@@ -8,13 +8,16 @@ use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::{self, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    ReadBuf,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -290,7 +293,7 @@ enum Frame {
     TooLong,
 }
 
-async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<Frame> {
+async fn read_frame(reader: &mut Input<BufReader<OwnedReadHalf>>) -> io::Result<Frame> {
     let mut buf = Vec::new();
     let limit = (MAX_REQUEST_BYTES + 1) as u64;
     let n = (&mut *reader)
@@ -332,7 +335,7 @@ async fn connection(
     stop: watch::Sender<bool>,
 ) {
     let (r, mut w) = stream.into_split();
-    let mut reader = BufReader::new(r);
+    let mut reader = Input::new(BufReader::new(r));
     let mut greeted = false;
     loop {
         let line = match read_frame(&mut reader).await {
@@ -429,7 +432,7 @@ async fn on_blocking_thread<T: Send + 'static>(
 /// a blocking thread. `None` when the client hung up meanwhile; there is
 /// then no one to answer.
 async fn blocking_call<R>(
-    reader: &mut R,
+    reader: &mut Input<R>,
     handler: &Arc<Handler>,
     caller: crate::protocol::Caller,
     req: Request,
@@ -445,13 +448,112 @@ where
     }
 }
 
-/// Resolve once the peer has closed its end (or the connection failed).
-/// Input that arrives instead is left buffered for the next request, and
-/// this then never resolves.
-async fn peer_closed<R: AsyncBufRead + Unpin>(reader: &mut R) {
-    match reader.fill_buf().await {
-        Ok([]) | Err(_) => {}
-        Ok(_) => std::future::pending().await,
+/// How much input a client may send ahead while a call of its waits: more
+/// than any one request can be. Past this the wait ends with an error.
+const MAX_READ_AHEAD: usize = MAX_REQUEST_BYTES + 1;
+
+/// A connection's input: whatever a client sent ahead while a blocking call
+/// of its waited (read early, to notice a hangup behind it), served first,
+/// then the rest of the stream.
+struct Input<R> {
+    inner: R,
+    ahead: Vec<u8>,
+    /// How much of `ahead` has been served.
+    pos: usize,
+    /// The most `ahead` may hold unserved before a wait gives up.
+    limit: usize,
+}
+
+impl<R> Input<R> {
+    fn new(inner: R) -> Input<R> {
+        Input::with_limit(inner, MAX_READ_AHEAD)
+    }
+
+    fn with_limit(inner: R, limit: usize) -> Input<R> {
+        Input {
+            inner,
+            ahead: Vec::new(),
+            pos: 0,
+            limit,
+        }
+    }
+
+    fn unserved(&self) -> &[u8] {
+        &self.ahead[self.pos..]
+    }
+
+    fn serve(&mut self, n: usize) {
+        self.pos += n;
+        if self.pos >= self.ahead.len() {
+            self.ahead.clear();
+            self.pos = 0;
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Input<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let ahead = this.unserved();
+        if ahead.is_empty() {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
+        let n = ahead.len().min(buf.remaining());
+        buf.put_slice(&ahead[..n]);
+        this.serve(n);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<R: AsyncBufRead + Unpin> AsyncBufRead for Input<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let this = self.get_mut();
+        if this.pos < this.ahead.len() {
+            return Poll::Ready(Ok(&this.ahead[this.pos..]));
+        }
+        Pin::new(&mut this.inner).poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        if this.pos < this.ahead.len() {
+            this.serve(amt);
+        } else {
+            Pin::new(&mut this.inner).consume(amt);
+        }
+    }
+}
+
+/// Why a wait stopped watching its client's input.
+enum Interrupt {
+    /// The client hung up (or the connection failed).
+    Closed,
+    /// The client sent more than its input's read-ahead limit.
+    Overflow,
+}
+
+/// Read what the client sends while a call of its waits into the read-ahead
+/// buffer, kept for its next requests, until it hangs up or sends too much.
+/// Reading on past early input is what lets a hangup behind it end the wait.
+async fn watch_input<R: AsyncBufRead + Unpin>(input: &mut Input<R>) -> Interrupt {
+    loop {
+        // `fill_buf` is cancel safe, and nothing below awaits: a wait that
+        // ends meanwhile loses no input.
+        let n = match input.inner.fill_buf().await {
+            Ok([]) | Err(_) => return Interrupt::Closed,
+            Ok(buf) => {
+                input.ahead.extend_from_slice(buf);
+                buf.len()
+            }
+        };
+        input.inner.consume(n);
+        if input.unserved().len() > input.limit {
+            return Interrupt::Overflow;
+        }
     }
 }
 
@@ -459,7 +561,7 @@ async fn peer_closed<R: AsyncBufRead + Unpin>(reader: &mut R) {
 /// event, and after any events were dropped for lagging), `timeout` runs
 /// out, or the client hangs up (`None`).
 async fn wait_for<R>(
-    reader: &mut R,
+    reader: &mut Input<R>,
     handler: &Arc<Handler>,
     mut rx: broadcast::Receiver<Event>,
     mut wait: Wait,
@@ -470,12 +572,21 @@ where
 {
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
-    let closed = peer_closed(reader);
-    tokio::pin!(closed);
+    let input = watch_input(reader);
+    tokio::pin!(input);
     loop {
         tokio::select! {
             biased;
-            () = &mut closed => return None,
+            interrupt = &mut input => return match interrupt {
+                Interrupt::Closed => None,
+                Interrupt::Overflow => Some(Err(ClientError::new(
+                    ErrorCode::TooLarge,
+                    format!(
+                        "more than {MAX_REQUEST_BYTES} bytes of input arrived while a call \
+                         waited; send the next request after the answer"
+                    ),
+                ))),
+            },
             () = &mut deadline => return Some(Ok(Handler::timed_out(&wait))),
             ev = rx.recv() => match ev {
                 Ok(event) if !wait.wakes(&event) => continue,
@@ -505,7 +616,7 @@ where
 /// Acknowledge a watch and stream hub events to the client until it
 /// disconnects.
 async fn watch_events(
-    reader: &mut BufReader<OwnedReadHalf>,
+    reader: &mut Input<BufReader<OwnedReadHalf>>,
     w: &mut OwnedWriteHalf,
     hub: &Hub,
     agent: Option<&str>,
@@ -692,7 +803,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let handler = handler_with(&dir, false);
         let (client, daemon_in) = duplex(64);
-        let mut reader = BufReader::new(daemon_in);
+        let mut reader = Input::new(BufReader::new(daemon_in));
         let (_tx, rx) = broadcast::channel(4);
         drop(client);
         let res = tokio::time::timeout(
@@ -715,7 +826,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let handler = handler_with(&dir, false);
         let (mut client, daemon_in) = duplex(64);
-        let mut reader = BufReader::new(daemon_in);
+        let mut reader = Input::new(BufReader::new(daemon_in));
         let (_tx, rx) = broadcast::channel(4);
         client.write_all(b"next\n").await.unwrap();
         let res = wait_for(
@@ -732,6 +843,99 @@ mod tests {
         assert_eq!(line, "next\n");
     }
 
+    /// Input sent during a wait does not hide a hangup that follows it:
+    /// the wait still ends at once.
+    #[tokio::test]
+    async fn hangup_after_input_during_a_wait_ends_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, false);
+        let (mut client, daemon_in) = duplex(64);
+        let mut reader = Input::new(BufReader::new(daemon_in));
+        let (_tx, rx) = broadcast::channel(4);
+        let hangup = tokio::spawn(async move {
+            client.write_all(b"next\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(b"junk").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(client);
+        });
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(
+                &mut reader,
+                &handler,
+                rx,
+                human_mail(),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("wait outlived its client");
+        assert!(res.is_none(), "{res:?}");
+        hangup.await.unwrap();
+    }
+
+    /// Input read ahead during a wait is served in order, before anything
+    /// sent later, across waits.
+    #[tokio::test]
+    async fn input_read_ahead_keeps_its_order_across_waits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, false);
+        let (mut client, daemon_in) = duplex(64);
+        let mut reader = Input::new(BufReader::new(daemon_in));
+        for line in [&b"one\n"[..], b"two\n"] {
+            let (_tx, rx) = broadcast::channel(4);
+            client.write_all(line).await.unwrap();
+            let res = wait_for(
+                &mut reader,
+                &handler,
+                rx,
+                human_mail(),
+                Duration::from_millis(50),
+            )
+            .await;
+            assert_eq!(res, Some(Ok(json!({ "status": "timeout" }))));
+        }
+        client.write_all(b"three\n").await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            got.push(line);
+        }
+        assert_eq!(got, ["one\n", "two\n", "three\n"]);
+    }
+
+    /// A client that sends more during a wait than could be one request
+    /// ends the wait with an error rather than growing the buffer without
+    /// bound; what it sent is still served next.
+    #[tokio::test]
+    async fn too_much_input_during_a_wait_ends_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, false);
+        let (mut client, daemon_in) = duplex(64);
+        let mut reader = Input::with_limit(BufReader::new(daemon_in), 8);
+        let (_tx, rx) = broadcast::channel(4);
+        client.write_all(b"0123456789\n").await.unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(
+                &mut reader,
+                &handler,
+                rx,
+                human_mail(),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("wait did not end on too much input");
+        let err = res.unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::TooLarge, "{err:?}");
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "0123456789\n");
+    }
+
     /// Events dropped for lagging may include the one waited for, so a
     /// lag makes the wait check the store.
     #[tokio::test]
@@ -739,7 +943,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let handler = handler_with(&dir, true);
         let (_client, daemon_in) = duplex(64);
-        let mut reader = BufReader::new(daemon_in);
+        let mut reader = Input::new(BufReader::new(daemon_in));
         let (tx, rx) = broadcast::channel(1);
         for i in 0..3 {
             tx.send(presence(&format!("x-{i}"))).unwrap();
@@ -767,7 +971,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let handler = handler_with(&dir, true);
         let (_client, daemon_in) = duplex(64);
-        let mut reader = BufReader::new(daemon_in);
+        let mut reader = Input::new(BufReader::new(daemon_in));
         let (tx, rx) = broadcast::channel(8);
         tx.send(presence("x-1")).unwrap();
         let res = wait_for(

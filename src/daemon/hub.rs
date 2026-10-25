@@ -63,7 +63,8 @@ pub enum Wait {
         thread_id: String,
         asker: String,
         /// Messages of the thread already accounted for: present when the
-        /// wait began, or checked since. Only others can end the wait.
+        /// wait began (for `await_answer`, those the asker has read), or
+        /// checked since. Only others can end the wait.
         seen: HashSet<String>,
     },
     /// Unread mail for `addr`.

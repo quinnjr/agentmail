@@ -102,6 +102,28 @@ pub enum Begun {
     },
 }
 
+/// What an ask returns right after storing its question, given whether
+/// anyone can answer it now: `None` to wait for the answer. The question is
+/// already stored and sent, so a failed lookup still hands back its id (as
+/// `pending`) rather than an error that would invite a duplicate ask.
+fn ask_outcome(listening: Result<bool, ClientError>, question_id: &str) -> Option<Value> {
+    match listening {
+        Ok(true) => None,
+        Ok(false) => Some(json!({
+            "status": "no_one_listening",
+            "question_id": question_id,
+        })),
+        Err(e) => {
+            eprintln!(
+                "agentmail daemon: question {question_id} was sent, but checking who can \
+                 answer it failed: {}",
+                e.message
+            );
+            Some(json!({ "status": "pending", "question_id": question_id }))
+        }
+    }
+}
+
 fn answered(question_id: &str, answer: Option<&Message>) -> Result<Value, ClientError> {
     Ok(json!({
         "status": "answered",
@@ -739,12 +761,11 @@ impl Handler {
                     in_reply_to: None,
                 };
                 let (msg, _held) = self.deliver(&me, &to, new)?;
-                // Names the mail is held for have no one to answer yet.
-                if !self.anyone_listening(&msg.to)? {
-                    return Ok(Begun::Done(json!({
-                        "status": "no_one_listening",
-                        "question_id": msg.id,
-                    })));
+                // Names the mail is held for have no one to answer yet. The
+                // question is stored and sent by now, so whatever happens
+                // the caller must learn its id.
+                if let Some(done) = ask_outcome(self.anyone_listening(&msg.to), &msg.id) {
+                    return Ok(Begun::Done(done));
                 }
                 Ok(Begun::Wait {
                     rx,
@@ -769,25 +790,46 @@ impl Handler {
                     return Err(ClientError::new(
                         ErrorCode::InvalidInput,
                         format!(
-                            "question {question_id:?} was asked by {}; only its asker                              waits for the answer",
+                            "question {question_id:?} was asked by {}; only its asker \
+                             waits for the answer",
                             q.asker
                         ),
                     ));
                 }
                 let thread = self.store.thread(&q.thread_id).map_err(store_err)?;
+                let unread: HashSet<String> = self
+                    .store
+                    .unread(&me)
+                    .map_err(store_err)?
+                    .into_iter()
+                    .map(|m| m.id)
+                    .collect();
                 let q = self.question(&question_id)?;
                 if q.answered_by.is_some() {
                     let thread = self.store.thread(&q.thread_id).map_err(store_err)?;
                     return answered(&q.id, Self::answer_in(&thread, &q.id)).map(Begun::Done);
                 }
+                // Only what the asker has not read yet can still be news: a
+                // clarification that came while no one was waiting (after an
+                // ask returned `pending`, say) wakes this wait at once. One
+                // already returned as a clarification was marked read then.
+                let seen = thread
+                    .into_iter()
+                    .filter(|m| !unread.contains(&m.id))
+                    .map(|m| m.id)
+                    .collect();
+                let mut wait = Wait::Answer {
+                    question_id: q.id,
+                    thread_id: q.thread_id,
+                    asker: me,
+                    seen,
+                };
+                if let Some(done) = self.check(&mut wait)? {
+                    return Ok(Begun::Done(done));
+                }
                 Ok(Begun::Wait {
                     rx,
-                    wait: Wait::Answer {
-                        question_id: q.id,
-                        thread_id: q.thread_id,
-                        asker: me,
-                        seen: thread.into_iter().map(|m| m.id).collect(),
-                    },
+                    wait,
                     timeout: Duration::from_secs(timeout_secs).min(MAX_WAIT),
                 })
             }
@@ -845,6 +887,12 @@ impl Handler {
                         continue;
                     }
                     if m.from != *asker && m.to.iter().any(|a| a == asker) {
+                        // Returned to the asker now: mark it read, so a
+                        // later wait on the question does not return it
+                        // again.
+                        self.store
+                            .mark_read(asker, std::slice::from_ref(&m.id))
+                            .map_err(store_err)?;
                         return Ok(Some(json!({
                             "status": "clarification",
                             "question_id": question_id,
@@ -1181,6 +1229,20 @@ impl Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_outcome_always_carries_the_question_id() {
+        assert_eq!(ask_outcome(Ok(true), "q1"), None);
+        assert_eq!(
+            ask_outcome(Ok(false), "q1"),
+            Some(json!({ "status": "no_one_listening", "question_id": "q1" }))
+        );
+        let err = ClientError::new(ErrorCode::Internal, "database is broken");
+        assert_eq!(
+            ask_outcome(Err(err), "q1"),
+            Some(json!({ "status": "pending", "question_id": "q1" }))
+        );
+    }
 
     #[test]
     fn bounded_output_returns_stdout_of_a_quick_command() {

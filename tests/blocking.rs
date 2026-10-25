@@ -476,6 +476,61 @@ async fn await_answer_errors() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidInput, "{err:?}");
+    assert!(
+        err.message.contains("only its asker waits for the answer"),
+        "{err:?}"
+    );
+    assert!(!err.message.contains("  "), "{err:?}");
+}
+
+/// A clarification that came while no one waited (after the ask returned
+/// `pending`) wakes the next await at once, and only that once.
+#[tokio::test]
+async fn clarification_before_await_returns_at_once() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let a = register(&mut c, "frontend", d.dir.path()).await;
+    let (b, _hb) = active(&mut c, "backend", d.dir.path()).await;
+
+    let out = c
+        .call(&agent(&a), ask_req(&[&b], "which schema?", 0))
+        .await
+        .unwrap();
+    assert_eq!(out["status"], "pending", "{out}");
+    let qid = str_of(&out, "question_id").to_string();
+    let note = c
+        .call(&agent(&b), reply_req(&qid, "for which endpoint?", false))
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let out = c
+        .call(
+            &agent(&a),
+            Request::AwaitAnswer {
+                question_id: qid.clone(),
+                timeout_secs: 30,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(out["status"], "clarification", "{out}");
+    assert_eq!(out["question_id"], qid.as_str());
+    assert_eq!(out["message"]["id"], note["id"]);
+
+    // Returned once, the clarification is read and does not fire again.
+    let out = c
+        .call(
+            &agent(&a),
+            Request::AwaitAnswer {
+                question_id: qid.clone(),
+                timeout_secs: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["status"], "pending", "{out}");
 }
 
 #[tokio::test]
