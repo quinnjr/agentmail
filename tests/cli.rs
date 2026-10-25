@@ -801,3 +801,102 @@ fn daemon_status_and_stop() {
     let out = ok_text(env.cmd().args(["daemon", "stop"]));
     assert!(out.contains("stopped"), "{out}");
 }
+
+#[test]
+fn hyphen_leading_body_and_subject_round_trip() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let body = "- a\n- b";
+    let sent = ok_json(env.as_agent(&a).args([
+        "send",
+        "--to",
+        &b,
+        "--subject",
+        "-x",
+        "--body",
+        body,
+        "--json",
+    ]));
+    let id = sent["id"].as_str().unwrap();
+    let v = ok_json(env.as_agent(&b).args(["read", id, "--json"]));
+    assert_eq!(v["body"].as_str().unwrap().as_bytes(), body.as_bytes());
+    assert_eq!(v["subject"], "-x");
+    // A hyphen-leading working-on summary and search query parse too.
+    ok_json(env.as_agent(&a).args(["status", "- reviewing", "--json"]));
+    let who = ok_json(env.as_agent(&a).args(["whoami", "--json"]));
+    assert_eq!(who["agent"]["working_on"], "- reviewing");
+    let found = ok_json(env.as_agent(&b).args(["search", "-x", "--json"]));
+    let ids: Vec<&str> = found
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&id), "{found}");
+}
+
+#[test]
+fn empty_recipient_is_usage_error() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    for to in [format!("{b},,{b}"), format!("{b},")] {
+        let out = env
+            .as_agent(&a)
+            .args(["send", "--to", &to, "--subject", "s", "--body", "x"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("empty"), "{}", text(&out.stderr));
+    }
+}
+
+/// Run `args` with stdout already closed; it must not panic (exit 101).
+fn closed_stdout(env: &Env, args: &[&str]) -> std::process::ExitStatus {
+    let mut child = StdCommand::new(BIN)
+        .args(args)
+        .env("AGENTMAIL_DATA_DIR", env.data_dir())
+        .env("AGENTMAIL_SOCKET", env.socket())
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .current_dir(&env.work)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "{args:?} panicked: {}",
+        text(&out.stderr)
+    );
+    assert!(
+        !text(&out.stderr).contains("panicked"),
+        "{args:?}: {}",
+        text(&out.stderr)
+    );
+    out.status
+}
+
+#[test]
+fn closed_stdout_does_not_panic() {
+    let mut env = Env::new();
+    for i in 0..5 {
+        env.agent(&format!("agent{i}"));
+    }
+    for args in [
+        &["--as", "human", "agents", "--all", "--json"][..],
+        &["--as", "human", "agents", "--all"],
+        &["daemon", "status"],
+        &["--as", "human", "--help"],
+    ] {
+        let status = closed_stdout(&env, args);
+        assert!(status.success(), "{args:?}: {status:?}");
+    }
+    // An error with --json prints JSON to the closed stdout too.
+    closed_stdout(&env, &["--as", "human", "read", "NOSUCHID", "--json"]);
+}

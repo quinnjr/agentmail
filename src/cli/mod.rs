@@ -59,8 +59,8 @@ pub struct Cli {
 #[derive(Args, Debug, Clone)]
 #[group(required = true, multiple = false)]
 pub struct BodyArgs {
-    /// The body as markdown text.
-    #[arg(long, value_name = "TEXT")]
+    /// The body as markdown text (may start with `-`, e.g. a bullet list).
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
     body: Option<String>,
     /// Read the body from a file.
     #[arg(long, value_name = "PATH")]
@@ -77,10 +77,10 @@ pub enum Command {
         /// Short role name, e.g. `backend`.
         name: String,
         /// One-line role description.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         role: Option<String>,
         /// What you are working on (at most 280 characters).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         working_on: Option<String>,
         /// Override the detected harness.
         #[arg(long, value_parser = ["claude-code", "opencode", "kiro", "other"])]
@@ -100,6 +100,7 @@ pub enum Command {
     /// Set your working-on summary.
     Status {
         /// The new summary (at most 280 characters).
+        #[arg(allow_hyphen_values = true)]
         working_on: String,
     },
     /// List, add or remove contacts (default: list).
@@ -122,9 +123,15 @@ pub enum Command {
     /// Start a new thread.
     Send {
         /// Recipients: full addresses or names, comma-separated or repeated.
-        #[arg(long, required = true, value_delimiter = ',', value_name = "ADDR")]
+        #[arg(
+            long,
+            required = true,
+            value_delimiter = ',',
+            value_name = "ADDR",
+            value_parser = parse_recipient
+        )]
         to: Vec<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: String,
         /// Ask for live interruption where the harness supports it.
         #[arg(long)]
@@ -151,9 +158,15 @@ pub enum Command {
     },
     /// Ask a question and wait for its answer. Exits 3 if none comes in time.
     Ask {
-        #[arg(long, required = true, value_delimiter = ',', value_name = "ADDR")]
+        #[arg(
+            long,
+            required = true,
+            value_delimiter = ',',
+            value_name = "ADDR",
+            value_parser = parse_recipient
+        )]
         to: Vec<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: String,
         #[command(flatten)]
         body: BodyArgs,
@@ -222,8 +235,13 @@ pub enum Command {
     },
     /// Search subjects, bodies and senders.
     Search {
-        #[arg(required = true, num_args = 1..)]
-        query: Vec<String>,
+        /// The query; it may start with `-`. Quote a query of several words
+        /// when a later word starts with `-`, or put it after `--`.
+        #[arg(allow_hyphen_values = true)]
+        query: String,
+        /// Further words of the query, joined with spaces.
+        #[arg(value_name = "MORE")]
+        more: Vec<String>,
     },
     /// Mark yourself gone.
     Signoff,
@@ -261,6 +279,15 @@ pub enum DaemonAction {
     /// Report whether the daemon is running. Exits 1 when it is not, 3 when
     /// it speaks another protocol version (stop it to replace it).
     Status,
+}
+
+/// One `--to` recipient: refused when empty or only whitespace (as from
+/// `--to a,,b` or `--to a,`), so it is a usage error, not a daemon one.
+fn parse_recipient(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("empty recipient: remove the extra comma or give an address".to_string());
+    }
+    Ok(s.to_string())
 }
 
 /// Parse a duration such as `240s`, `10m`, `7d` or `1h30m`. A bare number
@@ -427,23 +454,49 @@ fn parse<T: DeserializeOwned>(v: &Value) -> Result<T> {
     serde_json::from_value(v.clone()).context("unexpected data from daemon")
 }
 
-/// Print `v` as pretty JSON.
-fn print_json(v: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
-    Ok(())
-}
-
-/// Print `text` as is (it carries its own newlines).
+/// Write `text` to stdout as is (it carries its own newlines). A closed
+/// stdout (e.g. `| head -c1`) is not an error: the rest is dropped quietly.
 fn print_text(text: &str) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes())?;
-    out.flush()?;
-    Ok(())
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(anyhow::Error::new(e).context("writing to stdout"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Print `line` and a newline, like `println!` but without its panic on a
+/// closed stdout.
+fn print_line(line: &str) -> Result<()> {
+    print_text(&format!("{line}\n"))
+}
+
+/// Print `v` as pretty JSON.
+fn print_json(v: &Value) -> Result<()> {
+    print_line(&serde_json::to_string_pretty(v)?)
+}
+
+/// Write `text` to stderr, ignoring a failure: there is nowhere left to
+/// report it (and `eprint!` would panic).
+fn print_err(text: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
+}
+
+/// Print a clap error or help/version text and return its exit code,
+/// without `clap::Error::exit`'s panic on a closed stream.
+fn clap_exit(e: &clap::Error) -> ExitCode {
+    let _ = e.print();
+    ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2))
 }
 
 /// Parse and run the CLI. Never returns an error: it is printed here.
 pub async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return clap_exit(&e),
+    };
     let json = cli.json;
     match run(cli).await {
         Ok(code) => code,
@@ -460,16 +513,16 @@ pub async fn main() -> ExitCode {
 fn report(e: &anyhow::Error, json: bool) {
     match e.downcast_ref::<ClientError>() {
         Some(ce) => {
-            eprintln!("error: {}", ce.message);
+            print_err(&format!("error: {}\n", ce.message));
             if !ce.candidates.is_empty() {
-                eprint!("{}", render::agents(&ce.candidates, now_ms()));
+                print_err(&render::agents(&ce.candidates, now_ms()));
             }
             if json {
                 let _ = print_json(&json!({ "error": ce }));
             }
         }
         None => {
-            eprintln!("error: {e:#}");
+            print_err(&format!("error: {e:#}\n"));
             if json {
                 let _ = print_json(&json!({
                     "error": { "code": ErrorCode::Internal, "message": format!("{e:#}"), "candidates": [] }
@@ -539,16 +592,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let caller = identity::cli_caller(cli.as_who.is_some());
     if matches!(cli.command, Command::Register { .. }) && caller == Caller::Human {
         use clap::CommandFactory;
-        Cli::command()
-            .error(
-                clap::error::ErrorKind::ArgumentConflict,
-                format!(
-                    "register cannot act as {HUMAN}: {HUMAN} is the reserved operator \
+        let e = Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "register cannot act as {HUMAN}: {HUMAN} is the reserved operator \
                      address and never registers; drop --as {HUMAN} (and unset \
                      AGENTMAIL_HUMAN) to register an agent"
-                ),
-            )
-            .exit();
+            ),
+        );
+        return Ok(clap_exit(&e));
     }
     let client = Client::connect_or_spawn(&paths).await?;
     let mut s = Session {
@@ -573,14 +625,18 @@ fn render_ask(d: &Value) -> Result<String> {
     Ok(match d["status"].as_str().unwrap_or_default() {
         "answered" => {
             let m: Message = parse(&d["answer"])?;
-            format!("answered by {}:\n{}", m.from, render::message(&m))
+            format!(
+                "answered by {}:\n{}",
+                render::cell(&m.from),
+                render::message(&m)
+            )
         }
         "clarification" => {
             let m: Message = parse(&d["message"])?;
             format!(
                 "clarification from {} (question {qid} is still open: reply, then \
                  `agentmail await {qid}`):\n{}",
-                m.from,
+                render::cell(&m.from),
                 render::message(&m)
             )
         }
@@ -598,7 +654,11 @@ fn render_ask(d: &Value) -> Result<String> {
 
 fn sent(d: &Value) -> Result<String> {
     let m: Message = parse(d)?;
-    let mut out = format!("sent {} to {}\n", m.id, m.to.join(", "));
+    let mut out = format!(
+        "sent {} to {}\n",
+        render::cell(&m.id),
+        render::cell(&m.to.join(", "))
+    );
     let held: Vec<String> = d
         .get("held_for")
         .map(parse)
@@ -607,7 +667,7 @@ fn sent(d: &Value) -> Result<String> {
     if !held.is_empty() {
         out.push_str(&format!(
             "held for {} until an agent with that name registers in this repo\n",
-            held.join(", ")
+            render::cell(&held.join(", "))
         ));
     }
     Ok(out)
@@ -858,12 +918,12 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 Ok(render::threads(&parse::<Vec<ThreadSummary>>(d)?, now))
             })?;
         }
-        Command::Search { query } => {
-            let d = s
-                .call(Request::Search {
-                    query: query.join(" "),
-                })
-                .await?;
+        Command::Search { query, more } => {
+            let query = std::iter::once(query)
+                .chain(more)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let d = s.call(Request::Search { query }).await?;
             s.show(&d, |d| {
                 Ok(render::message_list(&parse::<Vec<Message>>(d)?, now))
             })?;
@@ -970,33 +1030,35 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
         DaemonAction::Start => {
             let mut c = Client::connect_or_spawn(paths).await?;
             let pid = daemon_pid(&mut c).await?;
-            println!("daemon running (pid {pid})");
+            print_line(&format!("daemon running (pid {pid})"))?;
             Ok(ExitCode::SUCCESS)
         }
         DaemonAction::Status => match Client::connect(paths).await {
             Ok(mut c) => {
                 let pid = daemon_pid(&mut c).await?;
-                println!(
+                print_line(&format!(
                     "daemon running (pid {pid}, protocol {PROTOCOL_VERSION}, socket {})",
                     paths.socket.display()
-                );
+                ))?;
                 Ok(ExitCode::SUCCESS)
             }
             Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
-                println!("daemon running, but not for this data directory: {e:#}");
+                print_line(&format!(
+                    "daemon running, but not for this data directory: {e:#}"
+                ))?;
                 Ok(ExitCode::FAILURE)
             }
             Err(e) => match e.downcast_ref::<ClientError>() {
                 Some(ce) if ce.code == ErrorCode::VersionMismatch => {
-                    println!(
+                    print_line(&format!(
                         "daemon running, but it speaks a different protocol (this client \
                          speaks {PROTOCOL_VERSION}: {}); run `agentmail daemon stop`",
                         ce.message
-                    );
+                    ))?;
                     Ok(ExitCode::from(STATUS_OTHER_PROTOCOL))
                 }
                 _ => {
-                    println!("daemon not running ({e:#})");
+                    print_line(&format!("daemon not running ({e:#})"))?;
                     Ok(ExitCode::FAILURE)
                 }
             },
@@ -1007,11 +1069,13 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
             match Client::shutdown(paths).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    println!("daemon not running");
+                    print_line("daemon not running")?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
-                    println!("daemon running, but not for this data directory; not stopped: {e:#}");
+                    print_line(&format!(
+                        "daemon running, but not for this data directory; not stopped: {e:#}"
+                    ))?;
                     return Ok(ExitCode::FAILURE);
                 }
                 Err(e) => return Err(e),
@@ -1025,7 +1089,7 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            println!("daemon stopped");
+            print_line("daemon stopped")?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -1224,6 +1288,152 @@ mod tests {
             Command::Send { to, .. } => assert_eq!(to, ["a", "b", "c"]),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_free_text_may_start_with_a_hyphen() {
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "send",
+            "--to",
+            "a",
+            "--subject",
+            "-x",
+            "--body",
+            "- a\n- b",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Command::Send { subject, body, .. } => {
+                assert_eq!(subject, "-x");
+                assert_eq!(body.body.as_deref(), Some("- a\n- b"));
+                assert_eq!(body.stdin, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from(["agentmail", "status", "- foo"]).unwrap();
+        match cli.command {
+            Command::Status { working_on } => assert_eq!(working_on, "- foo"),
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from(["agentmail", "status", "--json", "-- bar"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Command::Status { working_on } => assert_eq!(working_on, "-- bar"),
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "register",
+            "x",
+            "--role",
+            "-r",
+            "--working-on",
+            "- w",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Register {
+                role, working_on, ..
+            } => {
+                assert_eq!(role.as_deref(), Some("-r"));
+                assert_eq!(working_on.as_deref(), Some("- w"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from(["agentmail", "search", "-foo", "bar"]).unwrap();
+        match cli.command {
+            Command::Search { query, more } => assert_eq!(
+                (query.as_str(), &more[..]),
+                ("-foo", &["bar".to_string()][..])
+            ),
+            other => panic!("{other:?}"),
+        }
+        // Known flags after a hyphen-leading value are still flags.
+        let cli = Cli::try_parse_from(["agentmail", "search", "-foo", "--json"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Command::Search { query, more } => {
+                assert_eq!(query, "-foo");
+                assert!(more.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from(["agentmail", "search", "foo", "bar", "--json"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Command::Search { query, more } => {
+                assert_eq!(query, "foo");
+                assert_eq!(more, ["bar"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["agentmail", "search"]).is_err());
+        let cli = Cli::try_parse_from(["agentmail", "status", "- foo", "--json"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Command::Status { working_on } => assert_eq!(working_on, "- foo"),
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "ask",
+            "--to",
+            "a",
+            "--subject",
+            "-q",
+            "--body",
+            "-",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Ask { subject, body, .. } => {
+                assert_eq!(subject, "-q");
+                assert_eq!(body.body.as_deref(), Some("-"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The positional `-` still means stdin.
+        let cli =
+            Cli::try_parse_from(["agentmail", "send", "--to", "a", "--subject", "s", "-"]).unwrap();
+        match cli.command {
+            Command::Send { body, .. } => assert_eq!(body.stdin.as_deref(), Some("-")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_to_rejects_empty_recipients() {
+        use clap::error::ErrorKind;
+        for to in ["a,,b", "a,", ",a", "", " ", "a, ,b"] {
+            let err = Cli::try_parse_from([
+                "agentmail",
+                "send",
+                "--to",
+                to,
+                "--subject",
+                "s",
+                "--body",
+                "x",
+            ])
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{to:?}");
+            assert_eq!(err.exit_code(), 2, "{to:?}");
+        }
+        let err = Cli::try_parse_from([
+            "agentmail",
+            "ask",
+            "--to",
+            "a,",
+            "--subject",
+            "s",
+            "--body",
+            "x",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

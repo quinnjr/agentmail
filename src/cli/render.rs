@@ -68,6 +68,35 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
+/// Characters that reorder or hide text on a terminal: bidirectional
+/// embeddings, overrides and isolates, and directional marks.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `text` made safe for one line of a table or header: line breaks and tabs
+/// become spaces, and other control characters (ESC among them, so no
+/// terminal escape sequence gets through) and bidirectional controls are
+/// shown escaped, like `\u{1b}`. Message bodies never go through this.
+pub fn cell(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' | '\r' | '\t' => out.push(' '),
+            c if c.is_control() || is_bidi_control(c) => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Every item through `cell`, joined with `, `.
+fn cells(items: &[String]) -> String {
+    items.iter().map(|i| cell(i)).collect::<Vec<_>>().join(", ")
+}
+
 /// One line per row, columns padded to their widest cell. Trailing spaces
 /// are trimmed.
 fn table(rows: &[Vec<String>]) -> String {
@@ -108,9 +137,9 @@ fn kind_marker(kind: Kind) -> &'static str {
 /// The sender as shown in headers: `human [from human]` for the human.
 fn sender(m: &Message) -> String {
     if m.from_human {
-        format!("{} [from human]", m.from)
+        format!("{} [from human]", cell(&m.from))
     } else {
-        m.from.clone()
+        cell(&m.from)
     }
 }
 
@@ -125,9 +154,9 @@ pub fn inbox_line(m: &Message, from_contact: bool, now_ms: i64) -> Vec<String> {
     vec![
         kind_marker(m.kind).to_string(),
         if m.urgent { "!" } else { " " }.to_string(),
-        short_id(&m.id).to_string(),
+        cell(short_id(&m.id)),
         from,
-        m.subject.clone(),
+        cell(&m.subject),
         age(now_ms, m.created_at),
     ]
 }
@@ -156,9 +185,9 @@ pub fn message_list(msgs: &[Message], now_ms: i64) -> String {
             vec![
                 kind_marker(m.kind).to_string(),
                 if m.urgent { "!" } else { " " }.to_string(),
-                m.id.clone(),
+                cell(&m.id),
                 sender(m),
-                m.subject.clone(),
+                cell(&m.subject),
                 age(now_ms, m.created_at),
             ]
         })
@@ -179,16 +208,16 @@ pub fn message(m: &Message) -> String {
         out,
         "── {} → {} · {} · {kind}",
         sender(m),
-        m.to.join(", "),
+        cells(&m.to),
         utc(m.created_at)
     );
     if m.urgent {
         out.push_str(" · urgent");
     }
     out.push('\n');
-    let _ = writeln!(out, "   {}  {}", m.id, m.subject);
+    let _ = writeln!(out, "   {}  {}", cell(&m.id), cell(&m.subject));
     if !m.refs.is_empty() {
-        let _ = writeln!(out, "   refs: {}", m.refs.join(", "));
+        let _ = writeln!(out, "   refs: {}", cells(&m.refs));
     }
     out.push('\n');
     out.push_str(&m.body);
@@ -250,12 +279,12 @@ pub fn agents(views: &[AgentView], now_ms: i64) -> String {
         let mark = if v.is_contact { "* " } else { "  " };
         let place = a.repo.as_ref().unwrap_or(&a.cwd);
         rows.push(vec![
-            format!("{mark}{}", a.address),
-            clip(a.role.as_deref().unwrap_or("-"), ROLE_CELL),
+            format!("{mark}{}", cell(&a.address)),
+            clip(&cell(a.role.as_deref().unwrap_or("-")), ROLE_CELL),
             presence(v.presence).to_string(),
             harness(v),
-            place.display().to_string(),
-            clip(a.working_on.as_deref().unwrap_or("-"), SUMMARY_CELL),
+            cell(&place.display().to_string()),
+            clip(&cell(a.working_on.as_deref().unwrap_or("-")), SUMMARY_CELL),
             last_seen(v, now_ms),
         ]);
     }
@@ -266,14 +295,14 @@ pub fn agents(views: &[AgentView], now_ms: i64) -> String {
 pub fn agent(v: &AgentView, now_ms: i64) -> String {
     let a = &v.agent;
     let mut out = String::new();
-    let _ = writeln!(out, "{}", a.address);
+    let _ = writeln!(out, "{}", cell(&a.address));
     if let Some(role) = &a.role {
-        let _ = writeln!(out, "  role:       {role}");
+        let _ = writeln!(out, "  role:       {}", cell(role));
     }
     let _ = writeln!(
         out,
         "  working on: {}",
-        a.working_on.as_deref().unwrap_or("-")
+        cell(a.working_on.as_deref().unwrap_or("-"))
     );
     let _ = writeln!(
         out,
@@ -283,9 +312,9 @@ pub fn agent(v: &AgentView, now_ms: i64) -> String {
     );
     let _ = writeln!(out, "  harness:    {}", harness(v));
     if let Some(repo) = &a.repo {
-        let _ = writeln!(out, "  repo:       {}", repo.display());
+        let _ = writeln!(out, "  repo:       {}", cell(&repo.display().to_string()));
     }
-    let _ = writeln!(out, "  cwd:        {}", a.cwd.display());
+    let _ = writeln!(out, "  cwd:        {}", cell(&a.cwd.display().to_string()));
     out
 }
 
@@ -299,10 +328,10 @@ pub fn threads(list: &[ThreadSummary], now_ms: i64) -> String {
         .iter()
         .map(|t| {
             vec![
-                t.thread_id.clone(),
-                t.subject.clone(),
+                cell(&t.thread_id),
+                cell(&t.subject),
                 format!("{} msg", t.messages),
-                t.participants.join(", "),
+                cells(&t.participants),
                 if t.open_questions > 0 {
                     format!("{} open [Q]", t.open_questions)
                 } else {
@@ -324,7 +353,7 @@ pub fn event(e: &Event, now_ms: i64) -> String {
                 "mail     ".to_string(),
                 sender(m),
                 "→".to_string(),
-                to.clone(),
+                cell(to),
             ];
             let kind = kind_marker(m.kind).trim();
             if !kind.is_empty() {
@@ -333,19 +362,19 @@ pub fn event(e: &Event, now_ms: i64) -> String {
             if m.urgent {
                 parts.push("!".to_string());
             }
-            parts.push(format!("{:?}", m.subject));
+            parts.push(format!("\"{}\"", cell(&m.subject)));
             parts.join(" ")
         }
         Event::Presence { agent: v } => format!(
             "{} presence  {} {} · {}",
             utc(now_ms),
-            v.agent.address,
+            cell(&v.agent.address),
             if v.agent.signed_off {
                 "signed off"
             } else {
                 presence(v.presence)
             },
-            v.agent.working_on.as_deref().unwrap_or("-")
+            cell(v.agent.working_on.as_deref().unwrap_or("-"))
         ),
     }
 }
@@ -483,6 +512,62 @@ mod tests {
         assert_eq!(clip("abc", 3), "abc");
         assert_eq!(clip("abcd", 3), "ab…");
         assert_eq!(clip("ééééé", 4), "ééé…");
+    }
+
+    #[test]
+    fn render_cells_stay_on_one_line_without_escapes() {
+        let nasty = "a\nb\x1b[31m\r\tc\u{202e}d";
+        let check = |out: &str, rows: usize| {
+            assert_eq!(out.lines().count(), rows, "{out:?}");
+            assert!(!out.contains('\x1b'), "{out:?}");
+            assert!(!out.contains('\r') && !out.contains('\t'), "{out:?}");
+            assert!(!out.contains('\u{202e}'), "{out:?}");
+        };
+        let mut m = msg(Kind::Note, false);
+        m.subject = nasty.into();
+        m.refs = vec![nasty.into()];
+        m.to = vec![nasty.into()];
+        check(&inbox(&[(m.clone(), false)], 0), 1);
+        check(&message_list(&[m.clone()], 0), 1);
+        // The header lines of a message are sanitized; the body is not.
+        m.body = "body\x1b".into();
+        let out = message(&m);
+        let header = out.split("\n\n").next().unwrap();
+        check(header, 3);
+        assert!(out.ends_with("\n\nbody\x1b\n"), "{out:?}");
+        let mut v = view(false, Presence::Active);
+        v.agent.role = Some(nasty.into());
+        v.agent.working_on = Some(nasty.into());
+        v.agent.repo = Some(PathBuf::from(nasty));
+        v.agent.cwd = PathBuf::from(nasty);
+        check(&agents(std::slice::from_ref(&v), 0), 2);
+        check(&agent(&v, 0), 7);
+        check(&event(&Event::Presence { agent: v.clone() }, 0), 1);
+        check(
+            &event(
+                &Event::Delivered {
+                    to: nasty.into(),
+                    message: m.clone(),
+                },
+                0,
+            ),
+            1,
+        );
+        let t = ThreadSummary {
+            thread_id: "T".into(),
+            subject: nasty.into(),
+            messages: 1,
+            participants: vec![nasty.into()],
+            open_questions: 0,
+            last_at: 0,
+        };
+        check(&threads(&[t], 0), 1);
+        assert_eq!(cell("plain naïve ✓"), "plain naïve ✓");
+        assert_eq!(cell("a\nb\tc"), "a b c");
+        assert_eq!(
+            cell("x\x1b[31m\u{7f}\u{202e}"),
+            "x\\u{1b}[31m\\u{7f}\\u{202e}"
+        );
     }
 
     #[test]
