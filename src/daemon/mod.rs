@@ -29,6 +29,11 @@ use crate::store::Store;
 
 /// How often the daemon checks that its socket file is still its own.
 const SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// How many times a starting daemon tries to take the lock before deciding
+/// another daemon holds it.
+const LOCK_ATTEMPTS: u32 = 5;
+/// The pause between those tries.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// How long to keep retrying to open the database (a previous daemon in
 /// this process may still be releasing it).
 const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
@@ -145,12 +150,34 @@ fn bind_private(socket: &Path) -> Result<UnixListener> {
     staged
 }
 
+/// Take the exclusive lock on `lock` (the file at `path`). Returns false when
+/// another process keeps holding it for [`LOCK_ATTEMPTS`] tries
+/// [`LOCK_RETRY_INTERVAL`] apart. The retries let a daemon start while a
+/// momentary probe (`Paths::lock_held`, run by `daemon stop` while it waits)
+/// holds the lock for an instant.
+async fn take_lock(lock: &File, path: &Path) -> Result<bool> {
+    for attempt in 1..=LOCK_ATTEMPTS {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
+                tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Run the daemon until a client sends `Shutdown` or the socket file is
 /// removed or replaced.
 ///
 /// Startup: create the data directory (mode 0700) and take an exclusive
-/// lock on `paths.lock`. If another daemon holds it, return `Ok` at once
-/// without touching anything: that daemon serves. Otherwise open the store
+/// lock on `paths.lock`, retrying briefly so a momentary probe of the lock
+/// cannot make the daemon give up. If another daemon keeps holding it,
+/// return `Ok` without touching anything: that daemon serves. Otherwise open the store
 /// (so a database that cannot be opened never leaves a socket behind),
 /// then put a mode-0600 socket in place of any leftover one (no live daemon
 /// can own it while we hold the lock) and accept. Every fallible startup
@@ -166,12 +193,8 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
         .truncate(false)
         .open(&paths.lock)
         .with_context(|| format!("opening {}", paths.lock.display()))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(()),
-        Err(TryLockError::Error(e)) => {
-            return Err(e).with_context(|| format!("locking {}", paths.lock.display()));
-        }
+    if !take_lock(&lock, &paths.lock).await? {
+        return Ok(());
     }
 
     let store = Arc::new(open_store(&paths.db).await?);

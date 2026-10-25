@@ -88,7 +88,9 @@ impl Paths {
     ///
     /// A non-blocking probe on a fresh open file description, so it also
     /// sees a lock held elsewhere in this process. A missing or unreadable
-    /// lock file counts as not held.
+    /// lock file counts as not held. When the lock is free the probe takes
+    /// it for an instant; a starting daemon retries briefly, so this cannot
+    /// make it give up.
     pub fn lock_held(&self) -> bool {
         let Ok(file) = std::fs::File::open(&self.lock) else {
             return false;

@@ -32,6 +32,10 @@ const RESPAWN_INTERVAL: Duration = Duration::from_millis(500);
 pub struct Client {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
+    /// Set once [`Client::stream`] has put the connection in watch mode;
+    /// the daemon then only pushes events on it, so no further request can
+    /// be answered.
+    streaming: bool,
 }
 
 /// The binary to run as `daemon run`: `AGENTMAIL_BIN` if set and non-empty,
@@ -148,6 +152,7 @@ impl Client {
         Ok(Client {
             reader: BufReader::new(r),
             writer: w,
+            streaming: false,
         })
     }
 
@@ -326,6 +331,12 @@ impl Client {
     }
 
     async fn send(&mut self, caller: &Caller, req: Request) -> Result<(), ClientError> {
+        if self.streaming {
+            return Err(ClientError::new(
+                ErrorCode::Internal,
+                "connection is in watch mode; open a new client",
+            ));
+        }
         let env = Envelope {
             caller: caller.clone(),
             req,
@@ -364,6 +375,11 @@ impl Client {
     /// Send one request and wait for its result.
     pub async fn call(&mut self, caller: &Caller, req: Request) -> Result<Value, ClientError> {
         self.send(caller, req).await?;
+        self.reply().await
+    }
+
+    /// Read the reply to the request just sent.
+    async fn reply(&mut self) -> Result<Value, ClientError> {
         match self.recv().await? {
             Response::Ok { data } => Ok(data),
             Response::Err {
@@ -384,12 +400,22 @@ impl Client {
 
     /// Send a streaming request (`Watch`) and return its events. The stream
     /// ends after the first error, e.g. [`ErrorCode::ConnectionLost`].
+    ///
+    /// This puts the connection in watch mode for good: once `stream` has
+    /// been called, every later [`Client::call`] or `stream` on this client
+    /// fails with [`ErrorCode::Internal`] ("connection is in watch mode"),
+    /// even after the returned stream is dropped. Open a new client for
+    /// further requests.
     pub async fn stream(
         &mut self,
         caller: &Caller,
         req: Request,
     ) -> Result<impl Stream<Item = Result<Event, ClientError>>, ClientError> {
-        self.call(caller, req).await?;
+        self.send(caller, req).await?;
+        // From here on the daemon may push events at any time, even if this
+        // future is dropped before the acknowledgement arrives.
+        self.streaming = true;
+        self.reply().await?;
         Ok(futures_util::stream::unfold(
             Some(self),
             |state| async move {

@@ -1226,3 +1226,68 @@ async fn daemon_stop_refuses_a_daemon_for_another_data_dir() {
     c.call(&Caller::Human, Request::Whoami).await.unwrap();
     assert!(d.paths.lock_held());
 }
+
+#[tokio::test]
+async fn daemon_starts_despite_a_momentary_lock_probe() {
+    // `Paths::lock_held` (run by `daemon stop` while it waits) takes the
+    // lock for an instant when it is free. A daemon starting then must not
+    // give up.
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let probe = std::fs::File::create(&paths.lock).unwrap();
+    probe.try_lock().unwrap();
+    let handle = tokio::spawn(serve(DaemonConfig {
+        paths: paths.clone(),
+    }));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    drop(probe);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut c = loop {
+        if let Ok(c) = Client::connect(&paths).await {
+            break c;
+        }
+        assert!(
+            !handle.is_finished(),
+            "daemon gave up on a briefly held lock: {:?}",
+            handle.await
+        );
+        assert!(Instant::now() < deadline, "daemon did not start");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    c.call(&Caller::Human, Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon did not stop")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn client_refuses_calls_after_streaming() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    {
+        let events = c
+            .stream(&Caller::Human, Request::Watch { agent: None })
+            .await
+            .unwrap();
+        drop(events);
+    }
+    // Something is published while the stream is gone, so a confused client
+    // would read the event as its reply.
+    let mut other = d.client().await;
+    register(&mut other, "frontend", d.dir.path()).await;
+
+    let err = c.call(&Caller::Human, Request::Counts).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(err.message.contains("watch mode"), "{}", err.message);
+    let err = match c
+        .stream(&Caller::Human, Request::Watch { agent: None })
+        .await
+    {
+        Ok(_) => panic!("stream on a watching connection must fail"),
+        Err(e) => e,
+    };
+    assert!(err.message.contains("watch mode"), "{}", err.message);
+}
