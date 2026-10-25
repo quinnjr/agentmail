@@ -74,7 +74,25 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// whenever we give up on it the whole group is killed: a grandchild that
 /// keeps the pipe open then dies with it, so neither we nor the reader
 /// thread are held past the deadline.
-fn output_within(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
+fn output_within(cmd: Command, limit: Duration) -> Option<Vec<u8>> {
+    output_within_with(cmd, limit, kill_group)
+}
+
+/// [`output_within`] with the group kill injectable, so tests can observe
+/// when it happens.
+///
+/// The group id is the leader's pid, and a pid (hence the group id) stays
+/// reserved for exactly as long as the leader is unreaped, alive or a
+/// zombie. So the leader's exit is detected without reaping it
+/// ([`leader_exited`]), `kill_group` is only ever called before the
+/// leader is reaped, and the leader is reaped only after the last
+/// possible group kill. Signalling `-pgid` therefore can never reach an
+/// unrelated process that reused the id.
+fn output_within_with(
+    mut cmd: Command,
+    limit: Duration,
+    kill_group: impl Fn(u32),
+) -> Option<Vec<u8>> {
     use std::os::unix::process::CommandExt;
 
     let deadline = Instant::now() + limit;
@@ -86,61 +104,107 @@ fn output_within(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
         .spawn()
         .ok()?;
     // With `process_group(0)` the group id is the child's pid.
-    let group = ProcessGroup(child.id());
-    let mut stdout = child.stdout.take()?;
+    let pgid = child.id();
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_group(pgid);
+        let _ = child.wait();
+        return None;
+    };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let res = stdout.read_to_end(&mut buf).map(|_| buf);
         let _ = tx.send(res);
     });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
+    let success = loop {
+        match leader_exited(pgid) {
+            Ok(Some(success)) => break success,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            // Timed out, or cannot tell: stop it and give up.
-            _ => {
-                group.kill();
+            Ok(None) => {
+                // Timed out: the leader is still running, so unreaped.
+                kill_group(pgid);
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => {
+                // Cannot tell whether the leader is still ours to wait
+                // for, so the group id may already be free: do not signal
+                // the group, only the child std still tracks.
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
         }
     };
-    if !status.success() {
-        group.kill();
-        return None;
-    }
-    let wait = deadline
-        .saturating_duration_since(Instant::now())
-        .max(POLL_INTERVAL);
-    match rx.recv_timeout(wait) {
-        Ok(res) => res.ok(),
-        // The command exited but something it left behind still holds
+    // The leader has exited but is not reaped yet, so its zombie keeps
+    // the group id reserved for any kill below.
+    let out = if success {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(POLL_INTERVAL);
+        // A timeout means something the command left behind still holds
         // stdout open past the deadline.
-        Err(_) => {
-            group.kill();
-            None
+        rx.recv_timeout(wait).ok().and_then(|res| res.ok())
+    } else {
+        None
+    };
+    if out.is_none() {
+        kill_group(pgid);
+    }
+    let _ = child.wait();
+    out
+}
+
+/// Whether child `pid` has exited, without reaping it: `Ok(None)` while
+/// it runs, `Ok(Some(success))` once it has exited, where `success` means
+/// it exited with status 0. The child stays a zombie until waited for.
+fn leader_exited(pid: u32) -> std::io::Result<Option<bool>> {
+    let id = libc::id_t::from(pid);
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid value (plain integers
+        // and padding), and `waitid` only writes into `info`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, exclusively borrowed `siginfo_t`.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
+        // SAFETY: after a successful `waitid` the child fields are set
+        // (or left zero when, under WNOHANG, nothing has exited yet).
+        let (si_pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+        if si_pid == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(info.si_code == libc::CLD_EXITED && status == 0));
     }
 }
 
-/// The process group a bounded command runs in.
-struct ProcessGroup(u32);
-
-impl ProcessGroup {
-    /// SIGKILL every process left in the group (best effort). The group id
-    /// cannot be reused while any member is alive, so this only ever hits
-    /// the command and what it spawned.
-    fn kill(&self) {
-        let Ok(pgid) = libc::pid_t::try_from(self.0) else {
-            return;
-        };
-        if pgid > 0 {
-            // SAFETY: kill(2) takes plain integers and touches no memory.
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
+/// SIGKILL every process left in group `pgid` (best effort).
+///
+/// Callers must only use this while the group's leader (whose pid is
+/// `pgid`) is unreaped. Until it is reaped, no new process or group can
+/// take that id, so this only ever hits the command and what it spawned.
+/// Once the leader is reaped the id may be reused, even if other members
+/// are still alive, and signalling it could kill an unrelated process.
+fn kill_group(pgid: u32) {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    if pgid > 0 {
+        // SAFETY: kill(2) takes plain integers and touches no memory.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
         }
     }
 }
@@ -563,6 +627,88 @@ mod tests {
         assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 0");
         // The command fails, leaving a grandchild behind.
         assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 1");
+    }
+
+    /// Run `cmd` with a kill hook that records, for each group kill,
+    /// whether the leader was still unreaped (alive or a zombie) at that
+    /// moment, then performs the real kill. Returns the output, those
+    /// records and the leader's pid.
+    fn run_with_kill_probe(cmd: Command, limit: Duration) -> (Option<Vec<u8>>, Vec<bool>) {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let out = output_within_with(cmd, limit, |pgid| {
+            let pid = libc::pid_t::try_from(pgid).unwrap();
+            // SAFETY: kill(2) with signal 0 only checks that `pid` exists;
+            // an exited but unreaped child still does.
+            let unreaped = unsafe { libc::kill(pid, 0) } == 0;
+            seen.lock().unwrap().push(unreaped);
+            kill_group(pgid);
+        });
+        (out, seen.into_inner().unwrap())
+    }
+
+    /// The group is only ever killed while its leader is unreaped: the
+    /// zombie leader keeps the group id reserved, so the kill cannot hit
+    /// an unrelated process that reused it.
+    #[test]
+    fn bounded_output_kills_the_group_only_before_reaping_the_leader() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            cmd
+        };
+        // Exits non-zero with nothing left in the group.
+        let (out, kills) = run_with_kill_probe(sh("exit 3"), Duration::from_secs(5));
+        assert_eq!(out, None);
+        assert_eq!(kills, vec![true]);
+        // Outlives the deadline.
+        let (out, kills) = run_with_kill_probe(sh("exec sleep 30"), Duration::from_millis(200));
+        assert_eq!(out, None);
+        assert_eq!(kills, vec![true]);
+        // Succeeds, but a grandchild holds stdout open past the deadline.
+        let (out, kills) = run_with_kill_probe(sh("sleep 30 & exit 0"), Duration::from_millis(300));
+        assert_eq!(out, None);
+        assert_eq!(kills, vec![true]);
+        // Succeeds cleanly: nothing to kill.
+        let (out, kills) = run_with_kill_probe(sh("echo hi"), Duration::from_secs(5));
+        assert_eq!(out, Some(b"hi\n".to_vec()));
+        assert!(kills.is_empty());
+    }
+
+    /// The leader is always reaped before `output_within` returns.
+    #[test]
+    fn bounded_output_reaps_the_leader() {
+        let gone = |pid: libc::pid_t, script: &str| {
+            // SAFETY: kill(2) with signal 0 only checks that `pid` exists;
+            // an unreaped zombie still would.
+            let exists = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!exists, "leader of {script:?} left unreaped");
+        };
+        // Paths that give up learn the leader's pid from the kill hook.
+        for (script, limit) in [
+            ("exit 3", Duration::from_secs(5)),
+            ("exec sleep 30", Duration::from_millis(200)),
+            ("sleep 30 & exit 0", Duration::from_millis(300)),
+        ] {
+            let leader = std::sync::Mutex::new(None);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            output_within_with(cmd, limit, |pgid| {
+                *leader.lock().unwrap() = Some(pgid);
+                kill_group(pgid);
+            });
+            let pgid = leader.into_inner().unwrap().expect("group was killed");
+            gone(libc::pid_t::try_from(pgid).unwrap(), script);
+        }
+        // A clean success reports its own pid on stdout.
+        let script = "echo $$";
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        let out = output_within_with(cmd, Duration::from_secs(5), |_| {
+            panic!("a clean success killed its group")
+        })
+        .unwrap();
+        let pid = String::from_utf8(out).unwrap().trim().parse().unwrap();
+        gone(pid, script);
     }
 
     #[test]
