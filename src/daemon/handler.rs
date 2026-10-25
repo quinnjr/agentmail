@@ -70,16 +70,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// `None`, as does one that cannot be started or fails.
 ///
 /// Stdout is drained on a separate thread, so a chatty command cannot
-/// block on a full pipe, and a grandchild that keeps the pipe open cannot
-/// hold us past the deadline either.
+/// block on a full pipe. The command runs in its own process group, and
+/// whenever we give up on it the whole group is killed: a grandchild that
+/// keeps the pipe open then dies with it, so neither we nor the reader
+/// thread are held past the deadline.
 fn output_within(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
+    use std::os::unix::process::CommandExt;
+
     let deadline = Instant::now() + limit;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
+    // With `process_group(0)` the group id is the child's pid.
+    let group = ProcessGroup(child.id());
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -93,6 +100,7 @@ fn output_within(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             // Timed out, or cannot tell: stop it and give up.
             _ => {
+                group.kill();
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -100,12 +108,41 @@ fn output_within(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
         }
     };
     if !status.success() {
+        group.kill();
         return None;
     }
     let wait = deadline
         .saturating_duration_since(Instant::now())
         .max(POLL_INTERVAL);
-    rx.recv_timeout(wait).ok()?.ok()
+    match rx.recv_timeout(wait) {
+        Ok(res) => res.ok(),
+        // The command exited but something it left behind still holds
+        // stdout open past the deadline.
+        Err(_) => {
+            group.kill();
+            None
+        }
+    }
+}
+
+/// The process group a bounded command runs in.
+struct ProcessGroup(u32);
+
+impl ProcessGroup {
+    /// SIGKILL every process left in the group (best effort). The group id
+    /// cannot be reused while any member is alive, so this only ever hits
+    /// the command and what it spawned.
+    fn kill(&self) {
+        let Ok(pgid) = libc::pid_t::try_from(self.0) else {
+            return;
+        };
+        if pgid > 0 {
+            // SAFETY: kill(2) takes plain integers and touches no memory.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 /// The git toplevel containing `cwd`, if any, or `None` when git does not
@@ -481,6 +518,51 @@ mod tests {
             output_within(cmd, Duration::from_secs(5)),
             Some(b"/repo\n".to_vec())
         );
+    }
+
+    /// Run `script` (with `$1` a file to write a grandchild's pid to) under
+    /// a short limit and assert it yields `None` and the grandchild dies.
+    fn assert_grandchild_killed(script: &str) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).arg("sh").arg(&pidfile);
+        let started = Instant::now();
+        assert_eq!(output_within(cmd, Duration::from_millis(300)), None);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = |pid: u32| match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // A zombie awaiting its (new) parent is dead too.
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            gone(pid),
+            "grandchild {pid} of {script:?} outlived output_within"
+        );
+    }
+
+    /// Whenever the command is given up on, its whole process group is
+    /// killed, so a grandchild holding stdout open dies too and the reader
+    /// thread can finish.
+    #[test]
+    fn bounded_output_kills_grandchildren_when_giving_up() {
+        // The command itself outlives the deadline.
+        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; wait");
+        // The command succeeds, but a grandchild keeps stdout open.
+        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 0");
+        // The command fails, leaving a grandchild behind.
+        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 1");
     }
 
     #[test]

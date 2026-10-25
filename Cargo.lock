@@ -11,6 +11,7 @@ dependencies = [
  "clap",
  "cuid2",
  "futures-util",
+ "libc",
  "redb",
  "rmcp",
  "schemars",

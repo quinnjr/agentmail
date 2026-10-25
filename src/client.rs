@@ -217,9 +217,10 @@ impl Client {
     /// every protocol version honours.
     ///
     /// Returns false when no daemon is listening (no socket file, or a stale
-    /// one nobody accepts on), true once the daemon has acknowledged. The
-    /// daemon may still be releasing its lock when this returns. A peer that
-    /// does not acknowledge within a few seconds is an error.
+    /// one nobody accepts on), true once the daemon has acknowledged or has
+    /// closed the connection in answer to `Shutdown`. The daemon may still
+    /// be releasing its lock when this returns. A peer that does neither
+    /// within a few seconds is an error.
     pub async fn shutdown(paths: &Paths) -> Result<bool> {
         let attempt = async {
             let mut c = match Client::open(paths).await {
@@ -249,8 +250,13 @@ impl Client {
                 Err(e) if e.code == ErrorCode::VersionMismatch => {}
                 Err(e) => return Err(e.into()),
             }
-            c.call(&Caller::Human, Request::Shutdown).await?;
-            Ok(true)
+            match c.call(&Caller::Human, Request::Shutdown).await {
+                Ok(_) => Ok(true),
+                // Every version honours `Shutdown`: a peer that hangs up
+                // instead of replying is going away, as asked.
+                Err(e) if e.code == ErrorCode::ConnectionLost => Ok(true),
+                Err(e) => Err(e.into()),
+            }
         };
         tokio::time::timeout(ANSWER_WAIT, attempt)
             .await

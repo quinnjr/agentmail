@@ -679,15 +679,35 @@ impl Store {
     /// Mark messages read for `addr`. Ids not in `addr`'s mailbox are
     /// ignored, so a whole thread can be marked read at once.
     pub fn mark_read(&self, addr: &str, ids: &[String]) -> Result<(), StoreError> {
+        // Look first under a read transaction: re-reading mail that is
+        // already read is common and must not cost a durable commit or hold
+        // the writer lock.
+        let unread: Vec<&str> = {
+            let txn = self.read()?;
+            let mailbox = txn.open_table(MAILBOX)?;
+            let mut unread = Vec::new();
+            for id in ids {
+                if mailbox
+                    .get((addr, id.as_str()))?
+                    .is_some_and(|read| !read.value())
+                {
+                    unread.push(id.as_str());
+                }
+            }
+            unread
+        };
+        if unread.is_empty() {
+            return Ok(());
+        }
         let txn = self.db.begin_write()?;
         {
             let mut mailbox = txn.open_table(MAILBOX)?;
-            for id in ids {
-                let unread = mailbox
-                    .get((addr, id.as_str()))?
-                    .is_some_and(|read| !read.value());
-                if unread {
-                    mailbox.insert((addr, id.as_str()), true)?;
+            for id in unread {
+                // Re-check under the writer lock: the entry may have gone
+                // (pruned) since the read above.
+                let still_unread = mailbox.get((addr, id))?.is_some_and(|read| !read.value());
+                if still_unread {
+                    mailbox.insert((addr, id), true)?;
                 }
             }
         }
@@ -834,5 +854,78 @@ impl Store {
         self.on_messages_pruned(&txn, &doomed)?;
         txn.commit()?;
         Ok(pruned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::model::Harness;
+
+    fn agent(store: &Store, name: &str) -> String {
+        let req = RegisterReq {
+            name: name.into(),
+            role: None,
+            working_on: None,
+            harness: Harness::Other,
+            cwd: PathBuf::from("/w"),
+            repo: None,
+            proc_id: None,
+            fresh: true,
+            wake: false,
+        };
+        store.register(req, 1, &|_| false).unwrap().0.address
+    }
+
+    /// Marking ids that are already read (or not in the caller's mailbox)
+    /// succeeds without taking the writer lock: it completes while another
+    /// write transaction is open.
+    #[test]
+    fn mark_read_of_read_or_foreign_ids_takes_no_write_transaction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Store::open(&dir.path().join("agentmail.redb")).unwrap();
+        let a = agent(&s, "backend");
+        let b = agent(&s, "frontend");
+        let m = s
+            .insert_message(
+                NewMessage {
+                    from: a.clone(),
+                    to: vec![b.clone()],
+                    subject: Some("One".into()),
+                    body: "1".into(),
+                    kind: Kind::Note,
+                    urgent: false,
+                    refs: Vec::new(),
+                    in_reply_to: None,
+                },
+                1,
+            )
+            .unwrap();
+        s.mark_read(&b, std::slice::from_ref(&m.id)).unwrap();
+        assert_eq!(s.unread_counts(&b).unwrap(), (0, 0));
+
+        let writer = s.db.begin_write().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let again = s.mark_read(&b, std::slice::from_ref(&m.id));
+                let foreign = s.mark_read(&a, &[m.id.clone(), "nope".into()]);
+                let empty = s.mark_read(&b, &[]);
+                let _ = tx.send((again, foreign, empty));
+            });
+            let got = rx.recv_timeout(Duration::from_secs(5));
+            // Release the writer before asserting so a blocked call ends.
+            drop(writer);
+            let (again, foreign, empty) =
+                got.expect("mark_read of nothing unread must not wait for the writer lock");
+            assert_eq!(again, Ok(()));
+            assert_eq!(foreign, Ok(()));
+            assert_eq!(empty, Ok(()));
+        });
+        assert_eq!(s.unread_counts(&b).unwrap(), (0, 0));
     }
 }

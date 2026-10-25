@@ -1291,3 +1291,42 @@ async fn client_refuses_calls_after_streaming() {
     };
     assert!(err.message.contains("watch mode"), "{}", err.message);
 }
+
+/// A daemon that reads `Shutdown` and closes the connection without
+/// replying is going away, which is what was asked for.
+#[tokio::test]
+async fn shutdown_closed_without_reply_counts_as_acknowledged() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let fake = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut ops = Vec::new();
+        while let Some(l) = lines.next_line().await.unwrap() {
+            let env: Envelope = serde_json::from_str(&l).unwrap();
+            match env.req {
+                Request::Hello { .. } => {
+                    ops.push("hello");
+                    let resp = Response::Err {
+                        code: ErrorCode::VersionMismatch,
+                        message: "old daemon".into(),
+                        candidates: Vec::new(),
+                    };
+                    let mut out = serde_json::to_string(&resp).unwrap();
+                    out.push('\n');
+                    w.write_all(out.as_bytes()).await.unwrap();
+                }
+                Request::Shutdown => {
+                    ops.push("shutdown");
+                    break;
+                }
+                _ => panic!("unexpected request"),
+            }
+        }
+        ops
+    });
+    assert!(Client::shutdown(&paths).await.unwrap());
+    assert_eq!(fake.await.unwrap(), vec!["hello", "shutdown"]);
+}
