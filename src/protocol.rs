@@ -15,6 +15,10 @@
 //! without a successful `Hello`, so a newer client can always stop an older
 //! daemon and start its own.
 //!
+//! [`Request::Ask`], [`Request::AwaitAnswer`] and [`Request::WaitForMail`]
+//! block: their one response comes when the wait ends, at most their
+//! timeout later. A client that hangs up meanwhile cancels the wait.
+//!
 //! [`Request::Watch`] is the one streaming request: the daemon answers `Ok`
 //! once it is subscribed, then writes a [`Response::Event`] line per event
 //! until the client disconnects.
@@ -101,6 +105,9 @@ pub enum Request {
         #[serde(default)]
         refs: Vec<String>,
     },
+    /// Reply in `message_id`'s thread, to its sender and recipients other
+    /// than the caller. With `answer`, the reply must close an open
+    /// question on its reply chain. Data: the stored message.
     Reply {
         message_id: String,
         body: String,
@@ -111,6 +118,13 @@ pub enum Request {
         #[serde(default)]
         answer: bool,
     },
+    /// Send a question and block until it is answered, someone else
+    /// replies to the asker in its thread, or `timeout_secs` pass. Data:
+    /// `{"status":"answered","question_id","answer":Message}`,
+    /// `{"status":"clarification","question_id","message":Message}`,
+    /// `{"status":"pending","question_id"}` on timeout, or
+    /// `{"status":"no_one_listening","question_id"}` at once when no
+    /// recipient is active (the question is stored all the same).
     Ask {
         to: Vec<String>,
         subject: String,
@@ -121,10 +135,15 @@ pub enum Request {
         urgent: bool,
         timeout_secs: u64,
     },
+    /// Keep waiting on one's own question, as after [`Request::Ask`]
+    /// (`answered` at once if it already is). Replies present when the
+    /// call starts do not count as clarifications.
     AwaitAnswer {
         question_id: String,
         timeout_secs: u64,
     },
+    /// Block until the caller has unread mail (at once if it already has):
+    /// `{"status":"mail","messages":[Message]}`, or `{"status":"timeout"}`.
     WaitForMail {
         timeout_secs: u64,
     },

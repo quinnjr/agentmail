@@ -654,6 +654,17 @@ impl Store {
             .collect())
     }
 
+    /// `addr`'s unread messages, in id order. Unlike [`Store::inbox`], a
+    /// read open question is left out: only mail `addr` has not read yet.
+    pub fn unread(&self, addr: &str) -> Result<Vec<Message>, StoreError> {
+        let MailboxView { entries, .. } = self.mailbox_view(addr)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, read)| !read)
+            .map(|(m, _)| m)
+            .collect())
+    }
+
     /// `(unread messages, open questions addressed to addr)`.
     pub fn unread_counts(&self, addr: &str) -> Result<(usize, usize), StoreError> {
         let MailboxView { entries, open } = self.mailbox_view(addr)?;

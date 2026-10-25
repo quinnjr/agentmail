@@ -13,14 +13,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
 
-use self::handler::Handler;
-use self::hub::{Hub, involves};
+use self::handler::{Begun, Handler};
+use self::hub::{Hub, Wait, involves};
 use crate::paths::Paths;
 use crate::protocol::{
     ClientError, Envelope, ErrorCode, Event, MAX_REQUEST_BYTES, PROTOCOL_VERSION, Request, Response,
@@ -388,6 +390,15 @@ async fn connection(
                 watch_events(&mut reader, &mut w, handler.hub(), agent.as_deref()).await;
                 return;
             }
+            req @ (Request::Ask { .. }
+            | Request::AwaitAnswer { .. }
+            | Request::WaitForMail { .. }) => {
+                match blocking_call(&mut reader, &handler, env.caller, req).await {
+                    Some(res) => res,
+                    // The client hung up while waiting.
+                    None => return,
+                }
+            }
             req => {
                 let h = handler.clone();
                 let caller = env.caller;
@@ -398,6 +409,95 @@ async fn connection(
         };
         if write_response(&mut w, &to_response(res)).await.is_err() {
             return;
+        }
+    }
+}
+
+/// Run `f` on the handler on a blocking thread.
+async fn on_blocking_thread<T: Send + 'static>(
+    handler: &Arc<Handler>,
+    f: impl FnOnce(&Handler) -> Result<T, ClientError> + Send + 'static,
+) -> Result<T, ClientError> {
+    let h = handler.clone();
+    tokio::task::spawn_blocking(move || f(&h))
+        .await
+        .unwrap_or_else(|e| Err(ClientError::new(ErrorCode::Internal, e.to_string())))
+}
+
+/// Serve a blocking request (`Ask`, `AwaitAnswer`, `WaitForMail`): run its
+/// immediate part, then, if it has to wait, wait on the hub without holding
+/// a blocking thread. `None` when the client hung up meanwhile; there is
+/// then no one to answer.
+async fn blocking_call<R>(
+    reader: &mut R,
+    handler: &Arc<Handler>,
+    caller: crate::protocol::Caller,
+    req: Request,
+) -> Option<Result<Value, ClientError>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let begun = on_blocking_thread(handler, move |h| h.begin(&caller, req)).await;
+    match begun {
+        Ok(Begun::Done(data)) => Some(Ok(data)),
+        Ok(Begun::Wait { rx, wait, timeout }) => wait_for(reader, handler, rx, wait, timeout).await,
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Resolve once the peer has closed its end (or the connection failed).
+/// Input that arrives instead is left buffered for the next request, and
+/// this then never resolves.
+async fn peer_closed<R: AsyncBufRead + Unpin>(reader: &mut R) {
+    match reader.fill_buf().await {
+        Ok([]) | Err(_) => {}
+        Ok(_) => std::future::pending().await,
+    }
+}
+
+/// Wait until `wait` is over (checked against the store on every relevant
+/// event, and after any events were dropped for lagging), `timeout` runs
+/// out, or the client hangs up (`None`).
+async fn wait_for<R>(
+    reader: &mut R,
+    handler: &Arc<Handler>,
+    mut rx: broadcast::Receiver<Event>,
+    mut wait: Wait,
+    timeout: Duration,
+) -> Option<Result<Value, ClientError>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let closed = peer_closed(reader);
+    tokio::pin!(closed);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut closed => return None,
+            () = &mut deadline => return Some(Ok(Handler::timed_out(&wait))),
+            ev = rx.recv() => match ev {
+                Ok(event) if !wait.wakes(&event) => continue,
+                // A lag may have dropped the very event we wait for.
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Some(Err(ClientError::new(
+                        ErrorCode::Internal,
+                        "the daemon is shutting down",
+                    )));
+                }
+            },
+        }
+        let checked = on_blocking_thread(handler, move |h| {
+            let done = h.check(&mut wait)?;
+            Ok((wait, done))
+        })
+        .await;
+        match checked {
+            Ok((_, Some(data))) => return Some(Ok(data)),
+            Ok((w, None)) => wait = w,
+            Err(e) => return Some(Err(e)),
         }
     }
 }
@@ -474,7 +574,7 @@ mod tests {
     use super::*;
     use crate::model::{Agent, AgentView, Harness, Presence};
     use std::path::PathBuf;
-    use tokio::io::{AsyncBufReadExt, duplex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, duplex};
 
     fn presence(address: &str) -> Event {
         Event::Presence {
@@ -545,6 +645,140 @@ mod tests {
         crate::test_util::eventually(|| probe.try_lock()).expect("lock still held after release");
         crate::test_util::eventually(|| Store::open(&paths.db))
             .expect("successor could not open the store");
+    }
+
+    /// A handler over a fresh store, with one agent that has sent `human`
+    /// a message when `with_mail`.
+    fn handler_with(dir: &tempfile::TempDir, with_mail: bool) -> Arc<Handler> {
+        use crate::model::Kind;
+        use crate::store::{NewMessage, RegisterReq};
+        let store = Store::open(&dir.path().join("agentmail.redb")).unwrap();
+        if with_mail {
+            let req = RegisterReq {
+                name: "a".into(),
+                role: None,
+                working_on: None,
+                harness: Harness::Other,
+                cwd: PathBuf::from("/w"),
+                repo: None,
+                proc_id: None,
+                fresh: true,
+                wake: false,
+            };
+            let (agent, _) = store.register(req, 1, &|_| false).unwrap();
+            let msg = NewMessage {
+                from: agent.address,
+                to: vec![crate::model::HUMAN.into()],
+                subject: Some("s".into()),
+                body: "b".into(),
+                kind: Kind::Note,
+                urgent: false,
+                refs: vec![],
+                in_reply_to: None,
+            };
+            store.insert_message(msg, 2).unwrap();
+        }
+        Arc::new(Handler::new(Arc::new(store), Hub::new()))
+    }
+
+    fn human_mail() -> Wait {
+        Wait::Mail {
+            addr: crate::model::HUMAN.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_ends_without_an_answer_when_the_client_hangs_up() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, false);
+        let (client, daemon_in) = duplex(64);
+        let mut reader = BufReader::new(daemon_in);
+        let (_tx, rx) = broadcast::channel(4);
+        drop(client);
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(
+                &mut reader,
+                &handler,
+                rx,
+                human_mail(),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("wait outlived its client");
+        assert!(res.is_none(), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn input_during_a_wait_is_kept_for_the_next_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, false);
+        let (mut client, daemon_in) = duplex(64);
+        let mut reader = BufReader::new(daemon_in);
+        let (_tx, rx) = broadcast::channel(4);
+        client.write_all(b"next\n").await.unwrap();
+        let res = wait_for(
+            &mut reader,
+            &handler,
+            rx,
+            human_mail(),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(res, Some(Ok(json!({ "status": "timeout" }))));
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "next\n");
+    }
+
+    /// Events dropped for lagging may include the one waited for, so a
+    /// lag makes the wait check the store.
+    #[tokio::test]
+    async fn lagged_wait_checks_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, true);
+        let (_client, daemon_in) = duplex(64);
+        let mut reader = BufReader::new(daemon_in);
+        let (tx, rx) = broadcast::channel(1);
+        for i in 0..3 {
+            tx.send(presence(&format!("x-{i}"))).unwrap();
+        }
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(
+                &mut reader,
+                &handler,
+                rx,
+                human_mail(),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("lag did not end the wait");
+        let data = res.unwrap().unwrap();
+        assert_eq!(data["status"], "mail");
+        assert_eq!(data["messages"].as_array().unwrap().len(), 1);
+    }
+
+    /// Irrelevant events do not end a wait, even when the store would.
+    #[tokio::test]
+    async fn irrelevant_events_do_not_check_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handler = handler_with(&dir, true);
+        let (_client, daemon_in) = duplex(64);
+        let mut reader = BufReader::new(daemon_in);
+        let (tx, rx) = broadcast::channel(8);
+        tx.send(presence("x-1")).unwrap();
+        let res = wait_for(
+            &mut reader,
+            &handler,
+            rx,
+            human_mail(),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(res, Some(Ok(json!({ "status": "timeout" }))));
     }
 
     #[tokio::test]

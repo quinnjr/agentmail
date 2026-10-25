@@ -165,6 +165,30 @@ fn mark_read_hides_from_unread_inbox() {
 }
 
 #[test]
+fn unread_lists_only_unread_mail_even_for_open_questions() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let mut q = note(&a, &[&b], "Q", "q");
+    q.kind = Kind::Question;
+    let q = s.insert_message(q, 1).unwrap();
+    let m1 = s.insert_message(note(&a, &[&b], "One", "1"), 2).unwrap();
+    let m2 = s.insert_message(note(&a, &[&b], "Two", "2"), 3).unwrap();
+    assert_eq!(
+        ids(&s.unread(&b).unwrap()),
+        vec![q.id.as_str(), m1.id.as_str(), m2.id.as_str()]
+    );
+    s.mark_read(&b, &[q.id.clone(), m1.id.clone()]).unwrap();
+    // The read question is still open, so the inbox keeps it; unread does not.
+    assert_eq!(ids(&s.unread(&b).unwrap()), vec![m2.id.as_str()]);
+    assert_eq!(
+        ids(&s.inbox(&b, false).unwrap()),
+        vec![q.id.as_str(), m2.id.as_str()]
+    );
+    assert!(s.unread(&a).unwrap().is_empty());
+}
+
+#[test]
 fn reply_threads_and_prefixes_subject() {
     let (_d, s) = store();
     let a = agent(&s, "backend", None);

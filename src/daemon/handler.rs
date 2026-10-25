@@ -13,13 +13,16 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
-use super::hub::Hub;
+use super::hub::{Hub, Wait};
 use crate::ids::{is_address_shape, now_ms, validate_name};
-use crate::model::{Agent, AgentView, HUMAN, Kind, Message, Presence};
+use crate::model::{Agent, AgentView, HUMAN, Kind, Message, Presence, Question};
 use crate::procinfo;
 use crate::protocol::{Caller, ClientError, ErrorCode, Event, Request};
-use crate::store::{NewMessage, RegisterReq, Store, StoreError, agent_repo_key, lexical};
+use crate::store::{
+    NewMessage, RegisterReq, Store, StoreError, agent_repo_key, lexical, questions_closed_by,
+};
 
 /// How stale an agent's `last_seen` may get before a request refreshes it.
 pub const TOUCH_INTERVAL_MS: i64 = 1000;
@@ -39,18 +42,29 @@ pub fn store_err(e: StoreError) -> ClientError {
         StoreError::NotFound(_) => ErrorCode::NotFound,
         StoreError::UnknownRecipient(_) => ErrorCode::UnknownRecipient,
         StoreError::InvalidRecipient(_) => ErrorCode::InvalidRecipient,
-        StoreError::Deadlock(_) => ErrorCode::Deadlock,
+        StoreError::Deadlock(q) => return deadlock(q),
         StoreError::RecipientRegistered(_) | StoreError::Db(_) => ErrorCode::Internal,
     };
     ClientError::new(code, e.to_string())
 }
 
-fn to_json<T: Serialize>(value: &T) -> Result<Value, ClientError> {
-    serde_json::to_value(value).map_err(|e| ClientError::new(ErrorCode::Internal, e.to_string()))
+/// The refusal of a question that would close a wait cycle: `q` is the
+/// open question addressed to the would-be asker that it should deal with
+/// instead.
+fn deadlock(q: &Question) -> ClientError {
+    ClientError::new(
+        ErrorCode::Deadlock,
+        format!(
+            "asking would deadlock: {} is already waiting on you for question {}. \
+             Answer it first (`agentmail answer {}`), or send a clarifying reply \
+             in that thread (`agentmail reply {}`)",
+            q.asker, q.id, q.id, q.id
+        ),
+    )
 }
 
-fn unimplemented(op: &str) -> ClientError {
-    ClientError::new(ErrorCode::Internal, format!("unimplemented: {op}"))
+fn to_json<T: Serialize>(value: &T) -> Result<Value, ClientError> {
+    serde_json::to_value(value).map_err(|e| ClientError::new(ErrorCode::Internal, e.to_string()))
 }
 
 fn human_has_no(what: &str) -> ClientError {
@@ -68,6 +82,33 @@ pub const NOT_REGISTERED: &str =
 /// How many times a send resolves its recipients again when an agent
 /// registers under a held name between resolving and storing.
 const RESOLVE_ATTEMPTS: usize = 8;
+
+/// The longest a single blocking call waits; longer timeouts are cut to
+/// this. A week is far beyond any harness's tool-call limit.
+pub const MAX_WAIT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// What a blocking request turned into once its immediate part ran.
+pub enum Begun {
+    /// The request is answered already.
+    Done(Value),
+    /// Wait for events on `rx` (subscribed before anything the wait
+    /// depends on was read or stored, so nothing is missed), checking
+    /// `wait` with [`Handler::check`] on each relevant one, for at most
+    /// `timeout`; then answer [`Handler::timed_out`].
+    Wait {
+        rx: broadcast::Receiver<Event>,
+        wait: Wait,
+        timeout: Duration,
+    },
+}
+
+fn answered(question_id: &str, answer: Option<&Message>) -> Result<Value, ClientError> {
+    Ok(json!({
+        "status": "answered",
+        "question_id": question_id,
+        "answer": to_json(&answer)?,
+    }))
+}
 
 /// The recipients of a send, resolved from its `to` entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -540,17 +581,36 @@ impl Handler {
     }
 
     /// Store a new message from `me` to the resolved `to` entries, holding it
-    /// for names nobody active has yet, and announce the delivery.
-    fn send(&self, me: String, to: &[String], mut new: NewMessage) -> Result<Value, ClientError> {
+    /// for names nobody active has yet, and announce the delivery. Returns
+    /// the message with the names it is held for.
+    ///
+    /// A question that would close a wait cycle is refused with
+    /// [`ErrorCode::Deadlock`] before anything is written (the store checks
+    /// again when it writes, against a concurrent question).
+    fn deliver(
+        &self,
+        me: &str,
+        to: &[String],
+        mut new: NewMessage,
+    ) -> Result<(Message, Vec<String>), ClientError> {
         for _ in 0..RESOLVE_ATTEMPTS {
-            let resolved = self.resolve_recipients(&me, to)?;
+            let resolved = self.resolve_recipients(me, to)?;
+            if new.kind == Kind::Question
+                && let Some(q) = self
+                    .store
+                    .would_deadlock(me, &resolved.addresses)
+                    .map_err(store_err)?
+            {
+                return Err(deadlock(&q));
+            }
             let Some((repo, _)) = resolved.held_names.first() else {
                 new.to = resolved.addresses;
                 let msg = self
                     .store
                     .insert_message(new, now_ms())
                     .map_err(store_err)?;
-                return self.sent(&msg, &[]);
+                self.publish_delivered(&msg);
+                return Ok((msg, Vec::new()));
             };
             debug_assert!(resolved.held_names.iter().all(|(r, _)| r == repo));
             let names: Vec<String> = resolved.held_names.iter().map(|(_, n)| n.clone()).collect();
@@ -561,7 +621,10 @@ impl Handler {
                 .store
                 .insert_held(m, now_ms(), repo, &names, &procinfo::is_alive)
             {
-                Ok(msg) => return self.sent(&msg, &names),
+                Ok(msg) => {
+                    self.publish_delivered(&msg);
+                    return Ok((msg, names));
+                }
                 // An agent registered under a held name meanwhile: resolve
                 // again so it gets the mail directly.
                 Err(StoreError::RecipientRegistered(_)) => continue,
@@ -574,13 +637,243 @@ impl Handler {
         ))
     }
 
-    /// Announce a stored message and describe it to the sender, with the
-    /// names it is held for.
-    fn sent(&self, msg: &Message, held_for: &[String]) -> Result<Value, ClientError> {
-        self.publish_delivered(msg);
-        let mut out = to_json(msg)?;
-        out["held_for"] = to_json(&held_for)?;
-        Ok(out)
+    /// Reply to message `parent_id` from `me`: to the parent's sender and
+    /// recipients other than `me`, in that order, as a note or (with
+    /// `answer`) an answer that must close an open question on the reply
+    /// chain. The store enforces who may reply in the thread.
+    fn reply(
+        &self,
+        me: String,
+        parent_id: String,
+        body: String,
+        urgent: bool,
+        refs: Vec<String>,
+        answer: bool,
+    ) -> Result<Value, ClientError> {
+        let parent = self
+            .store
+            .get_message(&parent_id)
+            .map_err(store_err)?
+            .ok_or_else(|| {
+                ClientError::new(ErrorCode::NotFound, format!("no message {parent_id:?}"))
+            })?;
+        let mut to: Vec<String> = Vec::new();
+        for addr in std::iter::once(&parent.from).chain(&parent.to) {
+            if *addr != me && !to.contains(addr) {
+                to.push(addr.clone());
+            }
+        }
+        if to.is_empty() {
+            return Err(ClientError::new(
+                ErrorCode::InvalidRecipient,
+                format!("message {parent_id:?} has no one besides you to reply to"),
+            ));
+        }
+        let new = NewMessage {
+            from: me,
+            to,
+            subject: None,
+            body,
+            kind: if answer { Kind::Answer } else { Kind::Note },
+            urgent,
+            refs,
+            in_reply_to: Some(parent_id),
+        };
+        let msg = self
+            .store
+            .insert_message(new, now_ms())
+            .map_err(store_err)?;
+        self.publish_delivered(&msg);
+        to_json(&msg)
+    }
+
+    /// Whether anyone among `to` can answer now: the human, or an active
+    /// agent.
+    fn anyone_listening(&self, to: &[String]) -> Result<bool, ClientError> {
+        for addr in to {
+            if addr == HUMAN {
+                return Ok(true);
+            }
+            if let Some(agent) = self.store.get_agent(addr).map_err(store_err)?
+                && Store::presence(&agent, &procinfo::is_alive) == Presence::Active
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The first message in `thread` that answers (closes) question `id`.
+    fn answer_in<'a>(thread: &'a [Message], id: &str) -> Option<&'a Message> {
+        thread.iter().find(|m| {
+            questions_closed_by(m, thread)
+                .iter()
+                .any(|closed| closed.id == id)
+        })
+    }
+
+    /// Run the immediate part of a blocking request (`Ask`, `AwaitAnswer`,
+    /// `WaitForMail`): either its answer, or what to wait for. Any other
+    /// request is an internal error.
+    pub fn begin(&self, caller: &Caller, req: Request) -> Result<Begun, ClientError> {
+        match req {
+            Request::Ask {
+                to,
+                subject,
+                body,
+                refs,
+                urgent,
+                timeout_secs,
+            } => {
+                let me = self.resolve_caller(caller)?;
+                // Subscribe before storing, so no reply can slip by.
+                let rx = self.hub.subscribe();
+                let new = NewMessage {
+                    from: me.clone(),
+                    to: Vec::new(),
+                    subject: Some(subject),
+                    body,
+                    kind: Kind::Question,
+                    urgent,
+                    refs,
+                    in_reply_to: None,
+                };
+                let (msg, _held) = self.deliver(&me, &to, new)?;
+                // Names the mail is held for have no one to answer yet.
+                if !self.anyone_listening(&msg.to)? {
+                    return Ok(Begun::Done(json!({
+                        "status": "no_one_listening",
+                        "question_id": msg.id,
+                    })));
+                }
+                Ok(Begun::Wait {
+                    rx,
+                    wait: Wait::Answer {
+                        question_id: msg.id.clone(),
+                        thread_id: msg.thread_id,
+                        asker: me,
+                        seen: HashSet::from([msg.id]),
+                    },
+                    timeout: Duration::from_secs(timeout_secs).min(MAX_WAIT),
+                })
+            }
+            Request::AwaitAnswer {
+                question_id,
+                timeout_secs,
+            } => {
+                let me = self.resolve_caller(caller)?;
+                let rx = self.hub.subscribe();
+                // The thread before the question row: see `check_answer`.
+                let q = self.question(&question_id)?;
+                if q.asker != me {
+                    return Err(ClientError::new(
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "question {question_id:?} was asked by {}; only its asker                              waits for the answer",
+                            q.asker
+                        ),
+                    ));
+                }
+                let thread = self.store.thread(&q.thread_id).map_err(store_err)?;
+                let q = self.question(&question_id)?;
+                if q.answered_by.is_some() {
+                    let thread = self.store.thread(&q.thread_id).map_err(store_err)?;
+                    return answered(&q.id, Self::answer_in(&thread, &q.id)).map(Begun::Done);
+                }
+                Ok(Begun::Wait {
+                    rx,
+                    wait: Wait::Answer {
+                        question_id: q.id,
+                        thread_id: q.thread_id,
+                        asker: me,
+                        seen: thread.into_iter().map(|m| m.id).collect(),
+                    },
+                    timeout: Duration::from_secs(timeout_secs).min(MAX_WAIT),
+                })
+            }
+            Request::WaitForMail { timeout_secs } => {
+                let me = self.resolve_caller(caller)?;
+                let rx = self.hub.subscribe();
+                let mut wait = Wait::Mail { addr: me };
+                if let Some(done) = self.check(&mut wait)? {
+                    return Ok(Begun::Done(done));
+                }
+                Ok(Begun::Wait {
+                    rx,
+                    wait,
+                    timeout: Duration::from_secs(timeout_secs).min(MAX_WAIT),
+                })
+            }
+            _ => Err(ClientError::new(
+                ErrorCode::Internal,
+                "not a blocking request",
+            )),
+        }
+    }
+
+    /// Question `id`, or [`ErrorCode::NotFound`] when there is no such
+    /// question.
+    fn question(&self, id: &str) -> Result<Question, ClientError> {
+        self.store
+            .question(id)
+            .map_err(store_err)?
+            .ok_or_else(|| ClientError::new(ErrorCode::NotFound, format!("no question {id:?}")))
+    }
+
+    /// Whether `wait` is over, judged from the store alone: its answer if
+    /// so, `None` to keep waiting. Updates what the wait has seen.
+    pub fn check(&self, wait: &mut Wait) -> Result<Option<Value>, ClientError> {
+        match wait {
+            Wait::Answer {
+                question_id,
+                thread_id,
+                asker,
+                seen,
+            } => {
+                // Read the thread before the question row. An answer and
+                // the question's closing are stored together, so an answer
+                // in this snapshot always shows as closed below and is
+                // never taken for a clarification.
+                let thread = self.store.thread(thread_id).map_err(store_err)?;
+                let q = self.question(question_id)?;
+                if q.answered_by.is_some() {
+                    let thread = self.store.thread(thread_id).map_err(store_err)?;
+                    return answered(question_id, Self::answer_in(&thread, question_id)).map(Some);
+                }
+                for m in thread {
+                    if !seen.insert(m.id.clone()) {
+                        continue;
+                    }
+                    if m.from != *asker && m.to.iter().any(|a| a == asker) {
+                        return Ok(Some(json!({
+                            "status": "clarification",
+                            "question_id": question_id,
+                            "message": to_json(&m)?,
+                        })));
+                    }
+                }
+                Ok(None)
+            }
+            Wait::Mail { addr } => {
+                let unread = self.store.unread(addr).map_err(store_err)?;
+                if unread.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    json!({ "status": "mail", "messages": to_json(&unread)? }),
+                ))
+            }
+        }
+    }
+
+    /// The answer to a wait that ran out of time.
+    pub fn timed_out(wait: &Wait) -> Value {
+        match wait {
+            Wait::Answer { question_id, .. } => {
+                json!({ "status": "pending", "question_id": question_id })
+            }
+            Wait::Mail { .. } => json!({ "status": "timeout" }),
+        }
     }
 
     fn view(&self, agent: Agent, is_contact: bool) -> AgentView {
@@ -724,7 +1017,10 @@ impl Handler {
                     refs,
                     in_reply_to: None,
                 };
-                self.send(me, &to, new)
+                let (msg, held_for) = self.deliver(&me, &to, new)?;
+                let mut out = to_json(&msg)?;
+                out["held_for"] = to_json(&held_for)?;
+                Ok(out)
             }
             Request::Inbox { all } => {
                 let me = self.resolve_caller(caller)?;
@@ -766,13 +1062,25 @@ impl Handler {
                 let pruned = self.store.prune(before).map_err(store_err)?;
                 Ok(json!({ "pruned": pruned }))
             }
-            Request::Reply { .. } => Err(unimplemented("reply")),
-            Request::Ask { .. } => Err(unimplemented("ask")),
-            Request::AwaitAnswer { .. } => Err(unimplemented("await_answer")),
-            Request::WaitForMail { .. } => Err(unimplemented("wait_for_mail")),
-            Request::Hello { .. } | Request::Watch { .. } | Request::Shutdown => Err(
-                ClientError::new(ErrorCode::Internal, "handled by the connection loop"),
-            ),
+            Request::Reply {
+                message_id,
+                body,
+                urgent,
+                refs,
+                answer,
+            } => {
+                let me = self.resolve_caller(caller)?;
+                self.reply(me, message_id, body, urgent, refs, answer)
+            }
+            Request::Ask { .. }
+            | Request::AwaitAnswer { .. }
+            | Request::WaitForMail { .. }
+            | Request::Hello { .. }
+            | Request::Watch { .. }
+            | Request::Shutdown => Err(ClientError::new(
+                ErrorCode::Internal,
+                "handled by the connection loop",
+            )),
         }
     }
 
