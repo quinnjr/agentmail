@@ -119,10 +119,19 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> anyhow::Result<ExitCode>
             },
         },
         DaemonAction::Stop => {
-            // No Hello, so this also stops a daemon of another protocol.
-            if !Client::shutdown(paths).await? {
-                println!("daemon not running");
-                return Ok(ExitCode::SUCCESS);
+            // Also stops a daemon of another protocol, but never one that
+            // serves another data directory through the same socket.
+            match Client::shutdown(paths).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!("daemon not running");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
+                    println!("daemon running, but not for this data directory; not stopped: {e:#}");
+                    return Ok(ExitCode::FAILURE);
+                }
+                Err(e) => return Err(e),
             }
             // Wait until it has released the database and lock, so a
             // following start gets a fresh daemon.

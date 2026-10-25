@@ -170,6 +170,28 @@ async fn version_mismatch_rejected() {
 }
 
 #[tokio::test]
+async fn failed_rehello_revokes_the_handshake() {
+    let d = TestDaemon::start().await;
+    let resp = raw_exchange(
+        &d.paths,
+        &[
+            line(
+                Caller::Human,
+                Request::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+            ),
+            line(Caller::Human, Request::Hello { version: 999 }),
+            line(Caller::Human, Request::Counts),
+        ],
+    )
+    .await;
+    assert!(matches!(resp[0], Response::Ok { .. }), "{:?}", resp[0]);
+    assert_eq!(err_code(&resp[1]), ErrorCode::VersionMismatch);
+    assert_eq!(err_code(&resp[2]), ErrorCode::VersionMismatch);
+}
+
+#[tokio::test]
 async fn request_before_hello_rejected() {
     let d = TestDaemon::start().await;
     let resp = raw_exchange(&d.paths, &[line(Caller::Human, Request::Counts)]).await;
@@ -797,7 +819,7 @@ async fn daemon_cli_status_and_stop_handle_a_daemon_with_another_protocol() {
         .await
         .expect("fake daemon was never stopped")
         .unwrap();
-    assert_eq!(conns, vec![vec!["hello"], vec!["shutdown"]]);
+    assert_eq!(conns, vec![vec!["hello"], vec!["hello", "shutdown"]]);
 }
 
 #[tokio::test]
@@ -825,7 +847,43 @@ async fn client_shutdown_reports_whether_a_daemon_answered() {
 
     let fake = spawn_old_daemon(&paths);
     assert!(Client::shutdown(&paths).await.unwrap());
-    assert_eq!(fake.await.unwrap(), vec![vec!["shutdown"]]);
+    assert_eq!(fake.await.unwrap(), vec![vec!["hello", "shutdown"]]);
+}
+
+#[tokio::test]
+async fn client_shutdown_stops_a_daemon_that_does_not_report_its_data_dir() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let fake = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut ops = Vec::new();
+        while let Some(l) = lines.next_line().await.unwrap() {
+            let env: Envelope = serde_json::from_str(&l).unwrap();
+            let data = match env.req {
+                Request::Hello { .. } => {
+                    ops.push("hello");
+                    serde_json::json!({ "version": PROTOCOL_VERSION })
+                }
+                Request::Shutdown => {
+                    ops.push("shutdown");
+                    Value::Null
+                }
+                _ => {
+                    ops.push("other");
+                    Value::Null
+                }
+            };
+            let mut out = serde_json::to_string(&Response::Ok { data }).unwrap();
+            out.push('\n');
+            w.write_all(out.as_bytes()).await.unwrap();
+        }
+        ops
+    });
+    assert!(Client::shutdown(&paths).await.unwrap());
+    assert_eq!(fake.await.unwrap(), vec!["hello", "shutdown"]);
 }
 
 #[tokio::test]
@@ -1141,4 +1199,30 @@ async fn daemon_status_reports_a_daemon_for_another_data_dir() {
     assert!(!out.contains("not running"), "{out}");
     assert!(out.contains("not for this data directory"), "{out}");
     assert!(out.contains("AGENTMAIL_SOCKET"), "{out}");
+}
+
+#[tokio::test]
+async fn daemon_stop_refuses_a_daemon_for_another_data_dir() {
+    let d = TestDaemon::start().await;
+    let other = TempDir::new().unwrap();
+    let paths = Paths {
+        socket: d.paths.socket.clone(),
+        ..Paths::in_dir(other.path())
+    };
+    let (code, out) = run_cli(&paths, &["daemon", "stop"]).await;
+    assert_eq!(code, Some(1), "{out}");
+    assert!(!out.contains("daemon stopped"), "{out}");
+    assert!(out.contains("not for this data directory"), "{out}");
+    assert!(out.contains("AGENTMAIL_SOCKET"), "{out}");
+
+    let err = Client::shutdown(&paths).await.expect_err("stopped it");
+    assert!(
+        err.downcast_ref::<agentmail::client::DataDirMismatch>()
+            .is_some(),
+        "{err:#}"
+    );
+    // The daemon is still serving.
+    let mut c = d.client().await;
+    c.call(&Caller::Human, Request::Whoami).await.unwrap();
+    assert!(d.paths.lock_held());
 }

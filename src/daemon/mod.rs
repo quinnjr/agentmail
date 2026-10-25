@@ -337,13 +337,17 @@ async fn connection(
                     "data_dir": data_dir.to_string_lossy(),
                 }))
             }
-            Request::Hello { version } => Err(ClientError::new(
-                ErrorCode::VersionMismatch,
-                format!(
-                    "client speaks protocol {version}, daemon speaks {PROTOCOL_VERSION}; \
+            Request::Hello { version } => {
+                // A failed handshake revokes an earlier successful one.
+                greeted = false;
+                Err(ClientError::new(
+                    ErrorCode::VersionMismatch,
+                    format!(
+                        "client speaks protocol {version}, daemon speaks {PROTOCOL_VERSION}; \
                      restart the daemon"
-                ),
-            )),
+                    ),
+                ))
+            }
             Request::Shutdown => {
                 let _ = write_response(&mut w, &Response::Ok { data: Value::Null }).await;
                 let _ = stop.send(true);

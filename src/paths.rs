@@ -235,7 +235,7 @@ mod tests {
     fn paths_lock_held_sees_a_held_lock_only() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = Paths::in_dir(dir.path());
-        assert!(!p.lock_held(), "missing lock file counts as held");
+        assert!(!p.lock_held(), "a missing lock file must not count as held");
         let lock = std::fs::File::create(&p.lock).unwrap();
         assert!(!p.lock_held());
         lock.try_lock().unwrap();

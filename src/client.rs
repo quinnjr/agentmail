@@ -202,8 +202,14 @@ impl Client {
         }
     }
 
-    /// Ask the daemon for `paths` to stop, without the `Hello` handshake, so
-    /// it works on a daemon of any protocol version. Never starts one.
+    /// Ask the daemon for `paths` to stop. Never starts one.
+    ///
+    /// Sends `Hello` first, so a daemon serving another data directory
+    /// through the same socket is left running and reported as
+    /// [`DataDirMismatch`]. A daemon of another protocol version (it answers
+    /// `Hello` with `VersionMismatch`), or one that does not report its data
+    /// directory, is sent a bare `Shutdown` on the same connection, which
+    /// every protocol version honours.
     ///
     /// Returns false when no daemon is listening (no socket file, or a stale
     /// one nobody accepts on), true once the daemon has acknowledged. The
@@ -226,6 +232,18 @@ impl Client {
                         .context(format!("connecting to {}", paths.socket.display())));
                 }
             };
+            match c.hello().await {
+                Ok(hello) => match check_data_dir(paths, &hello) {
+                    Ok(()) => {}
+                    // A daemon that does not say which directory it serves
+                    // cannot be told apart from ours; stop it, as the
+                    // mismatch message advises.
+                    Err(e) if e.theirs.is_none() => {}
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) if e.code == ErrorCode::VersionMismatch => {}
+                Err(e) => return Err(e.into()),
+            }
             c.call(&Caller::Human, Request::Shutdown).await?;
             Ok(true)
         };
