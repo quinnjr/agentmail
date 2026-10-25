@@ -75,18 +75,6 @@ async fn daemon_pid(c: &mut Client) -> anyhow::Result<u64> {
     Ok(hello["pid"].as_u64().unwrap_or(0))
 }
 
-/// Whether some daemon holds the lock for `paths`.
-fn lock_held(paths: &Paths) -> bool {
-    let Ok(file) = std::fs::File::open(&paths.lock) else {
-        return false;
-    };
-    match file.try_lock() {
-        Ok(()) => false,
-        Err(std::fs::TryLockError::WouldBlock) => true,
-        Err(std::fs::TryLockError::Error(_)) => false,
-    }
-}
-
 async fn daemon(paths: &Paths, action: DaemonAction) -> anyhow::Result<ExitCode> {
     match action {
         DaemonAction::Run => {
@@ -135,7 +123,7 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> anyhow::Result<ExitCode>
             // Wait until it has released the database and lock, so a
             // following start gets a fresh daemon.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while lock_held(paths) {
+            while paths.lock_held() {
                 if Instant::now() >= deadline {
                     anyhow::bail!("daemon did not stop within 5s");
                 }

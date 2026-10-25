@@ -84,6 +84,22 @@ impl Paths {
         })
     }
 
+    /// Whether some process holds the daemon lock at [`Paths::lock`].
+    ///
+    /// A non-blocking probe on a fresh open file description, so it also
+    /// sees a lock held elsewhere in this process. A missing or unreadable
+    /// lock file counts as not held.
+    pub fn lock_held(&self) -> bool {
+        let Ok(file) = std::fs::File::open(&self.lock) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+
     /// Put everything, socket included, in `dir`. Used by tests.
     pub fn in_dir(dir: &Path) -> Paths {
         Paths {
@@ -213,6 +229,19 @@ mod tests {
     #[test]
     fn paths_without_home_or_xdg_is_an_error() {
         assert!(Paths::from_vars(vars(&[])).is_err());
+    }
+
+    #[test]
+    fn paths_lock_held_sees_a_held_lock_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = Paths::in_dir(dir.path());
+        assert!(!p.lock_held(), "missing lock file counts as held");
+        let lock = std::fs::File::create(&p.lock).unwrap();
+        assert!(!p.lock_held());
+        lock.try_lock().unwrap();
+        assert!(p.lock_held());
+        drop(lock);
+        assert!(!p.lock_held());
     }
 
     #[test]

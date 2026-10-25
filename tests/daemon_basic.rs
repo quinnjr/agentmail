@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentmail::client::Client;
 use agentmail::daemon::handler::TOUCH_INTERVAL_MS;
-use agentmail::daemon::{DaemonConfig, serve};
+use agentmail::daemon::{DaemonConfig, MAX_SOCKET_PATH_BYTES, serve};
 use agentmail::model::HUMAN;
 use agentmail::paths::Paths;
 use agentmail::protocol::{
@@ -472,7 +472,9 @@ async fn whoami_agents_status_contacts() {
         .await
         .unwrap();
     let contacts = c.call(&agent(&a), Request::Contacts).await.unwrap();
+    assert_eq!(contacts.as_array().unwrap().len(), 1);
     assert_eq!(contacts[0]["address"], b.as_str());
+    assert_eq!(contacts[0]["is_contact"], true);
 
     // Unbound agents are gone; `all` includes them.
     let listed = c
@@ -894,7 +896,7 @@ async fn bind_leaves_no_staging_files_and_replaces_leftovers() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
     // A crashed predecessor's staging directory and socket.
-    let staging = dir.path().join(".agentmail.sock.tmp");
+    let staging = dir.path().join(".agentmail.sock.d");
     std::fs::create_dir(&staging).unwrap();
     let _old = std::os::unix::net::UnixListener::bind(staging.join("s")).unwrap();
     std::fs::write(&paths.socket, b"stale").unwrap();
@@ -932,4 +934,130 @@ async fn last_seen_is_refreshed_at_most_once_per_interval() {
         t2 >= t0 + TOUCH_INTERVAL_MS,
         "last_seen did not advance: {t0} -> {t2}"
     );
+}
+
+/// A listener at `paths.socket` that accepts connections and never answers.
+fn silent_listener(paths: &Paths) -> tokio::task::JoinHandle<()> {
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    })
+}
+
+#[tokio::test]
+async fn handshake_with_a_silent_peer_times_out() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let task = silent_listener(&paths);
+    // A binary that would never serve: the client must not wait on it.
+    let start = Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect_or_spawn_with(&paths, Path::new("/bin/true")),
+    )
+    .await
+    .expect("connect_or_spawn_with hung")
+    .err()
+    .expect("connected to a silent peer");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("did not answer"), "{msg}");
+    assert!(msg.contains(&paths.socket.display().to_string()), "{msg}");
+    assert!(start.elapsed() < Duration::from_secs(6));
+
+    let err = tokio::time::timeout(Duration::from_secs(10), Client::connect(&paths))
+        .await
+        .expect("connect hung")
+        .err()
+        .expect("connected to a silent peer");
+    assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
+
+    let err = tokio::time::timeout(Duration::from_secs(10), Client::shutdown(&paths))
+        .await
+        .expect("shutdown hung")
+        .expect_err("a silent peer acknowledged shutdown");
+    assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn autostart_reports_a_lock_held_without_a_socket() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    // A daemon that holds the lock but listens somewhere else.
+    let lock = std::fs::File::create(&paths.lock).unwrap();
+    lock.try_lock().unwrap();
+    assert!(paths.lock_held());
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(15),
+        Client::connect_or_spawn_with(&paths, &bin()),
+    )
+    .await
+    .expect("connect_or_spawn_with hung")
+    .err()
+    .expect("connected without a daemon");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(&paths.lock.display().to_string()), "{msg}");
+    assert!(msg.contains("not listening"), "{msg}");
+    assert!(msg.contains("XDG_RUNTIME_DIR"), "{msg}");
+    drop(lock);
+    assert!(!paths.lock_held());
+}
+
+/// Paths in `dir` with a socket path exactly `len` bytes long.
+fn paths_with_socket_len(dir: &Path, len: usize) -> Paths {
+    let mut paths = Paths::in_dir(dir);
+    let base = dir.as_os_str().len() + 1;
+    assert!(len > base + 5, "temp dir path too long for this test");
+    paths.socket = dir.join("s".repeat(len - base));
+    assert_eq!(paths.socket.as_os_str().len(), len);
+    paths
+}
+
+#[tokio::test]
+async fn longest_socket_path_that_fits_is_served() {
+    let dir = TempDir::new().unwrap();
+    let paths = paths_with_socket_len(dir.path(), MAX_SOCKET_PATH_BYTES);
+    let task = tokio::spawn({
+        let paths = paths.clone();
+        async move { serve(DaemonConfig { paths }).await }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut c = loop {
+        if let Ok(c) = Client::connect(&paths).await {
+            break c;
+        }
+        assert!(!task.is_finished(), "{:?}", task.await.unwrap());
+        assert!(Instant::now() < deadline, "daemon did not start");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    c.call(&Caller::Human, Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn too_long_socket_path_is_refused_by_name() {
+    let dir = TempDir::new().unwrap();
+    let paths = paths_with_socket_len(dir.path(), MAX_SOCKET_PATH_BYTES + 1);
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        serve(DaemonConfig {
+            paths: paths.clone(),
+        }),
+    )
+    .await
+    .expect("serve hung")
+    .expect_err("served on a socket path that is too long");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("too long"), "{msg}");
+    assert!(msg.contains(&paths.socket.display().to_string()), "{msg}");
+    assert!(!msg.contains(".d/s"), "{msg}");
+    assert!(std::fs::symlink_metadata(&paths.socket).is_err());
 }

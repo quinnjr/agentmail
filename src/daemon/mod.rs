@@ -35,6 +35,14 @@ const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
 /// How long to wait for in-flight database work after shutdown.
 const STORE_RELEASE_WAIT: Duration = Duration::from_secs(5);
 
+/// The longest path a Unix socket can be bound at: `sun_path` holds 108
+/// bytes, including the terminating NUL.
+const SUN_PATH_MAX: usize = 107;
+/// What staging adds to the socket path: `<parent>/.<name>.d/s`.
+const STAGING_EXTRA_BYTES: usize = ".".len() + ".d".len() + "/s".len();
+/// The longest socket path the daemon can serve, in bytes.
+pub const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_MAX - STAGING_EXTRA_BYTES;
+
 pub struct DaemonConfig {
     pub paths: Paths,
 }
@@ -91,9 +99,17 @@ fn bind_private(socket: &Path) -> Result<UnixListener> {
         .with_context(|| format!("{} has no file name", socket.display()))?;
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(".tmp");
+    tmp_name.push(".d");
     let tmp_dir = parent.join(tmp_name);
     let tmp_sock = tmp_dir.join("s");
+    if tmp_sock.as_os_str().len() > SUN_PATH_MAX {
+        anyhow::bail!(
+            "socket path {} is too long ({} bytes; at most {MAX_SOCKET_PATH_BYTES}): \
+             set AGENTMAIL_SOCKET or XDG_RUNTIME_DIR to a shorter path",
+            socket.display(),
+            socket.as_os_str().len(),
+        );
+    }
 
     // A crashed predecessor may have left the staging directory behind.
     // We hold the lock, so nothing else is using it. Never remove more

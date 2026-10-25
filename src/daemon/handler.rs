@@ -5,9 +5,11 @@
 //! connection loop runs it inside `spawn_blocking`.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -58,24 +60,69 @@ fn human_has_no(what: &str) -> ClientError {
     )
 }
 
-/// The git toplevel containing `cwd`, if any. The caller's own git
-/// environment is not inherited, so only `cwd` decides.
+/// How long `git rev-parse` may take before the repo is treated as unknown.
+const GIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often to check whether a bounded command has exited.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Run `cmd` and return its stdout if it exits successfully within
+/// `limit`. A command still running at the deadline is killed and yields
+/// `None`, as does one that cannot be started or fails.
+///
+/// Stdout is drained on a separate thread, so a chatty command cannot
+/// block on a full pipe, and a grandchild that keeps the pipe open cannot
+/// hold us past the deadline either.
+fn output_within(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + limit;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let res = stdout.read_to_end(&mut buf).map(|_| buf);
+        let _ = tx.send(res);
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            // Timed out, or cannot tell: stop it and give up.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(POLL_INTERVAL);
+    rx.recv_timeout(wait).ok()?.ok()
+}
+
+/// The git toplevel containing `cwd`, if any, or `None` when git does not
+/// answer within [`GIT_TIMEOUT`]. The caller's own git environment is not
+/// inherited, so only `cwd` decides; git never prompts and never takes
+/// optional locks.
 fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_CEILING_DIRECTORIES")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let mut raw = out.stdout;
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let mut raw = output_within(cmd, GIT_TIMEOUT)?;
     while raw.last() == Some(&b'\n') || raw.last() == Some(&b'\r') {
         raw.pop();
     }
@@ -128,10 +175,10 @@ impl Handler {
         Ok(agent.address)
     }
 
-    fn view(&self, agent: Agent, contacts: &HashSet<String>) -> AgentView {
+    fn view(&self, agent: Agent, is_contact: bool) -> AgentView {
         AgentView {
             presence: Store::presence(&agent, &procinfo::is_alive),
-            is_contact: contacts.contains(&agent.address),
+            is_contact,
             agent,
         }
     }
@@ -153,7 +200,7 @@ impl Handler {
             .ok_or_else(|| {
                 ClientError::new(ErrorCode::NotFound, format!("no agent {address:?}"))
             })?;
-        Ok(self.view(agent, &HashSet::new()))
+        Ok(self.view(agent, false))
     }
 
     fn publish_presence(&self, view: &AgentView) {
@@ -242,11 +289,11 @@ impl Handler {
             }
             Request::Contacts => {
                 let me = self.resolve_caller(caller)?;
-                let contacts = self.contact_set(&me)?;
                 let mut views = Vec::new();
                 for address in self.store.contacts(&me).map_err(store_err)? {
                     if let Some(agent) = self.store.get_agent(&address).map_err(store_err)? {
-                        views.push(self.view(agent, &contacts));
+                        // Every listed agent is a contact.
+                        views.push(self.view(agent, true));
                     }
                 }
                 to_json(&views)
@@ -343,7 +390,7 @@ impl Handler {
             .store
             .register_and_release(req, now_ms(), &procinfo::is_alive)
             .map_err(store_err)?;
-        let view = self.view(agent, &HashSet::new());
+        let view = self.view(agent, false);
         self.publish_presence(&view);
         for msg in &released {
             self.hub.publish(Event::Delivered {
@@ -391,7 +438,10 @@ impl Handler {
                         || lexical(&a.cwd).starts_with(r)
                 })
             })
-            .map(|a| self.view(a, &contacts))
+            .map(|a| {
+                let is_contact = contacts.contains(&a.address);
+                self.view(a, is_contact)
+            })
             .filter(|v| all || v.presence == crate::model::Presence::Active)
             .collect();
         to_json(&views)
@@ -416,5 +466,69 @@ impl Handler {
                 .map_err(store_err)?;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_output_returns_stdout_of_a_quick_command() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("/repo\n");
+        assert_eq!(
+            output_within(cmd, Duration::from_secs(5)),
+            Some(b"/repo\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn bounded_output_is_none_on_failure() {
+        assert_eq!(
+            output_within(Command::new("false"), Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            output_within(
+                Command::new("/nonexistent/agentmail-test"),
+                Duration::from_secs(5)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_output_kills_a_hung_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        assert_eq!(output_within(cmd, Duration::from_millis(200)), None);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn git_toplevel_finds_the_repo_and_none_outside_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(git_toplevel(dir.path()), None);
+        let ok = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let top = git_toplevel(&sub).unwrap();
+        assert_eq!(
+            top.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 }

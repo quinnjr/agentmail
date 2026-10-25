@@ -20,6 +20,9 @@ use crate::protocol::{Caller, Envelope, ErrorCode, Event, PROTOCOL_VERSION, Requ
 const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// How long to wait for a spawned daemon.
 const SPAWN_WAIT: Duration = Duration::from_secs(3);
+/// How long a running daemon may take to accept and answer `Hello` (or
+/// `Shutdown`) before the client gives up on it.
+const ANSWER_WAIT: Duration = Duration::from_secs(3);
 /// How often to spawn again while waiting. A spawned daemon exits quietly
 /// when another holds the lock, e.g. one that is still shutting down.
 const RESPAWN_INTERVAL: Duration = Duration::from_millis(500);
@@ -68,6 +71,16 @@ fn spawn_daemon(paths: &Paths, bin: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Why opening a connection with the `Hello` handshake failed.
+enum Handshake {
+    /// Nothing accepted the connection.
+    Open(std::io::Error),
+    /// The peer answered `Hello` with an error.
+    Refused(Box<Client>, ClientError),
+    /// The peer did not answer in time.
+    TimedOut(anyhow::Error),
+}
+
 impl Client {
     /// Open the socket without the handshake.
     async fn open(paths: &Paths) -> std::io::Result<Client> {
@@ -89,13 +102,42 @@ impl Client {
         .await
     }
 
+    /// The error for a peer at the socket that did not answer in time.
+    fn no_answer(paths: &Paths, limit: Duration) -> anyhow::Error {
+        anyhow!(
+            "daemon at {} did not answer within {}ms (is it stopped or wedged, \
+             or is another program listening there?)",
+            paths.socket.display(),
+            limit.as_millis()
+        )
+    }
+
+    /// Open the socket and complete the handshake, all within `limit`.
+    async fn open_and_hello(paths: &Paths, limit: Duration) -> Result<Client, Handshake> {
+        let attempt = async {
+            let mut c = Client::open(paths).await.map_err(Handshake::Open)?;
+            match c.hello().await {
+                Ok(_) => Ok(c),
+                Err(e) => Err(Handshake::Refused(Box::new(c), e)),
+            }
+        };
+        match tokio::time::timeout(limit, attempt).await {
+            Ok(res) => res,
+            Err(_) => Err(Handshake::TimedOut(Client::no_answer(paths, limit))),
+        }
+    }
+
     /// Connect to a running daemon. Never starts one.
     pub async fn connect(paths: &Paths) -> Result<Client> {
-        let mut c = Client::open(paths)
-            .await
-            .with_context(|| format!("connecting to {}", paths.socket.display()))?;
-        c.hello().await?;
-        Ok(c)
+        match Client::open_and_hello(paths, ANSWER_WAIT).await {
+            Ok(c) => Ok(c),
+            Err(Handshake::Open(e)) => {
+                Err(anyhow::Error::new(e)
+                    .context(format!("connecting to {}", paths.socket.display())))
+            }
+            Err(Handshake::Refused(_, e)) => Err(e.into()),
+            Err(Handshake::TimedOut(e)) => Err(e),
+        }
     }
 
     /// Ask the daemon for `paths` to stop, without the `Hello` handshake, so
@@ -103,25 +145,31 @@ impl Client {
     ///
     /// Returns false when no daemon is listening (no socket file, or a stale
     /// one nobody accepts on), true once the daemon has acknowledged. The
-    /// daemon may still be releasing its lock when this returns.
+    /// daemon may still be releasing its lock when this returns. A peer that
+    /// does not acknowledge within a few seconds is an error.
     pub async fn shutdown(paths: &Paths) -> Result<bool> {
-        let mut c = match Client::open(paths).await {
-            Ok(c) => c,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return Ok(false);
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("connecting to {}", paths.socket.display())));
-            }
+        let attempt = async {
+            let mut c = match Client::open(paths).await {
+                Ok(c) => c,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("connecting to {}", paths.socket.display())));
+                }
+            };
+            c.call(&Caller::Human, Request::Shutdown).await?;
+            Ok(true)
         };
-        c.call(&Caller::Human, Request::Shutdown).await?;
-        Ok(true)
+        tokio::time::timeout(ANSWER_WAIT, attempt)
+            .await
+            .unwrap_or_else(|_| Err(Client::no_answer(paths, ANSWER_WAIT)))
     }
 
     /// Connect, starting the daemon (see [`daemon_bin`]) if none is running.
@@ -132,41 +180,59 @@ impl Client {
     /// [`Client::connect_or_spawn`] with an explicit daemon binary.
     ///
     /// A daemon speaking another protocol version is sent `Shutdown` and
-    /// replaced, once.
+    /// replaced, once. A peer that accepts but does not answer is an error:
+    /// starting another daemon would not help, as the silent one either
+    /// holds the lock or is not a daemon at all.
     pub async fn connect_or_spawn_with(paths: &Paths, bin: &Path) -> Result<Client> {
-        if let Ok(mut c) = Client::open(paths).await {
-            match c.hello().await {
-                Ok(_) => return Ok(c),
-                Err(e) if e.code == ErrorCode::VersionMismatch => {
-                    let _ = c.call(&Caller::Human, Request::Shutdown).await;
-                }
-                // The daemon is going away; start a new one below.
-                Err(e) if e.code == ErrorCode::ConnectionLost => {}
-                Err(e) => return Err(e.into()),
+        match Client::open_and_hello(paths, ANSWER_WAIT).await {
+            Ok(c) => return Ok(c),
+            Err(Handshake::Refused(mut c, e)) if e.code == ErrorCode::VersionMismatch => {
+                let _ =
+                    tokio::time::timeout(ANSWER_WAIT, c.call(&Caller::Human, Request::Shutdown))
+                        .await;
             }
+            // The daemon is going away; start a new one below.
+            Err(Handshake::Refused(_, e)) if e.code == ErrorCode::ConnectionLost => {}
+            Err(Handshake::Refused(_, e)) => return Err(e.into()),
+            Err(Handshake::TimedOut(e)) => return Err(e),
+            // Nothing listening: start a daemon below.
+            Err(Handshake::Open(_)) => {}
         }
         Client::spawn_and_connect(paths, bin).await
     }
 
     async fn spawn_and_connect(paths: &Paths, bin: &Path) -> Result<Client> {
-        let start = Instant::now();
-        let mut last_spawn = start;
+        let deadline = Instant::now() + SPAWN_WAIT;
+        let mut last_spawn = Instant::now();
         spawn_daemon(paths, bin)?;
         let mut last_err = anyhow!("no daemon answered");
         loop {
-            match Client::open(paths).await {
-                Ok(mut c) => match c.hello().await {
-                    Ok(_) => return Ok(c),
-                    // An old daemon still shutting down, or a new one dying.
-                    Err(e) => last_err = e.into(),
-                },
-                Err(e) => last_err = e.into(),
+            let left = deadline.saturating_duration_since(Instant::now());
+            match Client::open_and_hello(paths, left).await {
+                Ok(c) => return Ok(c),
+                // An old daemon still shutting down, or a new one dying.
+                Err(Handshake::Refused(_, e)) => last_err = e.into(),
+                Err(Handshake::Open(e)) => last_err = e.into(),
+                Err(Handshake::TimedOut(e)) => last_err = e,
             }
-            if start.elapsed() >= SPAWN_WAIT {
-                return Err(last_err.context(format!(
-                    "the agentmail daemon did not start (socket {})",
-                    paths.socket.display()
-                )));
+            if Instant::now() >= deadline {
+                // A daemon that holds the lock but is not at our socket is
+                // serving another socket path for the same data directory.
+                let msg = if paths.lock_held() {
+                    format!(
+                        "a daemon holds {} but is not listening on {}; check \
+                         AGENTMAIL_SOCKET/XDG_RUNTIME_DIR (every client sharing a \
+                         data directory must resolve the same socket)",
+                        paths.lock.display(),
+                        paths.socket.display()
+                    )
+                } else {
+                    format!(
+                        "the agentmail daemon did not start (socket {})",
+                        paths.socket.display()
+                    )
+                };
+                return Err(last_err.context(msg));
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
             if last_spawn.elapsed() >= RESPAWN_INTERVAL {
