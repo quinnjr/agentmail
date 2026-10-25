@@ -57,6 +57,24 @@ const STAGING_EXTRA_BYTES: usize = ".".len() + ".d".len() + "/s".len();
 /// The longest socket path the daemon can serve, in bytes.
 pub const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_MAX - STAGING_EXTRA_BYTES;
 
+fn socket_too_long(socket: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "socket path {} is too long ({} bytes; at most {MAX_SOCKET_PATH_BYTES}): \
+         set AGENTMAIL_SOCKET or XDG_RUNTIME_DIR to a shorter path",
+        socket.display(),
+        socket.as_os_str().len(),
+    )
+}
+
+/// Refuse a socket path the daemon could not bind, so a client can say why
+/// before it starts a daemon that would only exit.
+pub fn check_socket_path(socket: &Path) -> Result<()> {
+    if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        return Err(socket_too_long(socket));
+    }
+    Ok(())
+}
+
 pub struct DaemonConfig {
     pub paths: Paths,
 }
@@ -117,12 +135,7 @@ fn bind_private(socket: &Path) -> Result<UnixListener> {
     let tmp_dir = parent.join(tmp_name);
     let tmp_sock = tmp_dir.join("s");
     if tmp_sock.as_os_str().len() > SUN_PATH_MAX {
-        anyhow::bail!(
-            "socket path {} is too long ({} bytes; at most {MAX_SOCKET_PATH_BYTES}): \
-             set AGENTMAIL_SOCKET or XDG_RUNTIME_DIR to a shorter path",
-            socket.display(),
-            socket.as_os_str().len(),
-        );
+        return Err(socket_too_long(socket));
     }
 
     // A crashed predecessor may have left the staging directory behind.

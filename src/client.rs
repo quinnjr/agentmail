@@ -309,6 +309,7 @@ impl Client {
     }
 
     async fn spawn_and_connect(paths: &Paths, bin: &Path) -> Result<Client> {
+        crate::daemon::check_socket_path(&paths.socket)?;
         let deadline = Instant::now() + SPAWN_WAIT;
         let mut last_spawn = Instant::now();
         spawn_daemon(paths, bin)?;
@@ -500,6 +501,21 @@ mod tests {
         let err = check_data_dir(&paths, &serde_json::json!({ "version": 1 })).unwrap_err();
         assert_eq!(err.theirs, None);
         assert!(err.to_string().contains("did not report"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn client_refuses_to_spawn_for_an_unbindable_socket() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut paths = Paths::in_dir(tmp.path());
+        paths.socket = tmp.path().join("s".repeat(120));
+        let bin = Path::new("/nonexistent/agentmail");
+        let err = Client::connect_or_spawn_with(&paths, bin)
+            .await
+            .err()
+            .expect("a too-long socket path must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("too long"), "{msg}");
+        assert!(msg.contains("AGENTMAIL_SOCKET"), "{msg}");
     }
 
     #[test]

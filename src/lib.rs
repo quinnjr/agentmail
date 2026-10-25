@@ -1,5 +1,6 @@
 //! agentmail: mail and blocking questions between coding agents and a human.
 
+pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod identity;

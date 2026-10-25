@@ -51,7 +51,7 @@ pub enum StoreError {
     InvalidInput(String),
     #[error("{0} is too long")]
     TooLong(&'static str),
-    #[error("message body is larger than 256 KiB")]
+    #[error("message body is too large (over 256 KiB)")]
     TooLarge,
     #[error("not found: {0}")]
     NotFound(String),

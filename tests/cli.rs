@@ -1,0 +1,752 @@
+//! Task 9: the command-line interface, driven through the built binary.
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as StdCommand, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use assert_cmd::Command;
+use serde_json::Value;
+use tempfile::TempDir;
+
+/// The Task 4 body: code fences, a table, `\r\n`, non-ASCII and a trailing
+/// newline.
+const MARKDOWN: &str = "```rust\nfn x(){}\n```\r\n| a | b |\n| - | - |\nnaïve ✓\n";
+
+const HUMAN_ADDR: &str = "human";
+
+const BIN: &str = env!("CARGO_BIN_EXE_agentmail");
+
+/// A private data directory and socket, with a daemon the CLI autostarts.
+/// Dropping it stops the daemon and the fake harness processes.
+struct Env {
+    dir: TempDir,
+    work: PathBuf,
+    sleeps: Vec<Child>,
+}
+
+impl Env {
+    fn new() -> Env {
+        let dir = TempDir::new().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        Env {
+            dir,
+            work,
+            sleeps: Vec::new(),
+        }
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("data")
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.dir.path().join("agentmail.sock")
+    }
+
+    /// `agentmail` with this environment and no identity.
+    fn cmd(&self) -> Command {
+        let mut c = Command::new(BIN);
+        c.env("AGENTMAIL_DATA_DIR", self.data_dir())
+            .env("AGENTMAIL_SOCKET", self.socket())
+            .env_remove("AGENTMAIL_ADDRESS")
+            .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_BIN")
+            .current_dir(&self.work)
+            .timeout(Duration::from_secs(30));
+        c
+    }
+
+    /// `agentmail` acting as agent `addr`.
+    fn as_agent(&self, addr: &str) -> Command {
+        let mut c = self.cmd();
+        c.env("AGENTMAIL_ADDRESS", addr);
+        c
+    }
+
+    /// `agentmail --as human`.
+    fn as_human(&self) -> Command {
+        let mut c = self.cmd();
+        c.arg("--as").arg("human");
+        c
+    }
+
+    /// Register `name` bound to a fresh `sleep` process; return its address.
+    fn agent(&mut self, name: &str) -> String {
+        let sleep = StdCommand::new("sleep").arg("300").spawn().unwrap();
+        let out = self
+            .cmd()
+            .args(["register", name, "--json", "--fresh", "--pid"])
+            .arg(sleep.id().to_string())
+            .output()
+            .unwrap();
+        self.sleeps.push(sleep);
+        assert!(
+            out.status.success(),
+            "register failed: {}",
+            text(&out.stderr)
+        );
+        let v = json(&out);
+        let addr = v["address"].as_str().unwrap().to_string();
+        assert!(addr.starts_with(&format!("{name}-")), "{addr}");
+        addr
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let _ = StdCommand::new(BIN)
+            .args(["daemon", "stop"])
+            .env("AGENTMAIL_DATA_DIR", self.data_dir())
+            .env("AGENTMAIL_SOCKET", self.socket())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for s in &mut self.sleeps {
+            let _ = s.kill();
+            let _ = s.wait();
+        }
+    }
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn json(out: &Output) -> Value {
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("bad json ({e}): {}", text(&out.stdout)))
+}
+
+/// Run and require exit 0; return stdout parsed as JSON.
+fn ok_json(c: &mut Command) -> Value {
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit {:?}: {}",
+        out.status.code(),
+        text(&out.stderr)
+    );
+    json(&out)
+}
+
+/// Run and require exit 0; return stdout.
+fn ok_text(c: &mut Command) -> String {
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit {:?}: {}",
+        out.status.code(),
+        text(&out.stderr)
+    );
+    text(&out.stdout)
+}
+
+/// Send `body` from `from` to `to` by stdin; return the message id.
+fn send_stdin(env: &Env, from: &str, to: &str, body: &[u8]) -> String {
+    let v = ok_json(
+        env.as_agent(from)
+            .args(["send", "--json", "--to", to, "--subject", "s", "-"])
+            .write_stdin(body.to_vec()),
+    );
+    v["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn stdin_markdown_round_trip() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let id = send_stdin(&env, &a, &b, MARKDOWN.as_bytes());
+    let v = ok_json(env.as_agent(&b).args(["read", &id, "--json"]));
+    assert_eq!(v["body"].as_str().unwrap().as_bytes(), MARKDOWN.as_bytes());
+    // The human-readable form prints the body byte for byte too.
+    let out = env.as_agent(&b).args(["read", &id]).output().unwrap();
+    assert!(out.status.success());
+    let shown = out.stdout;
+    assert!(
+        shown
+            .windows(MARKDOWN.len())
+            .any(|w| w == MARKDOWN.as_bytes()),
+        "{}",
+        text(&shown)
+    );
+}
+
+#[test]
+fn body_file_and_inline_equivalent() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let file = env.dir.path().join("body.md");
+    std::fs::write(&file, MARKDOWN).unwrap();
+    let from_file = ok_json(env.as_agent(&a).args([
+        "send",
+        "--json",
+        "--to",
+        &b,
+        "--subject",
+        "f",
+        "--body-file",
+        file.to_str().unwrap(),
+    ]));
+    let inline = ok_json(env.as_agent(&a).args([
+        "send",
+        "--json",
+        "--to",
+        &b,
+        "--subject",
+        "i",
+        "--body",
+        MARKDOWN,
+    ]));
+    assert_eq!(from_file["body"], MARKDOWN);
+    assert_eq!(inline["body"], MARKDOWN);
+    // A relative --body-file is read from the working directory.
+    std::fs::write(env.work.join("rel.md"), "rel body").unwrap();
+    let rel = ok_json(env.as_agent(&a).args([
+        "send",
+        "--json",
+        "--to",
+        &b,
+        "--subject",
+        "r",
+        "--body-file",
+        "rel.md",
+    ]));
+    assert_eq!(rel["body"], "rel body");
+}
+
+#[test]
+fn missing_body_is_usage_error() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    env.as_agent(&a)
+        .args(["send", "--to", &b, "--subject", "s"])
+        .assert()
+        .code(2);
+    // Two body sources are as wrong as none.
+    env.as_agent(&a)
+        .args(["send", "--to", &b, "--subject", "s", "--body", "x", "-"])
+        .write_stdin("y")
+        .assert()
+        .code(2);
+    env.as_agent(&a).args(["answer", "x"]).assert().code(2);
+    env.as_agent(&a).args(["reply", "x"]).assert().code(2);
+    // A positional other than `-` is not a body source.
+    env.as_agent(&a)
+        .args(["send", "--to", &b, "--subject", "s", "body-text"])
+        .assert()
+        .code(2);
+    // Only `human` may follow --as.
+    env.cmd().args(["--as", "bob", "inbox"]).assert().code(2);
+}
+
+#[test]
+fn oversize_body_rejected() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let big = vec![b'x'; 262_145];
+    let out = env
+        .as_agent(&a)
+        .args(["send", "--to", &b, "--subject", "s", "-"])
+        .write_stdin(big)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("too large"),
+        "{}",
+        text(&out.stderr)
+    );
+    // Nothing was delivered, not even a truncated copy.
+    let inbox = ok_json(env.as_agent(&b).args(["inbox", "--json"]));
+    assert_eq!(inbox.as_array().unwrap().len(), 0);
+    // Exactly the limit is fine.
+    let id = send_stdin(&env, &a, &b, &vec![b'x'; 262_144]);
+    let v = ok_json(env.as_agent(&b).args(["read", &id, "--json"]));
+    assert_eq!(v["body"].as_str().unwrap().len(), 262_144);
+}
+
+#[test]
+fn non_utf8_body_rejected() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let out = env
+        .as_agent(&a)
+        .args(["send", "--to", &b, "--subject", "s", "-"])
+        .write_stdin(vec![b'a', 0xff, b'b'])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("UTF-8"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn no_identity_errors() {
+    let env = Env::new();
+    let out = env.cmd().arg("inbox").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.starts_with("error: "), "{err}");
+    assert!(err.contains("not registered"), "{err}");
+}
+
+#[test]
+fn human_can_join_any_thread() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let id = send_stdin(&env, &a, &b, b"hello");
+    ok_text(env.as_human().args(["reply", &id, "--body", "x"]));
+    let shown = ok_text(env.as_human().args(["show", &id]));
+    assert!(shown.contains("human"), "{shown}");
+    assert!(shown.contains("[from human]"), "{shown}");
+    assert!(shown.contains(&format!("{a} → {b}")), "{shown}");
+    assert!(shown.contains("hello") && shown.contains('x'), "{shown}");
+    // `show` also takes a message id inside the thread.
+    let thread = ok_json(env.as_agent(&a).args(["read", &id, "--json"]));
+    let reply_id = thread["thread"][1]["id"].as_str().unwrap().to_string();
+    let again = ok_text(env.as_human().args(["show", &reply_id]));
+    assert_eq!(again, shown);
+    // The agents got the human's reply, marked as from the human (`read`
+    // above marked it read for `a`).
+    let inbox = ok_json(env.as_agent(&a).args(["inbox", "--json", "--all"]));
+    let from_human: Vec<&Value> = inbox
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["from_human"] == true)
+        .collect();
+    assert_eq!(from_human.len(), 1, "{inbox}");
+    let inbox = ok_json(env.as_agent(&b).args(["inbox", "--json"]));
+    assert!(
+        inbox
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["from"] == HUMAN_ADDR),
+        "{inbox}"
+    );
+}
+
+#[test]
+fn ask_pending_exit_code_3() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let started = Instant::now();
+    let out = env
+        .as_agent(&a)
+        .args([
+            "ask",
+            "--json",
+            "--to",
+            &b,
+            "--subject",
+            "q",
+            "--timeout",
+            "1s",
+            "--body",
+            "?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let v = json(&out);
+    assert_eq!(v["status"], "pending");
+    assert!(v["question_id"].is_string());
+    // Human-readable form: same exit code, says how to keep waiting.
+    let out = env
+        .as_agent(&a)
+        .args(["ask", "--to", &b, "--subject", "q2", "--timeout", "1s", "-"])
+        .write_stdin("?")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        text(&out.stdout).contains("agentmail await"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn answer_then_await() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let out = env
+        .as_agent(&a)
+        .args([
+            "ask",
+            "--json",
+            "--to",
+            &b,
+            "--subject",
+            "q",
+            "--timeout",
+            "1s",
+            "--body",
+            "?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let qid = json(&out)["question_id"].as_str().unwrap().to_string();
+    // Still pending before the answer.
+    env.as_agent(&a)
+        .args(["await", &qid, "--timeout", "1s"])
+        .assert()
+        .code(3);
+    let ans = ok_json(
+        env.as_agent(&b)
+            .args(["answer", &qid, "--json", "--body", "ok"]),
+    );
+    assert_eq!(ans["kind"], "answer");
+    let v = ok_json(env.as_agent(&a).args(["await", &qid, "--json"]));
+    assert_eq!(v["status"], "answered");
+    assert_eq!(v["answer"]["body"], "ok");
+    let shown = ok_text(env.as_agent(&a).args(["await", &qid]));
+    assert!(shown.contains("ok"), "{shown}");
+}
+
+#[test]
+fn wait_returns_mail_or_times_out() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    env.as_agent(&b)
+        .args(["wait", "--timeout", "1s"])
+        .assert()
+        .code(3);
+    send_stdin(&env, &a, &b, b"ping");
+    let v = ok_json(env.as_agent(&b).args(["wait", "--json", "--timeout", "1s"]));
+    assert_eq!(v["status"], "mail");
+    assert_eq!(v["messages"][0]["body"], "ping");
+}
+
+#[test]
+fn contact_add_and_agents_marks_contact() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let c = env.agent("docs");
+    ok_text(env.as_agent(&a).args(["contact", "add", &b]));
+    let listed = ok_json(env.as_agent(&a).args(["contact", "--json"]));
+    assert_eq!(listed[0]["address"], b.as_str());
+    let agents = ok_json(env.as_agent(&a).args(["agents", "--json"]));
+    for row in agents.as_array().unwrap() {
+        assert_eq!(row["is_contact"], row["address"] == b.as_str(), "{row}");
+    }
+    let table = ok_text(env.as_agent(&a).arg("agents"));
+    let line_of = |addr: &str| {
+        table
+            .lines()
+            .find(|l| l.contains(addr))
+            .unwrap_or_else(|| panic!("{addr} missing: {table}"))
+            .to_string()
+    };
+    assert!(line_of(&b).starts_with('*'), "{table}");
+    assert!(!line_of(&c).starts_with('*'), "{table}");
+    assert!(line_of(&b).contains("active"), "{table}");
+    assert!(line_of(&b).contains("idle"), "{table}");
+    // --name filters by prefix.
+    let only = ok_json(env.as_agent(&a).args(["agents", "--json", "--name", "doc"]));
+    assert_eq!(only.as_array().unwrap().len(), 1);
+    ok_text(env.as_agent(&a).args(["contact", "remove", &b]));
+    let listed = ok_json(env.as_agent(&a).args(["contact", "list", "--json"]));
+    assert_eq!(listed.as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn status_and_whoami_show_summary() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    ok_text(env.as_agent(&a).args(["status", "building the orders API"]));
+    let who = ok_text(env.as_agent(&a).arg("whoami"));
+    assert!(who.contains(&a), "{who}");
+    assert!(who.contains("building the orders API"), "{who}");
+    let v = ok_json(env.as_agent(&a).args(["whoami", "--json"]));
+    assert_eq!(v["agent"]["working_on"], "building the orders API");
+    let human = ok_text(env.as_human().arg("whoami"));
+    assert!(human.contains("human"), "{human}");
+}
+
+#[test]
+fn prune_older_than() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    send_stdin(&env, &a, &b, b"old");
+    // Only the human may prune.
+    env.as_agent(&a)
+        .args(["prune", "--older-than", "0s"])
+        .assert()
+        .code(1);
+    // Nothing is a week old yet.
+    let v = ok_json(
+        env.as_human()
+            .args(["prune", "--json", "--older-than", "7d"]),
+    );
+    assert_eq!(v["pruned"], 0);
+    std::thread::sleep(Duration::from_millis(20));
+    let v = ok_json(
+        env.as_human()
+            .args(["prune", "--json", "--older-than", "0s"]),
+    );
+    assert_eq!(v["pruned"], 1);
+    let inbox = ok_json(env.as_agent(&b).args(["inbox", "--json", "--all"]));
+    assert_eq!(inbox.as_array().unwrap().len(), 0);
+    // A bad duration is a usage error.
+    env.as_human()
+        .args(["prune", "--older-than", "soon"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn inbox_lines_and_short_ids() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let id = ok_json(env.as_agent(&a).args([
+        "send",
+        "--json",
+        "--urgent",
+        "--to",
+        &b,
+        "--subject",
+        "Schema change",
+        "--body",
+        "x",
+    ]))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inbox = ok_text(env.as_agent(&b).arg("inbox"));
+    let line = inbox.lines().find(|l| l.contains("Schema change")).unwrap();
+    let short = &id[id.len() - 8..];
+    assert!(line.contains(short), "{line}");
+    assert!(!line.contains(&id), "{line}");
+    assert!(line.contains('!'), "{line}");
+    assert!(line.contains(&a), "{line}");
+    // A short id from the inbox works wherever an id is taken.
+    let v = ok_json(env.as_agent(&b).args(["read", short, "--json"]));
+    assert_eq!(v["id"], id.as_str());
+    ok_text(env.as_agent(&b).args(["reply", short, "--body", "thanks"]));
+    let thread = ok_json(env.as_agent(&a).args(["read", &id, "--json"]));
+    assert_eq!(thread["thread"].as_array().unwrap().len(), 2);
+    // An id nobody has is an error.
+    env.as_agent(&b).args(["read", "zzzzzzzz"]).assert().code(1);
+}
+
+#[test]
+fn send_to_comma_separated_and_repeated() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let c = env.agent("docs");
+    let d = env.agent("ops");
+    let v = ok_json(env.as_agent(&a).args([
+        "send",
+        "--json",
+        "--to",
+        &format!("{b},{c}"),
+        "--to",
+        &d,
+        "--subject",
+        "all",
+        "--ref",
+        "docs/api.md",
+        "--ref",
+        "src/lib.rs",
+        "--body",
+        "x",
+    ]));
+    assert_eq!(v["to"], serde_json::json!([b, c, d]));
+    assert_eq!(v["refs"], serde_json::json!(["docs/api.md", "src/lib.rs"]));
+}
+
+#[test]
+fn threads_and_search() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let id = send_stdin(&env, &a, &b, b"the needle is here");
+    let threads = ok_json(env.as_human().args(["threads", "--json", "--agent", &a]));
+    assert_eq!(threads[0]["thread_id"], id.as_str());
+    let listed = ok_text(env.as_human().arg("threads"));
+    assert!(listed.contains(&id), "{listed}");
+    let none = ok_json(
+        env.as_human()
+            .args(["threads", "--json", "--open-questions"]),
+    );
+    assert_eq!(none.as_array().unwrap().len(), 0);
+    let found = ok_json(env.as_human().args(["search", "--json", "needle"]));
+    assert_eq!(found[0]["id"], id.as_str());
+}
+
+#[test]
+fn ambiguous_name_prints_candidates() {
+    let mut env = Env::new();
+    // Agents in a git repo, so plain names resolve within it.
+    let ok = StdCommand::new("git")
+        .args(["init", "-q"])
+        .current_dir(&env.work)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let a = env.agent("backend");
+    let f1 = env.agent("frontend");
+    let f2 = env.agent("frontend");
+    for f in [&f1, &f2] {
+        ok_text(env.as_agent(f).args(["status", &format!("work of {f}")]));
+    }
+    let out = env
+        .as_agent(&a)
+        .args(["send", "--to", "frontend", "--subject", "s", "--body", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.starts_with("error: "), "{err}");
+    for f in [&f1, &f2] {
+        assert!(err.contains(f.as_str()), "{err}");
+        assert!(err.contains(&format!("work of {f}")), "{err}");
+    }
+    // With --json the error is also printed as JSON on stdout.
+    let out = env
+        .as_agent(&a)
+        .args([
+            "send",
+            "--json",
+            "--to",
+            "frontend",
+            "--subject",
+            "s",
+            "--body",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json(&out);
+    assert_eq!(v["error"]["code"], "AmbiguousRecipient");
+    assert_eq!(v["error"]["candidates"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn signoff_marks_gone() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    ok_text(env.as_agent(&a).arg("signoff"));
+    let active = ok_json(env.as_agent(&b).args(["agents", "--json"]));
+    assert!(
+        active
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["address"] != a.as_str())
+    );
+    let all = ok_json(env.as_agent(&b).args(["agents", "--json", "--all"]));
+    let row = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == a.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(row["presence"], "gone");
+}
+
+#[test]
+fn register_binds_the_given_process() {
+    let env = Env::new();
+    let sleep = StdCommand::new("sleep").arg("300").spawn().unwrap();
+    let v = ok_json(env.cmd().args([
+        "register",
+        "backend",
+        "--json",
+        "--role",
+        "API",
+        "--working-on",
+        "orders",
+        "--harness",
+        "kiro",
+        "--no-wake",
+        "--pid",
+        &sleep.id().to_string(),
+    ]));
+    let agent = &v["agent"];
+    assert_eq!(agent["proc_id"]["pid"], sleep.id());
+    assert_eq!(agent["harness"], "kiro");
+    assert_eq!(agent["role"], "API");
+    assert_eq!(agent["working_on"], "orders");
+    assert_eq!(agent["wake"], false);
+    assert_eq!(
+        Path::new(agent["cwd"].as_str().unwrap()),
+        env.work.canonicalize().unwrap()
+    );
+    let mut sleep = sleep;
+    let _ = sleep.kill();
+    let _ = sleep.wait();
+}
+
+#[test]
+fn watch_prints_one_line_per_event() {
+    let mut env = Env::new();
+    // Start the daemon first, so the watcher connects at once.
+    ok_text(env.cmd().args(["daemon", "start"]));
+    let mut watcher = StdCommand::new(BIN)
+        .args(["watch", "--json"])
+        .env("AGENTMAIL_DATA_DIR", env.data_dir())
+        .env("AGENTMAIL_SOCKET", env.socket())
+        .env("AGENTMAIL_HUMAN", "1")
+        .env_remove("AGENTMAIL_ADDRESS")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(watcher.stdout.take().unwrap()).lines();
+    // Register until the watcher has subscribed and reports the event.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(Ok(l)) = lines.next() {
+            let _ = tx.send(l);
+        }
+    });
+    let line = loop {
+        env.agent("backend");
+        if let Ok(l) = rx.recv_timeout(Duration::from_millis(200)) {
+            break l;
+        }
+        assert!(Instant::now() < deadline, "watch printed nothing");
+    };
+    let _ = watcher.kill();
+    let _ = watcher.wait();
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["type"], "presence", "{line}");
+    assert!(
+        v["agent"]["address"]
+            .as_str()
+            .unwrap()
+            .starts_with("backend-")
+    );
+}
+
+#[test]
+fn daemon_status_and_stop() {
+    let env = Env::new();
+    env.cmd().args(["daemon", "status"]).assert().code(1);
+    ok_text(env.cmd().args(["daemon", "start"]));
+    ok_text(env.cmd().args(["daemon", "status"]));
+    let out = ok_text(env.cmd().args(["daemon", "stop"]));
+    assert!(out.contains("stopped"), "{out}");
+}

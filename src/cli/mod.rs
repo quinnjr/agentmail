@@ -1,0 +1,1115 @@
+//! The `agentmail` command line: the clap command tree, body input,
+//! dispatch to the daemon, and exit codes.
+//!
+//! Exit codes: 0 success; 1 error; 2 usage error (clap); 3 when `ask`,
+//! `await` or `wait` end without an answer or mail (`pending`,
+//! `no_one_listening`, `timeout`), so scripts and hooks can branch.
+
+pub mod render;
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, Parser, Subcommand};
+use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+use crate::client::{Client, ClientError, DataDirMismatch};
+use crate::daemon::{DaemonConfig, serve};
+use crate::identity;
+use crate::ids::now_ms;
+use crate::model::{AgentView, HUMAN, Harness, MAX_BODY_BYTES, Message};
+use crate::paths::Paths;
+use crate::protocol::{Caller, ErrorCode, PROTOCOL_VERSION, Request};
+use crate::store::{ThreadFilter, ThreadSummary};
+
+/// Exit code for `ask`/`await`/`wait` ending without an answer or mail.
+pub const EXIT_PENDING: u8 = 3;
+/// `daemon status` exit code when a daemon answers but speaks another
+/// protocol version (1 means not running).
+const STATUS_OTHER_PROTOCOL: u8 = 3;
+/// Length of a full message id (a ULID).
+const ULID_LEN: usize = 26;
+/// The default for every `--timeout`.
+const DEFAULT_TIMEOUT: &str = "240s";
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "agentmail",
+    version,
+    about = "Mail between coding agents and a human"
+)]
+pub struct Cli {
+    /// Act as WHO instead of the registered agent. Only `human` is accepted
+    /// (or set AGENTMAIL_HUMAN=1).
+    #[arg(long = "as", global = true, value_name = "WHO", value_parser = [HUMAN])]
+    pub as_who: Option<String>,
+    /// Print the daemon's JSON instead of human-readable output.
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Where a message body comes from. Exactly one is required.
+#[derive(Args, Debug, Clone)]
+#[group(required = true, multiple = false)]
+pub struct BodyArgs {
+    /// The body as markdown text.
+    #[arg(long, value_name = "TEXT")]
+    body: Option<String>,
+    /// Read the body from a file.
+    #[arg(long, value_name = "PATH")]
+    body_file: Option<PathBuf>,
+    /// `-` reads the body from standard input (e.g. a heredoc).
+    #[arg(value_name = "-", value_parser = ["-"])]
+    stdin: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Register this session as an agent and print its address.
+    Register {
+        /// Short role name, e.g. `backend`.
+        name: String,
+        /// One-line role description.
+        #[arg(long)]
+        role: Option<String>,
+        /// What you are working on (at most 280 characters).
+        #[arg(long)]
+        working_on: Option<String>,
+        /// Override the detected harness.
+        #[arg(long, value_parser = ["claude-code", "opencode", "kiro", "other"])]
+        harness: Option<String>,
+        /// Always take a new address instead of reclaiming a gone one.
+        #[arg(long)]
+        fresh: bool,
+        /// Do not wake this agent for new mail.
+        #[arg(long)]
+        no_wake: bool,
+        /// Bind to this process instead of the detected harness process.
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+    /// Show who you are acting as.
+    Whoami,
+    /// Set your working-on summary.
+    Status {
+        /// The new summary (at most 280 characters).
+        working_on: String,
+    },
+    /// List, add or remove contacts (default: list).
+    Contact {
+        #[command(subcommand)]
+        action: Option<ContactAction>,
+    },
+    /// List registered agents (active ones unless --all).
+    Agents {
+        /// Only agents whose name starts with this.
+        #[arg(long, value_name = "PREFIX")]
+        name: Option<String>,
+        /// Only agents in this repo or directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Include gone agents.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Start a new thread.
+    Send {
+        /// Recipients: full addresses or names, comma-separated or repeated.
+        #[arg(long, required = true, value_delimiter = ',', value_name = "ADDR")]
+        to: Vec<String>,
+        #[arg(long)]
+        subject: String,
+        /// Ask for live interruption where the harness supports it.
+        #[arg(long)]
+        urgent: bool,
+        /// A file path pointing at shared docs or code (repeatable).
+        #[arg(long = "ref", value_name = "PATH")]
+        refs: Vec<String>,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    /// Reply in a message's thread, to its sender and other recipients.
+    Reply {
+        /// The message to reply to (full id or the inbox's short id).
+        id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+        #[arg(long)]
+        urgent: bool,
+        #[arg(long = "ref", value_name = "PATH")]
+        refs: Vec<String>,
+        /// Close the question this replies to (same as `answer`).
+        #[arg(long)]
+        answer: bool,
+    },
+    /// Ask a question and wait for its answer. Exits 3 if none comes in time.
+    Ask {
+        #[arg(long, required = true, value_delimiter = ',', value_name = "ADDR")]
+        to: Vec<String>,
+        #[arg(long)]
+        subject: String,
+        #[command(flatten)]
+        body: BodyArgs,
+        #[arg(long = "ref", value_name = "PATH")]
+        refs: Vec<String>,
+        #[arg(long)]
+        urgent: bool,
+        /// How long to wait, e.g. `240s`, `10m`.
+        #[arg(long, default_value = DEFAULT_TIMEOUT, value_parser = parse_duration)]
+        timeout: Duration,
+    },
+    /// Keep waiting for the answer to your question. Exits 3 if none comes.
+    Await {
+        question_id: String,
+        #[arg(long, default_value = DEFAULT_TIMEOUT, value_parser = parse_duration)]
+        timeout: Duration,
+    },
+    /// Answer a question (same as `reply --answer`).
+    Answer {
+        question_id: String,
+        #[command(flatten)]
+        body: BodyArgs,
+        #[arg(long)]
+        urgent: bool,
+        #[arg(long = "ref", value_name = "PATH")]
+        refs: Vec<String>,
+    },
+    /// Block until new mail arrives. Exits 3 on timeout.
+    Wait {
+        #[arg(long, default_value = DEFAULT_TIMEOUT, value_parser = parse_duration)]
+        timeout: Duration,
+    },
+    /// Your mail: open questions first, then unread messages.
+    Inbox {
+        /// Include messages already read.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a message, or a whole thread, and mark it read.
+    Read {
+        /// Message or thread id (full, or the inbox's short id).
+        id: String,
+    },
+    /// List threads.
+    Threads {
+        /// Only threads this address took part in.
+        #[arg(long, value_name = "ADDR")]
+        agent: Option<String>,
+        /// Only threads with a participant in this repo or directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Only threads with an open question.
+        #[arg(long)]
+        open_questions: bool,
+    },
+    /// Show a whole thread, for humans.
+    Show {
+        /// A thread id, or the id of any message in it.
+        id: String,
+    },
+    /// Live tail of mail and presence.
+    Watch {
+        /// Only events involving this address.
+        #[arg(long, value_name = "ADDR")]
+        agent: Option<String>,
+    },
+    /// Search subjects, bodies and senders.
+    Search {
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+    },
+    /// Mark yourself gone.
+    Signoff,
+    /// Delete threads with no message newer than DUR (human only).
+    Prune {
+        /// e.g. `7d`, `12h`, `30m`.
+        #[arg(long, value_parser = parse_duration, value_name = "DUR")]
+        older_than: Duration,
+    },
+    /// Manage the background daemon (default: status).
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ContactAction {
+    /// List your contacts.
+    List,
+    /// Add a contact by full address.
+    Add { address: String },
+    /// Remove a contact.
+    Remove { address: String },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum DaemonAction {
+    /// Serve in the foreground (what autostart runs).
+    Run,
+    /// Start the daemon if it is not running.
+    Start,
+    /// Stop the running daemon.
+    Stop,
+    /// Report whether the daemon is running. Exits 1 when it is not, 3 when
+    /// it speaks another protocol version (stop it to replace it).
+    Status,
+}
+
+/// Parse a duration such as `240s`, `10m`, `7d` or `1h30m`. A bare number
+/// is seconds. Units: `s`, `m`, `h`, `d`, `w`.
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let bad = || format!("invalid duration {s:?}: use e.g. 240s, 10m, 12h, 7d");
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(bad());
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse().map(Duration::from_secs).map_err(|_| bad());
+    }
+    let mut total: u64 = 0;
+    let mut num = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        let unit: u64 = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            'w' => 604_800,
+            _ => return Err(bad()),
+        };
+        let n: u64 = num.parse().map_err(|_| bad())?;
+        num.clear();
+        total = n
+            .checked_mul(unit)
+            .and_then(|v| total.checked_add(v))
+            .ok_or_else(bad)?;
+    }
+    if !num.is_empty() {
+        return Err(bad());
+    }
+    Ok(Duration::from_secs(total))
+}
+
+/// The error for a body over the limit; `size` is its length in bytes.
+fn too_large(size: u64) -> anyhow::Error {
+    ClientError::new(
+        ErrorCode::TooLarge,
+        format!(
+            "message body is too large: {size} bytes, the limit is {MAX_BODY_BYTES} bytes \
+             (256 KiB); nothing was sent"
+        ),
+    )
+    .into()
+}
+
+/// Read all of `r`, keeping at most `MAX_BODY_BYTES + 1` bytes. The rest is
+/// drained (so a writer never sees a broken pipe) and only counted.
+fn read_capped(mut r: impl Read) -> Result<(Vec<u8>, u64)> {
+    let cap = MAX_BODY_BYTES + 1;
+    let mut kept = Vec::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        total += n as u64;
+        let room = cap.saturating_sub(kept.len());
+        kept.extend_from_slice(&buf[..n.min(room)]);
+    }
+    Ok((kept, total))
+}
+
+/// A body's bytes as text: refused, never truncated, when it is over the
+/// limit; refused when it is not UTF-8.
+fn body_text(bytes: Vec<u8>, total: u64) -> Result<String> {
+    if total > MAX_BODY_BYTES as u64 {
+        return Err(too_large(total));
+    }
+    String::from_utf8(bytes).map_err(|e| {
+        anyhow!(
+            "message body is not valid UTF-8 (at byte {}); nothing was sent",
+            e.utf8_error().valid_up_to()
+        )
+    })
+}
+
+/// The body from whichever source was given, byte for byte.
+fn read_body(b: &BodyArgs) -> Result<String> {
+    if let Some(text) = &b.body {
+        return body_text(text.clone().into_bytes(), text.len() as u64);
+    }
+    if let Some(path) = &b.body_file {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("reading body file {}", path.display()))?;
+        let (bytes, total) =
+            read_capped(file).with_context(|| format!("reading body file {}", path.display()))?;
+        return body_text(bytes, total);
+    }
+    let (bytes, total) = read_capped(std::io::stdin().lock()).context("reading body from stdin")?;
+    body_text(bytes, total)
+}
+
+/// `p` made absolute against the working directory.
+fn absolute(p: &Path) -> Result<PathBuf> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
+}
+
+fn harness_from(s: &str) -> Result<Harness> {
+    serde_json::from_value(Value::String(s.to_string()))
+        .map_err(|_| anyhow!("unknown harness {s:?}"))
+}
+
+fn parse<T: DeserializeOwned>(v: &Value) -> Result<T> {
+    serde_json::from_value(v.clone()).context("unexpected data from daemon")
+}
+
+/// Print `v` as pretty JSON.
+fn print_json(v: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+/// Print `text` as is (it carries its own newlines).
+fn print_text(text: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Parse and run the CLI. Never returns an error: it is printed here.
+pub async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let json = cli.json;
+    match run(cli).await {
+        Ok(code) => code,
+        Err(e) => {
+            report(&e, json);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print an error as `error: <message>` on stderr, with the candidate table
+/// for an ambiguous recipient. With `--json`, also print it as
+/// `{"error":{code,message,candidates}}` on stdout.
+fn report(e: &anyhow::Error, json: bool) {
+    match e.downcast_ref::<ClientError>() {
+        Some(ce) => {
+            eprintln!("error: {}", ce.message);
+            if !ce.candidates.is_empty() {
+                eprint!("{}", render::agents(&ce.candidates, now_ms()));
+            }
+            if json {
+                let _ = print_json(&json!({ "error": ce }));
+            }
+        }
+        None => {
+            eprintln!("error: {e:#}");
+            if json {
+                let _ = print_json(&json!({
+                    "error": { "code": ErrorCode::Internal, "message": format!("{e:#}"), "candidates": [] }
+                }));
+            }
+        }
+    }
+}
+
+/// A connection to the daemon (started if needed) and who is calling.
+struct Session {
+    client: Client,
+    caller: Caller,
+    json: bool,
+}
+
+impl Session {
+    async fn call(&mut self, req: Request) -> Result<Value> {
+        Ok(self.client.call(&self.caller, req).await?)
+    }
+
+    /// Print `data` as JSON, or as `text(data)`.
+    fn show(&self, data: &Value, text: impl FnOnce(&Value) -> Result<String>) -> Result<()> {
+        if self.json {
+            print_json(data)
+        } else {
+            print_text(&text(data)?)
+        }
+    }
+
+    /// The full id for `id`: a full id as is; otherwise the one message or
+    /// thread id in the caller's mailbox ending with it (case-insensitive).
+    /// No match passes `id` through, so the daemon reports it.
+    async fn full_id(&mut self, id: &str) -> Result<String> {
+        if id.len() == ULID_LEN || id.is_empty() {
+            return Ok(id.to_string());
+        }
+        let want = id.to_ascii_uppercase();
+        let inbox = self.call(Request::Inbox { all: true }).await?;
+        let msgs: Vec<Message> = parse(&inbox)?;
+        let mut found: Vec<String> = Vec::new();
+        for m in &msgs {
+            for cand in [&m.id, &m.thread_id] {
+                if cand.ends_with(&want) && !found.contains(cand) {
+                    found.push(cand.clone());
+                }
+            }
+        }
+        match found.len() {
+            0 => Ok(id.to_string()),
+            1 => Ok(found.remove(0)),
+            _ => Err(ClientError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "id {id:?} matches several messages ({}); give more of it",
+                    found.join(", ")
+                ),
+            )
+            .into()),
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    if let Command::Daemon { action } = cli.command {
+        return daemon(&paths, action.unwrap_or(DaemonAction::Status)).await;
+    }
+    let caller = identity::cli_caller(cli.as_who.is_some());
+    let client = Client::connect_or_spawn(&paths).await?;
+    let mut s = Session {
+        client,
+        caller,
+        json: cli.json,
+    };
+    command(&mut s, cli.command).await
+}
+
+/// Exit code for a blocking call's `status`.
+fn blocking_exit(data: &Value) -> ExitCode {
+    match data["status"].as_str() {
+        Some("pending" | "no_one_listening" | "timeout") => ExitCode::from(EXIT_PENDING),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Human-readable result of `ask`/`await`.
+fn render_ask(d: &Value) -> Result<String> {
+    let qid = d["question_id"].as_str().unwrap_or_default();
+    Ok(match d["status"].as_str().unwrap_or_default() {
+        "answered" => {
+            let m: Message = parse(&d["answer"])?;
+            format!("answered by {}:\n{}", m.from, render::message(&m))
+        }
+        "clarification" => {
+            let m: Message = parse(&d["message"])?;
+            format!(
+                "clarification from {} (question {qid} is still open: reply, then \
+                 `agentmail await {qid}`):\n{}",
+                m.from,
+                render::message(&m)
+            )
+        }
+        "pending" => format!(
+            "pending: no answer to question {qid} yet. Keep waiting with \
+             `agentmail await {qid}`, or carry on and check `agentmail inbox` later.\n"
+        ),
+        "no_one_listening" => format!(
+            "no one listening: every recipient is gone. Question {qid} is stored; \
+             check later with `agentmail await {qid}`.\n"
+        ),
+        other => format!("{other}\n"),
+    })
+}
+
+fn sent(d: &Value) -> Result<String> {
+    let m: Message = parse(d)?;
+    let mut out = format!("sent {} to {}\n", m.id, m.to.join(", "));
+    let held: Vec<String> = d
+        .get("held_for")
+        .map(parse)
+        .transpose()?
+        .unwrap_or_default();
+    if !held.is_empty() {
+        out.push_str(&format!(
+            "held for {} until an agent with that name registers in this repo\n",
+            held.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
+    let now = now_ms();
+    match cmd {
+        Command::Register {
+            name,
+            role,
+            working_on,
+            harness,
+            fresh,
+            no_wake,
+            pid,
+        } => {
+            let bound = identity::register_proc(pid);
+            if let (Some(pid), None) = (pid, bound) {
+                bail!("process {pid} does not exist or cannot be bound to");
+            }
+            let (proc_id, detected) = match bound {
+                Some((p, h)) => (Some(p), h),
+                None => (None, Harness::Other),
+            };
+            let harness = match harness {
+                Some(h) => harness_from(&h)?,
+                None => detected,
+            };
+            let req = Request::Register {
+                name,
+                role,
+                working_on,
+                harness,
+                cwd: std::env::current_dir().context("reading the working directory")?,
+                proc_id,
+                fresh,
+                wake: !no_wake,
+            };
+            let d = s.call(req).await?;
+            s.show(&d, |d| {
+                let address = d["address"].as_str().unwrap_or_default();
+                let mut out = format!("registered {address}");
+                if d["reclaimed"] == true {
+                    out.push_str(" (reclaimed)");
+                }
+                out.push('\n');
+                if let Some(n) = d["released"].as_u64().filter(|n| *n > 0) {
+                    out.push_str(&format!("{n} held message(s) delivered to you\n"));
+                }
+                if proc_id.is_none() {
+                    out.push_str(&format!(
+                        "not bound to a process: set AGENTMAIL_ADDRESS={address} to act as it\n"
+                    ));
+                }
+                Ok(out)
+            })?;
+        }
+        Command::Whoami => {
+            let d = s.call(Request::Whoami).await?;
+            s.show(&d, |d| {
+                if d["agent"].is_null() {
+                    return Ok(format!(
+                        "{} (acting as the human operator)\n",
+                        d["address"].as_str().unwrap_or(HUMAN)
+                    ));
+                }
+                Ok(render::agent(&parse::<AgentView>(&d["agent"])?, now))
+            })?;
+        }
+        Command::Status { working_on } => {
+            let d = s.call(Request::Status { working_on }).await?;
+            s.show(&d, |d| Ok(render::agent(&parse::<AgentView>(d)?, now)))?;
+        }
+        Command::Contact { action } => match action.unwrap_or(ContactAction::List) {
+            ContactAction::List => {
+                let d = s.call(Request::Contacts).await?;
+                s.show(&d, |d| {
+                    let views: Vec<AgentView> = parse(d)?;
+                    Ok(if views.is_empty() {
+                        "no contacts\n".to_string()
+                    } else {
+                        render::agents(&views, now)
+                    })
+                })?;
+            }
+            ContactAction::Add { address } => {
+                let d = s
+                    .call(Request::ContactAdd {
+                        address: address.clone(),
+                    })
+                    .await?;
+                s.show(&d, |_| Ok(format!("added contact {address}\n")))?;
+            }
+            ContactAction::Remove { address } => {
+                let d = s
+                    .call(Request::ContactRemove {
+                        address: address.clone(),
+                    })
+                    .await?;
+                s.show(&d, |_| Ok(format!("removed contact {address}\n")))?;
+            }
+        },
+        Command::Agents { name, repo, all } => {
+            let repo = repo.as_deref().map(absolute).transpose()?;
+            let d = s
+                .call(Request::Agents {
+                    name_prefix: name,
+                    repo,
+                    all,
+                })
+                .await?;
+            s.show(&d, |d| {
+                Ok(render::agents(&parse::<Vec<AgentView>>(d)?, now))
+            })?;
+        }
+        Command::Send {
+            to,
+            subject,
+            urgent,
+            refs,
+            body,
+        } => {
+            let body = read_body(&body)?;
+            let d = s
+                .call(Request::Send {
+                    to,
+                    subject,
+                    body,
+                    urgent,
+                    refs,
+                })
+                .await?;
+            s.show(&d, sent)?;
+        }
+        Command::Reply {
+            id,
+            body,
+            urgent,
+            refs,
+            answer,
+        } => return reply(s, &id, &body, urgent, refs, answer).await,
+        Command::Answer {
+            question_id,
+            body,
+            urgent,
+            refs,
+        } => return reply(s, &question_id, &body, urgent, refs, true).await,
+        Command::Ask {
+            to,
+            subject,
+            body,
+            refs,
+            urgent,
+            timeout,
+        } => {
+            let body = read_body(&body)?;
+            let d = s
+                .call(Request::Ask {
+                    to,
+                    subject,
+                    body,
+                    refs,
+                    urgent,
+                    timeout_secs: timeout.as_secs(),
+                })
+                .await?;
+            s.show(&d, render_ask)?;
+            return Ok(blocking_exit(&d));
+        }
+        Command::Await {
+            question_id,
+            timeout,
+        } => {
+            let question_id = s.full_id(&question_id).await?;
+            let d = s
+                .call(Request::AwaitAnswer {
+                    question_id,
+                    timeout_secs: timeout.as_secs(),
+                })
+                .await?;
+            s.show(&d, render_ask)?;
+            return Ok(blocking_exit(&d));
+        }
+        Command::Wait { timeout } => {
+            let d = s
+                .call(Request::WaitForMail {
+                    timeout_secs: timeout.as_secs(),
+                })
+                .await?;
+            s.show(&d, |d| {
+                if d["status"] == "mail" {
+                    let msgs: Vec<Message> = parse(&d["messages"])?;
+                    Ok(render::thread(&msgs))
+                } else {
+                    Ok(format!(
+                        "no new mail within {}\n",
+                        humanize(timeout.as_secs())
+                    ))
+                }
+            })?;
+            return Ok(blocking_exit(&d));
+        }
+        Command::Inbox { all } => {
+            let d = s.call(Request::Inbox { all }).await?;
+            s.show(&d, |d| {
+                let rows = d
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| Ok((parse::<Message>(v)?, v["from_contact"] == true)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(render::inbox(&rows, now))
+            })?;
+        }
+        Command::Read { id } => {
+            let id = s.full_id(&id).await?;
+            let d = s.call(Request::Read { id }).await?;
+            s.show(&d, |d| match d.get("thread") {
+                Some(t) => Ok(render::thread(&parse::<Vec<Message>>(t)?)),
+                None => Ok(render::message(&parse::<Message>(d)?)),
+            })?;
+        }
+        Command::Show { id } => {
+            let id = s.full_id(&id).await?;
+            let mut d = s.call(Request::Read { id }).await?;
+            if d.get("thread").is_none() {
+                let root = d["thread_id"].as_str().unwrap_or_default().to_string();
+                d = s.call(Request::Read { id: root }).await?;
+            }
+            s.show(&d, |d| {
+                Ok(render::thread(&parse::<Vec<Message>>(&d["thread"])?))
+            })?;
+        }
+        Command::Threads {
+            agent,
+            repo,
+            open_questions,
+        } => {
+            let filter = ThreadFilter {
+                agent,
+                repo: repo.as_deref().map(absolute).transpose()?,
+                open_questions,
+            };
+            let d = s.call(Request::Threads { filter }).await?;
+            s.show(&d, |d| {
+                Ok(render::threads(&parse::<Vec<ThreadSummary>>(d)?, now))
+            })?;
+        }
+        Command::Search { query } => {
+            let d = s
+                .call(Request::Search {
+                    query: query.join(" "),
+                })
+                .await?;
+            s.show(&d, |d| {
+                Ok(render::message_list(&parse::<Vec<Message>>(d)?, now))
+            })?;
+        }
+        Command::Watch { agent } => return watch(s, agent).await,
+        Command::Signoff => {
+            let d = s.call(Request::Signoff).await?;
+            s.show(&d, |d| {
+                Ok(format!(
+                    "signed off {}\n",
+                    d["address"].as_str().unwrap_or_default()
+                ))
+            })?;
+        }
+        Command::Prune { older_than } => {
+            let d = s
+                .call(Request::Prune {
+                    older_than_secs: older_than.as_secs(),
+                })
+                .await?;
+            s.show(&d, |d| {
+                Ok(format!(
+                    "pruned {} thread(s)\n",
+                    d["pruned"].as_u64().unwrap_or(0)
+                ))
+            })?;
+        }
+        Command::Daemon { .. } => unreachable!("handled in run"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `reply`, or `answer` (`answer = true`).
+async fn reply(
+    s: &mut Session,
+    id: &str,
+    body: &BodyArgs,
+    urgent: bool,
+    refs: Vec<String>,
+    answer: bool,
+) -> Result<ExitCode> {
+    let body = read_body(body)?;
+    let message_id = s.full_id(id).await?;
+    let d = s
+        .call(Request::Reply {
+            message_id,
+            body,
+            urgent,
+            refs,
+            answer,
+        })
+        .await?;
+    s.show(&d, sent)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print every event until the daemon goes away or stdout closes.
+async fn watch(s: &mut Session, agent: Option<String>) -> Result<ExitCode> {
+    let json = s.json;
+    let caller = s.caller.clone();
+    let mut events = Box::pin(s.client.stream(&caller, Request::Watch { agent }).await?);
+    let mut out = std::io::stdout();
+    while let Some(ev) = events.next().await {
+        let ev = ev?;
+        let line = if json {
+            serde_json::to_string(&ev)?
+        } else {
+            render::event(&ev, now_ms())
+        };
+        // A closed stdout (e.g. `| head`) ends the watch quietly.
+        if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Seconds as the largest whole unit, e.g. `4m`.
+fn humanize(secs: u64) -> String {
+    render::age(secs as i64 * 1000, 0)
+}
+
+async fn daemon_pid(c: &mut Client) -> Result<u64> {
+    let hello = c
+        .call(
+            &Caller::Human,
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+    Ok(hello["pid"].as_u64().unwrap_or(0))
+}
+
+async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
+    match action {
+        DaemonAction::Run => {
+            serve(DaemonConfig {
+                paths: paths.clone(),
+            })
+            .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        DaemonAction::Start => {
+            let mut c = Client::connect_or_spawn(paths).await?;
+            let pid = daemon_pid(&mut c).await?;
+            println!("daemon running (pid {pid})");
+            Ok(ExitCode::SUCCESS)
+        }
+        DaemonAction::Status => match Client::connect(paths).await {
+            Ok(mut c) => {
+                let pid = daemon_pid(&mut c).await?;
+                println!(
+                    "daemon running (pid {pid}, protocol {PROTOCOL_VERSION}, socket {})",
+                    paths.socket.display()
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
+                println!("daemon running, but not for this data directory: {e:#}");
+                Ok(ExitCode::FAILURE)
+            }
+            Err(e) => match e.downcast_ref::<ClientError>() {
+                Some(ce) if ce.code == ErrorCode::VersionMismatch => {
+                    println!(
+                        "daemon running, but it speaks a different protocol (this client \
+                         speaks {PROTOCOL_VERSION}: {}); run `agentmail daemon stop`",
+                        ce.message
+                    );
+                    Ok(ExitCode::from(STATUS_OTHER_PROTOCOL))
+                }
+                _ => {
+                    println!("daemon not running ({e:#})");
+                    Ok(ExitCode::FAILURE)
+                }
+            },
+        },
+        DaemonAction::Stop => {
+            // Also stops a daemon of another protocol, but never one that
+            // serves another data directory through the same socket.
+            match Client::shutdown(paths).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!("daemon not running");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
+                    println!("daemon running, but not for this data directory; not stopped: {e:#}");
+                    return Ok(ExitCode::FAILURE);
+                }
+                Err(e) => return Err(e),
+            }
+            // Wait until it has released the database and lock, so a
+            // following start gets a fresh daemon.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while paths.lock_held() {
+                if Instant::now() >= deadline {
+                    bail!("daemon did not stop within 5s");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            println!("daemon stopped");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_parse_duration_units() {
+        let secs = |s: &str| parse_duration(s).map(|d| d.as_secs());
+        assert_eq!(secs("240s"), Ok(240));
+        assert_eq!(secs("240"), Ok(240));
+        assert_eq!(secs("10m"), Ok(600));
+        assert_eq!(secs("12h"), Ok(43_200));
+        assert_eq!(secs("7d"), Ok(604_800));
+        assert_eq!(secs("2w"), Ok(1_209_600));
+        assert_eq!(secs("1h30m"), Ok(5400));
+        assert_eq!(secs("0s"), Ok(0));
+        assert_eq!(
+            secs(DEFAULT_TIMEOUT),
+            Ok(crate::model::DEFAULT_ASK_TIMEOUT_SECS)
+        );
+        for bad in [
+            "",
+            "s",
+            "10x",
+            "m10",
+            "1.5h",
+            "-1s",
+            "10m5",
+            "99999999999999999999d",
+        ] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cli_body_limits_are_exact() {
+        let at = vec![b'x'; MAX_BODY_BYTES];
+        assert_eq!(
+            body_text(at.clone(), at.len() as u64).unwrap().len(),
+            MAX_BODY_BYTES
+        );
+        let err = body_text(vec![b'x'; MAX_BODY_BYTES + 1], MAX_BODY_BYTES as u64 + 1).unwrap_err();
+        let ce = err.downcast_ref::<ClientError>().unwrap();
+        assert_eq!(ce.code, ErrorCode::TooLarge);
+        assert!(ce.message.contains("too large"), "{}", ce.message);
+        assert!(
+            body_text(vec![0xff], 1)
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn cli_read_capped_counts_everything_but_keeps_the_cap() {
+        let data = vec![b'a'; MAX_BODY_BYTES * 2 + 7];
+        let (kept, total) = read_capped(&data[..]).unwrap();
+        assert_eq!(kept.len(), MAX_BODY_BYTES + 1);
+        assert_eq!(total, data.len() as u64);
+        let (kept, total) = read_capped(&b"hi\r\n"[..]).unwrap();
+        assert_eq!((kept.as_slice(), total), (&b"hi\r\n"[..], 4));
+    }
+
+    #[test]
+    fn cli_body_sources_are_exclusive_and_required() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ()).map_err(|e| e.kind());
+        use clap::error::ErrorKind;
+        assert_eq!(
+            parse(&["agentmail", "send", "--to", "a", "--subject", "s"]),
+            Err(ErrorKind::MissingRequiredArgument)
+        );
+        assert_eq!(
+            parse(&[
+                "agentmail",
+                "send",
+                "--to",
+                "a",
+                "--subject",
+                "s",
+                "--body",
+                "x",
+                "-"
+            ]),
+            Err(ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(parse(&["agentmail", "reply", "id", "-"]), Ok(()));
+        assert_eq!(
+            parse(&["agentmail", "answer", "id", "--body-file", "f"]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn cli_to_splits_commas_and_repeats() {
+        let cli = Cli::try_parse_from([
+            "agentmail",
+            "send",
+            "--to",
+            "a,b",
+            "--to",
+            "c",
+            "--subject",
+            "s",
+            "--body",
+            "x",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Send { to, .. } => assert_eq!(to, ["a", "b", "c"]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_global_flags_go_anywhere() {
+        let cli = Cli::try_parse_from(["agentmail", "inbox", "--json", "--as", "human"]).unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.as_who.as_deref(), Some("human"));
+        assert!(Cli::try_parse_from(["agentmail", "--as", "bob", "inbox"]).is_err());
+    }
+
+    #[test]
+    fn cli_blocking_exit_codes() {
+        let code = |s: &str| blocking_exit(&json!({ "status": s }));
+        for s in ["pending", "no_one_listening", "timeout"] {
+            assert_eq!(code(s), ExitCode::from(EXIT_PENDING), "{s}");
+        }
+        for s in ["answered", "clarification", "mail"] {
+            assert_eq!(code(s), ExitCode::SUCCESS, "{s}");
+        }
+    }
+}
