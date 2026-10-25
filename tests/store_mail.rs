@@ -469,9 +469,14 @@ fn human_reply_in_unaddressed_thread_joins_it() {
         .insert_message(reply(HUMAN, &[&a, &b], &root.id, "use v2"), 2)
         .unwrap();
     assert!(h.from_human);
-    // The human's own reply lands in its mailbox, already read.
+    // What this guards: the mailbox row written for the human's own reply.
+    // It is already read, so it stays out of the unread inbox but shows
+    // with `include_read`, which keeps the thread in the human's mail.
     assert!(s.inbox(HUMAN, false).unwrap().is_empty());
     assert_eq!(ids(&s.inbox(HUMAN, true).unwrap()), vec![h.id.as_str()]);
+    assert_eq!(s.unread_counts(HUMAN).unwrap(), (0, 0));
+    // The thread listing does not depend on that row (it finds the thread
+    // because the human sent in it); this only pins participant order.
     let joined = s
         .threads(&ThreadFilter {
             agent: Some(HUMAN.into()),
@@ -655,4 +660,108 @@ fn release_held_checks_agent_matches_name_and_repo() {
         ids(&s.release_held(repo, "frontend", &f).unwrap()),
         vec![m.id.as_str()]
     );
+}
+
+fn question(from: &str, to: &[&str], subject: &str) -> NewMessage {
+    NewMessage {
+        kind: Kind::Question,
+        ..note(from, to, subject, "?")
+    }
+}
+
+fn answer(from: &str, to: &[&str], parent: &str) -> NewMessage {
+    NewMessage {
+        kind: Kind::Answer,
+        ..reply(from, to, parent, "!")
+    }
+}
+
+fn open_question_threads(s: &Store) -> usize {
+    s.threads(&ThreadFilter {
+        open_questions: true,
+        ..ThreadFilter::default()
+    })
+    .unwrap()
+    .len()
+}
+
+#[test]
+fn answer_replying_inside_the_question_thread_closes_it() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let q = s.insert_message(question(&a, &[&b], "Q"), 1).unwrap();
+    // b asks for clarification, a clarifies, b answers the clarification.
+    let c = s
+        .insert_message(reply(&b, &[&a], &q.id, "which endpoint?"), 2)
+        .unwrap();
+    let r = s
+        .insert_message(reply(&a, &[&b], &c.id, "POST /orders"), 3)
+        .unwrap();
+    assert_eq!(s.unread_counts(&b).unwrap().1, 1);
+    s.insert_message(answer(&b, &[&a], &r.id), 4).unwrap();
+    assert_eq!(s.unread_counts(&b).unwrap().1, 0);
+    assert_eq!(open_question_threads(&s), 0);
+}
+
+#[test]
+fn only_a_recipient_or_human_answer_closes_a_question() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let c = agent(&s, "docs", None);
+    let q = s.insert_message(question(&a, &[&b], "Q"), 1).unwrap();
+    // c joins the thread through a later note, but was never asked.
+    s.insert_message(reply(&a, &[&b, &c], &q.id, "cc docs"), 2)
+        .unwrap();
+    s.insert_message(answer(&c, &[&a], &q.id), 3).unwrap();
+    assert_eq!(s.unread_counts(&b).unwrap().1, 1);
+    assert_eq!(open_question_threads(&s), 1);
+    // The asker cannot answer its own question either.
+    s.insert_message(answer(&a, &[&b], &q.id), 4).unwrap();
+    assert_eq!(open_question_threads(&s), 1);
+    // human may answer any question.
+    s.insert_message(answer(HUMAN, &[&a], &q.id), 5).unwrap();
+    assert_eq!(s.unread_counts(&b).unwrap().1, 0);
+    assert_eq!(open_question_threads(&s), 0);
+}
+
+#[test]
+fn outside_agent_cannot_reply_into_a_thread() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let c = agent(&s, "docs", None);
+    let root = s.insert_message(note(&a, &[&b], "Orders", "1"), 1).unwrap();
+    let err = s
+        .insert_message(reply(&c, &[&a], &root.id, "me too"), 2)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    assert_eq!(ids(&s.thread(&root.id).unwrap()), vec![root.id.as_str()]);
+    assert!(s.inbox(&a, true).unwrap().is_empty());
+    // Once addressed in the thread, c may reply.
+    let cc = s
+        .insert_message(reply(&a, &[&b, &c], &root.id, "cc docs"), 3)
+        .unwrap();
+    s.insert_message(reply(&c, &[&a], &cc.id, "ok"), 4).unwrap();
+    assert_eq!(s.thread(&root.id).unwrap().len(), 3);
+}
+
+#[test]
+fn released_held_question_is_open_to_its_new_recipient() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let q = s
+        .insert_held(question(&a, &[], "Q"), 1, repo, &names(&["docs"]))
+        .unwrap();
+    assert_eq!(open_question_threads(&s), 1);
+    let d = agent(&s, "docs", Some("/repo"));
+    s.release_held(repo, "docs", &d).unwrap();
+    assert_eq!(ids(&s.inbox(&d, false).unwrap()), vec![q.id.as_str()]);
+    assert_eq!(s.unread_counts(&d).unwrap(), (1, 1));
+    // Released, docs is now a recipient: it may reply and its answer closes.
+    s.insert_message(answer(&d, &[&a], &q.id), 2).unwrap();
+    assert_eq!(s.unread_counts(&d).unwrap(), (1, 0));
+    assert_eq!(open_question_threads(&s), 0);
 }

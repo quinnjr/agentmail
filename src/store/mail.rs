@@ -1,7 +1,7 @@
 //! Messages: insert, mailboxes and read state, threads, held mail, search
 //! and prune.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use redb::{ReadableTable, WriteTransaction};
@@ -90,14 +90,57 @@ fn reply_subject(root: &str) -> String {
     }
 }
 
-/// Whether question `q` is still open given every message in its thread:
-/// only an `answer` replying to it from someone other than the asker
-/// closes it.
-fn is_open_question(q: &Message, thread: &[Message]) -> bool {
-    q.kind == Kind::Question
-        && !thread.iter().any(|m| {
-            m.kind == Kind::Answer && m.in_reply_to.as_deref() == Some(&q.id) && m.from != q.from
-        })
+/// Whether `from` may answer question `q`: one of its recipients, or
+/// `human`, but never the asker.
+pub(crate) fn may_answer(q: &Message, from: &str) -> bool {
+    from != q.from && (from == HUMAN || q.to.iter().any(|a| a == from))
+}
+
+/// The questions in `thread` that `answer` closes, nearest first.
+///
+/// This is the one closing rule (the questions table in
+/// `store::questions` uses it too): an `answer` closes every question on
+/// its reply chain (its `in_reply_to`, that message's parent, and so on up
+/// to the root) that its sender [`may_answer`]. So `reply --answer` to a
+/// clarification inside a question's thread still closes the question.
+/// Anything other than an `answer` closes nothing.
+pub(crate) fn questions_closed_by<'a>(answer: &Message, thread: &'a [Message]) -> Vec<&'a Message> {
+    if answer.kind != Kind::Answer {
+        return Vec::new();
+    }
+    let by_id: HashMap<&str, &Message> = thread.iter().map(|m| (m.id.as_str(), m)).collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut next = answer.in_reply_to.as_deref();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            break;
+        }
+        let Some(m) = by_id.get(id) else {
+            break;
+        };
+        if m.kind == Kind::Question && may_answer(m, &answer.from) {
+            out.push(*m);
+        }
+        next = m.in_reply_to.as_deref();
+    }
+    out
+}
+
+/// The ids of the questions in `thread` that are still open: every
+/// question that no `answer` in the thread closes (see
+/// [`questions_closed_by`]).
+fn open_questions(thread: &[Message]) -> HashSet<&str> {
+    let closed: HashSet<&str> = thread
+        .iter()
+        .flat_map(|m| questions_closed_by(m, thread))
+        .map(|q| q.id.as_str())
+        .collect();
+    thread
+        .iter()
+        .filter(|m| m.kind == Kind::Question && !closed.contains(m.id.as_str()))
+        .map(|m| m.id.as_str())
+        .collect()
 }
 
 /// A thread's messages, in id order.
@@ -200,12 +243,27 @@ struct MailboxView {
 
 impl Store {
     /// Hook for the questions table (Task 5): called inside the write
-    /// transaction when a question message is inserted, and again when a
-    /// held question gains a recipient.
+    /// transaction exactly once per question, when the message is stored
+    /// (by [`Store::insert_message`] or [`Store::insert_held`]). It creates
+    /// the question row. Releasing held mail never calls it again; see
+    /// [`Store::on_question_recipient_added`].
     fn on_question_inserted(
         &self,
         _txn: &WriteTransaction,
         _msg: &Message,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Hook for the questions table (Task 5): called inside the release
+    /// transaction when held question `msg` is delivered to `addr`, after
+    /// `addr` was appended to `msg.to`. It adds `addr` to the existing
+    /// question row's recipients and must never create a second row.
+    fn on_question_recipient_added(
+        &self,
+        _txn: &WriteTransaction,
+        _msg: &Message,
+        _addr: &str,
     ) -> Result<(), StoreError> {
         Ok(())
     }
@@ -229,7 +287,10 @@ impl Store {
     /// agent ([`StoreError::NotFound`] otherwise), every recipient too
     /// ([`StoreError::UnknownRecipient`]), and the sender may not be a
     /// recipient ([`StoreError::InvalidRecipient`]). Duplicate recipients are
-    /// dropped. When `human` replies in a thread it had no part in, the reply
+    /// dropped. Only a participant of the parent's thread (the sender or a
+    /// recipient of some message in it) may reply there
+    /// ([`StoreError::InvalidInput`] otherwise); `human` may reply in any
+    /// thread. When `human` replies in a thread it had no part in, the reply
     /// is also put in the human's mailbox, already read, so the thread lists
     /// under `human`.
     pub fn insert_message(&self, m: NewMessage, now: i64) -> Result<Message, StoreError> {
@@ -311,14 +372,23 @@ impl Store {
                     let parent: Message = get_json(&messages, parent_id)?
                         .ok_or_else(|| missing_message(parent_id))?;
                     let thread = thread_messages(&threads, &messages, &parent.thread_id)?;
+                    let takes_part = |addr: &str| {
+                        thread
+                            .iter()
+                            .any(|t| t.from == addr || t.to.iter().any(|a| a == addr))
+                    };
+                    if m.from != HUMAN && !takes_part(&m.from) {
+                        return Err(StoreError::InvalidInput(format!(
+                            "{} is not part of thread {}; only human can reply in a \
+                             thread it was not addressed in",
+                            m.from, parent.thread_id
+                        )));
+                    }
                     let root_subject = thread
                         .iter()
                         .find(|t| t.id == parent.thread_id)
                         .map_or(parent.subject.as_str(), |root| root.subject.as_str());
-                    let human_joins = m.from == HUMAN
-                        && !thread
-                            .iter()
-                            .any(|t| t.from == HUMAN || t.to.iter().any(|a| a == HUMAN));
+                    let human_joins = m.from == HUMAN && !takes_part(HUMAN);
                     (
                         parent.thread_id.clone(),
                         reply_subject(root_subject),
@@ -453,7 +523,7 @@ impl Store {
             released
         };
         for msg in released.iter().filter(|m| m.kind == Kind::Question) {
-            self.on_question_inserted(&txn, msg)?;
+            self.on_question_recipient_added(&txn, msg, addr)?;
         }
         txn.commit()?;
         Ok(released)
@@ -472,7 +542,7 @@ impl Store {
             };
             if msg.kind == Kind::Question && msg.to.iter().any(|a| a == addr) {
                 let thread = thread_messages(&threads, &messages, &msg.thread_id)?;
-                if is_open_question(&msg, &thread) {
+                if open_questions(&thread).contains(msg.id.as_str()) {
                     open.insert(msg.id.clone());
                 }
             }
@@ -585,7 +655,7 @@ impl Store {
             {
                 continue;
             }
-            let open_questions = msgs.iter().filter(|m| is_open_question(m, &msgs)).count();
+            let open_questions = open_questions(&msgs).len();
             if f.open_questions && open_questions == 0 {
                 continue;
             }
