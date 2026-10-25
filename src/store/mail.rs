@@ -75,7 +75,7 @@ fn missing_message(id: &str) -> StoreError {
 /// repeated and trailing slashes, and resolve `..` against the previous
 /// component, so every spelling of one path compares equal. `..` at the
 /// root stays at the root, as the OS does.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for c in path.components() {
         match c {
