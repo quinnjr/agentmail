@@ -7,8 +7,10 @@ use std::path::{Component, Path, PathBuf};
 use redb::{ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
+use super::questions::is_open;
 use super::{
-    AGENTS, Alive, HELD, MAILBOX, MESSAGES, Store, StoreError, THREADS, all_json, encode, get_json,
+    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, Store, StoreError, THREADS, all_json,
+    encode, get_json,
 };
 use crate::ids::{new_message_id, validate_name};
 use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message, Presence};
@@ -128,8 +130,9 @@ pub(crate) fn may_answer(q: &Message, from: &str) -> bool {
 
 /// The questions in `thread` that `answer` closes, nearest first.
 ///
-/// This is the one closing rule (the questions table in
-/// `store::questions` uses it too): an `answer` closes every question on
+/// This is the one closing rule, applied once when the answer is stored
+/// (by `store::questions`, which records it in the questions table that
+/// every open-question view reads): an `answer` closes every question on
 /// its reply chain (its `in_reply_to`, that message's parent, and so on up
 /// to the root) that its sender [`may_answer`]. So `reply --answer` to a
 /// clarification inside a question's thread still closes the question.
@@ -155,22 +158,6 @@ pub(crate) fn questions_closed_by<'a>(answer: &Message, thread: &'a [Message]) -
         next = m.in_reply_to.as_deref();
     }
     out
-}
-
-/// The ids of the questions in `thread` that are still open: every
-/// question that no `answer` in the thread closes (see
-/// [`questions_closed_by`]).
-fn open_questions(thread: &[Message]) -> HashSet<&str> {
-    let closed: HashSet<&str> = thread
-        .iter()
-        .flat_map(|m| questions_closed_by(m, thread))
-        .map(|q| q.id.as_str())
-        .collect();
-    thread
-        .iter()
-        .filter(|m| m.kind == Kind::Question && !closed.contains(m.id.as_str()))
-        .map(|m| m.id.as_str())
-        .collect()
 }
 
 /// A thread's messages, in id order.
@@ -289,7 +276,10 @@ impl Store {
     /// `Re: <root subject>`; a new thread needs a non-blank subject. An
     /// [`Kind::Answer`] must be a reply that closes at least one open
     /// question on its reply chain (`InvalidInput("not an open question")`
-    /// otherwise). `to`
+    /// otherwise). A [`Kind::Question`] whose recipients already wait,
+    /// directly or through others, on its sender is refused with
+    /// [`StoreError::Deadlock`] (see [`Store::would_deadlock`]); the check
+    /// runs in the same transaction as the insert. `to`
     /// must not be empty (mail for unregistered names goes through
     /// [`Store::insert_held`]). The sender must be `human` or a registered
     /// agent ([`StoreError::NotFound`] otherwise), every recipient too
@@ -394,6 +384,11 @@ impl Store {
             require_known_sender(&agents, &m.from)?;
             for addr in &to {
                 require_known_recipient(&agents, addr)?;
+            }
+            if m.kind == Kind::Question {
+                // Checked in this write transaction, so two agents asking
+                // each other at once cannot both pass.
+                self.refuse_deadlock(txn, &m.from, &to)?;
             }
 
             let mut messages = txn.open_table(MESSAGES)?;
@@ -585,18 +580,18 @@ impl Store {
         let txn = self.read()?;
         let mailbox = txn.open_table(MAILBOX)?;
         let messages = txn.open_table(MESSAGES)?;
-        let threads = txn.open_table(THREADS)?;
+        let index = txn.open_table(OPEN_QUESTIONS)?;
         let mut entries = Vec::new();
         let mut open = HashSet::new();
         for (id, read) in mailbox_rows(&mailbox, addr)? {
             let Some(msg): Option<Message> = get_json(&messages, &id)? else {
                 continue;
             };
-            if msg.kind == Kind::Question && msg.to.iter().any(|a| a == addr) {
-                let thread = thread_messages(&threads, &messages, &msg.thread_id)?;
-                if open_questions(&thread).contains(msg.id.as_str()) {
-                    open.insert(msg.id.clone());
-                }
+            if msg.kind == Kind::Question
+                && msg.to.iter().any(|a| a == addr)
+                && is_open(&index, &msg.id)?
+            {
+                open.insert(msg.id.clone());
             }
             entries.push((msg, read));
         }
@@ -667,6 +662,7 @@ impl Store {
         let txn = self.read()?;
         let threads = txn.open_table(THREADS)?;
         let messages = txn.open_table(MESSAGES)?;
+        let index = txn.open_table(OPEN_QUESTIONS)?;
         let repo_members: Option<HashSet<String>> = match &f.repo {
             None => None,
             Some(repo) => {
@@ -710,7 +706,12 @@ impl Store {
             {
                 continue;
             }
-            let open_questions = open_questions(&msgs).len();
+            let mut open_questions = 0;
+            for m in msgs.iter().filter(|m| m.kind == Kind::Question) {
+                if is_open(&index, &m.id)? {
+                    open_questions += 1;
+                }
+            }
             if f.open_questions && open_questions == 0 {
                 continue;
             }

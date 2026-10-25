@@ -31,6 +31,9 @@ pub(crate) const THREADS: TableDefinition<(&str, &str), ()> = TableDefinition::n
 pub(crate) const HELD: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("held");
 /// Questions by message id. Value: JSON [`crate::model::Question`].
 pub(crate) const QUESTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("questions");
+/// Index of the open (unanswered) rows of [`QUESTIONS`]: question id.
+/// Rebuilt from [`QUESTIONS`] on every [`Store::open`].
+pub(crate) const OPEN_QUESTIONS: TableDefinition<&str, ()> = TableDefinition::new("open_questions");
 /// Store metadata, e.g. `schema_version`.
 pub(crate) const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
@@ -63,6 +66,13 @@ pub enum StoreError {
     /// and send to that agent.
     #[error("recipient registered: {0}; resolve the recipients again")]
     RecipientRegistered(String),
+    /// Storing this question would close a wait cycle: the recipients
+    /// already wait, directly or through others, on its asker. Nothing was
+    /// stored. Carries the open question addressed to the asker that it
+    /// should answer (or reply to in that thread) instead; see
+    /// [`Store::would_deadlock`].
+    #[error("asking would deadlock: answer question {} first", .0.id)]
+    Deadlock(Box<crate::model::Question>),
     #[error("database error: {0}")]
     Db(String),
 }
@@ -110,6 +120,7 @@ impl Store {
             txn.open_table(THREADS)?;
             txn.open_table(HELD)?;
             txn.open_table(QUESTIONS)?;
+            questions::rebuild_open_index(&txn)?;
             let mut meta = txn.open_table(META)?;
             let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());
             match existing {

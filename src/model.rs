@@ -100,7 +100,7 @@ pub struct Message {
 }
 
 /// An open or answered blocking question.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Question {
     /// Id of the question message.
     pub id: String,

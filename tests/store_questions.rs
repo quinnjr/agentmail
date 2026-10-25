@@ -204,16 +204,187 @@ fn no_cycle_after_answer() {
 
 #[test]
 fn deadlock_check_terminates_on_existing_cycles() {
-    // The store itself does not refuse cyclic questions (the daemon calls
-    // would_deadlock first), so the search must survive cycles it did not
-    // start from.
+    // The store refuses a cyclic question, but releasing held mail can
+    // still close a cycle (delivery is never refused), so the search must
+    // survive cycles it did not start from.
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let c = agent(&s, "frontend", Some("/repo"));
+    // a asks the not-yet-registered docs agent.
+    s.insert_held(
+        question(&a, &[], "Q"),
+        1,
+        repo,
+        &addrs(&["docs"]),
+        NOT_ALIVE,
+    )
+    .unwrap();
+    let b = agent(&s, "docs", Some("/repo"));
+    // b asks a before the held question is released: no cycle yet.
+    ask(&s, &b, &[&a]);
+    // Releasing adds the edge a -> b, closing a -> b -> a.
+    s.release_held(repo, "docs", &b).unwrap();
+    assert_eq!(s.would_deadlock(&c, &addrs(&[&a])).unwrap(), None);
+    assert!(s.would_deadlock(&b, &addrs(&[&a])).unwrap().is_some());
+}
+
+#[test]
+fn cyclic_question_is_refused_atomically() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let q = ask(&s, &a, &[&b]);
+    let err = s.insert_message(question(&b, &[&a], "Q2"), 2).unwrap_err();
+    let StoreError::Deadlock(hit) = err else {
+        panic!("expected Deadlock, got {err:?}");
+    };
+    assert_eq!(hit.id, q.id);
+    // Nothing was stored.
+    assert!(s.inbox(&a, true).unwrap().is_empty());
+    assert!(s.open_questions_to(&a).unwrap().is_empty());
+    assert_eq!(s.threads(&Default::default()).unwrap().len(), 1);
+    // A note in the other direction is fine.
+    s.insert_message(note(&b, &[&a], "N", "x"), 3).unwrap();
+    // A clarifying question in the same thread would also wait on a.
+    let err = s
+        .insert_message(
+            NewMessage {
+                kind: Kind::Question,
+                ..reply(&b, &[&a], &q.id, "which?")
+            },
+            4,
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Deadlock(_)), "{err:?}");
+}
+
+#[test]
+fn cyclic_held_question_is_refused() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let b = agent(&s, "frontend", Some("/repo"));
+    let q = ask(&s, &a, &[&b]);
+    let err = s
+        .insert_held(
+            question(&b, &[&a], "Q2"),
+            2,
+            repo,
+            &addrs(&["docs"]),
+            NOT_ALIVE,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::Deadlock(Box::new(s.question(&q.id).unwrap().unwrap()))
+    );
+    let d = agent(&s, "docs", Some("/repo"));
+    assert!(s.release_held(repo, "docs", &d).unwrap().is_empty());
+}
+
+#[test]
+fn simultaneous_opposite_questions_never_both_land() {
+    for _ in 0..20 {
+        let (_d, s) = store();
+        let a = agent(&s, "backend", None);
+        let b = agent(&s, "frontend", None);
+        let barrier = std::sync::Barrier::new(2);
+        let (ra, rb) = std::thread::scope(|scope| {
+            let ha = scope.spawn(|| {
+                barrier.wait();
+                s.insert_message(question(&a, &[&b], "A"), 1)
+            });
+            let hb = scope.spawn(|| {
+                barrier.wait();
+                s.insert_message(question(&b, &[&a], "B"), 1)
+            });
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+        assert!(ra.is_ok() != rb.is_ok(), "{ra:?} / {rb:?}");
+        let refused = ra.err().or(rb.err()).unwrap();
+        assert!(matches!(refused, StoreError::Deadlock(_)), "{refused:?}");
+    }
+}
+
+/// Every open-question view agrees with the questions table.
+fn assert_views_agree(s: &Store, addrs_: &[&str]) {
+    let mut table_open: Vec<String> = Vec::new();
+    for addr in addrs_ {
+        let to_me: Vec<String> = s
+            .open_questions_to(addr)
+            .unwrap()
+            .into_iter()
+            .map(|q| q.id)
+            .collect();
+        let (_, open_count) = s.unread_counts(addr).unwrap();
+        assert_eq!(open_count, to_me.len(), "unread_counts for {addr}");
+        let inbox = s.inbox(addr, true).unwrap();
+        let first: Vec<String> = inbox
+            .iter()
+            .take(to_me.len())
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(first, to_me, "inbox head for {addr}");
+        for id in to_me {
+            if !table_open.contains(&id) {
+                table_open.push(id);
+            }
+        }
+    }
+    let threads = s.threads(&Default::default()).unwrap();
+    let mut listed = 0;
+    for t in &threads {
+        let in_thread = s
+            .thread(&t.thread_id)
+            .unwrap()
+            .into_iter()
+            .filter(|m| {
+                s.question(&m.id)
+                    .unwrap()
+                    .is_some_and(|q| q.answered_by.is_none())
+            })
+            .count();
+        assert_eq!(t.open_questions, in_thread, "thread {}", t.thread_id);
+        listed += t.open_questions;
+    }
+    assert!(listed >= table_open.len());
+}
+
+#[test]
+fn open_question_views_agree_after_each_closing_scenario() {
     let (_d, s) = store();
     let a = agent(&s, "backend", None);
     let b = agent(&s, "frontend", None);
     let c = agent(&s, "docs", None);
-    ask(&s, &a, &[&b]);
-    ask(&s, &b, &[&a]);
-    assert_eq!(s.would_deadlock(&c, &addrs(&[&a])).unwrap(), None);
+    let all = [a.as_str(), b.as_str(), c.as_str(), HUMAN];
+    let q1 = ask(&s, &a, &[&b, &c]);
+    assert_views_agree(&s, &all);
+    let cl = s
+        .insert_message(reply(&b, &[&a], &q1.id, "which?"), 2)
+        .unwrap();
+    assert_views_agree(&s, &all);
+    let r = s
+        .insert_message(reply(&a, &[&b], &cl.id, "this"), 3)
+        .unwrap();
+    s.insert_message(answer(&b, &[&a], &r.id), 4).unwrap();
+    assert_views_agree(&s, &all);
+    let q2 = ask(&s, &c, &[&b]);
+    let q3 = s
+        .insert_message(
+            NewMessage {
+                kind: Kind::Question,
+                ..reply(&c, &[&b], &q2.id, "and?")
+            },
+            5,
+        )
+        .unwrap();
+    assert_views_agree(&s, &all);
+    s.insert_message(answer(HUMAN, &[&c], &q3.id), 6).unwrap();
+    assert_views_agree(&s, &all);
+    assert!(s.open_questions_to(&b).unwrap().is_empty());
+    s.prune(100).unwrap();
+    assert_views_agree(&s, &all);
 }
 
 #[test]
