@@ -495,8 +495,9 @@ impl Store {
     /// and stops being held. Returns the released messages in id order.
     ///
     /// The agent at `addr` must exist ([`StoreError::NotFound`]) and be
-    /// named `name` in `repo` (its repo, or its cwd when it has none);
-    /// otherwise [`StoreError::InvalidInput`]. `repo` must be absolute.
+    /// named `name` in `repo` (its repo, or its cwd when it has none; a
+    /// non-absolute stored path never matches); otherwise
+    /// [`StoreError::InvalidInput`]. `repo` must be absolute.
     pub fn release_held(
         &self,
         repo: &Path,
@@ -516,7 +517,10 @@ impl Store {
                 )));
             }
             let agent_repo = agent.repo.as_deref().unwrap_or(&agent.cwd);
-            if repo_key(agent_repo)? != repo {
+            // A non-absolute stored path (register does not require one)
+            // can never match `repo`; report it as a mismatch, not as a
+            // fault in the caller's `repo`.
+            if repo_key(agent_repo).ok().as_deref() != Some(repo.as_str()) {
                 return Err(StoreError::InvalidInput(format!(
                     "agent {addr:?} is in {}, not {repo}",
                     agent_repo.display()

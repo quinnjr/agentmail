@@ -748,11 +748,14 @@ fn only_a_recipient_or_human_answer_closes_a_question() {
     // c joins the thread through a later note, but was never asked.
     s.insert_message(reply(&a, &[&b, &c], &q.id, "cc docs"), 2)
         .unwrap();
-    s.insert_message(answer(&c, &[&a], &q.id), 3).unwrap();
+    // Whether such answers are accepted is not pinned here; only that they
+    // close nothing.
+    let _ = s.insert_message(answer(&c, &[&a], &q.id), 3);
     assert_eq!(s.unread_counts(&b).unwrap().1, 1);
     assert_eq!(open_question_threads(&s), 1);
     // The asker cannot answer its own question either.
-    s.insert_message(answer(&a, &[&b], &q.id), 4).unwrap();
+    let _ = s.insert_message(answer(&a, &[&b], &q.id), 4);
+    assert_eq!(s.unread_counts(&b).unwrap().1, 1);
     assert_eq!(open_question_threads(&s), 1);
     // human may answer any question.
     s.insert_message(answer(HUMAN, &[&a], &q.id), 5).unwrap();
@@ -891,4 +894,32 @@ fn threads_repo_filter_matches_cwd_without_repo() {
     assert_eq!(by_repo(&s, "/r3").unwrap(), vec![t.id.clone()]);
     assert_eq!(by_repo(&s, "/r3/sub/").unwrap(), vec![t.id]);
     assert!(by_repo(&s, "/r3/other").unwrap().is_empty());
+}
+
+#[test]
+fn release_held_to_agent_with_relative_cwd_is_a_repo_mismatch() {
+    let (_d, s) = store();
+    let req = agentmail::store::RegisterReq {
+        name: "frontend".into(),
+        role: None,
+        working_on: None,
+        harness: Harness::Other,
+        cwd: PathBuf::from("relative/dir"),
+        repo: None,
+        proc_id: None,
+        fresh: true,
+        wake: false,
+    };
+    let f = s.register(req, 1, &|_| false).unwrap().0.address;
+    let err = s
+        .release_held(Path::new("/repo"), "frontend", &f)
+        .unwrap_err();
+    match err {
+        StoreError::InvalidInput(msg) => {
+            assert!(msg.contains("relative/dir"), "{msg}");
+            assert!(msg.contains("not /repo"), "{msg}");
+            assert!(!msg.contains("not an absolute path"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
