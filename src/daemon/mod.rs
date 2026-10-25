@@ -4,11 +4,11 @@
 pub mod handler;
 pub mod hub;
 
-use std::fs::{DirBuilder, OpenOptions, TryLockError};
+use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -32,8 +32,8 @@ const SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to keep retrying to open the database (a previous daemon in
 /// this process may still be releasing it).
 const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
-/// How long to wait for in-flight database work after shutdown.
-const STORE_RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// How often to log while shutdown waits for in-flight database work.
+const STORE_RELEASE_WARN: Duration = Duration::from_secs(5);
 
 /// The longest path a Unix socket can be bound at: `sun_path` holds 108
 /// bytes, including the terminating NUL.
@@ -220,14 +220,32 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
     drop(listener);
     conns.shutdown().await;
     drop(handler);
-    // Close the database before releasing the lock, so the successor that
-    // takes the lock can open it.
-    let deadline = Instant::now() + STORE_RELEASE_WAIT;
-    while store_ref.strong_count() > 0 && Instant::now() < deadline {
+    release_store(store_ref, lock, STORE_RELEASE_WARN).await;
+    Ok(())
+}
+
+/// Wait until the store is closed, then release the lock.
+///
+/// Requests still running on blocking threads hold the store after the
+/// connections are gone. The lock is kept until the last of them drops
+/// it, however long that takes: a successor takes the lock only when it
+/// can open the database. Every request is bounded (child processes run
+/// under a timeout), so this ends. A note is logged every `warn_every`
+/// while it waits.
+async fn release_store(store: Weak<Store>, lock: File, warn_every: Duration) {
+    let started = Instant::now();
+    let mut next_warn = started + warn_every;
+    while store.strong_count() > 0 {
+        if Instant::now() >= next_warn {
+            eprintln!(
+                "agentmail daemon: waiting for in-flight requests to finish ({:.1}s)",
+                started.elapsed().as_secs_f64()
+            );
+            next_warn += warn_every;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     drop(lock);
-    Ok(())
 }
 
 /// Why a request line could not be read.
@@ -430,6 +448,50 @@ mod tests {
                 is_contact: false,
             },
         }
+    }
+
+    /// A slow request still holding the store when the daemon shuts down
+    /// must keep the lock held until it finishes, however long that takes,
+    /// so the successor that takes the lock can always open the database.
+    #[tokio::test]
+    async fn lock_is_held_until_a_slow_request_releases_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let lock = std::fs::File::create(&paths.lock).unwrap();
+        lock.lock().unwrap();
+        let store = Arc::new(Store::open(&paths.db).unwrap());
+        let weak = Arc::downgrade(&store);
+
+        // An in-flight request that outlives shutdown, and the warning
+        // interval, several times over.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let slow = tokio::task::spawn_blocking(move || {
+            let _held = store;
+            done_rx.recv().ok();
+        });
+        let release = tokio::spawn(release_store(weak, lock, Duration::from_millis(20)));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !release.is_finished(),
+            "released while the store was in use"
+        );
+        let probe = std::fs::File::open(&paths.lock).unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(TryLockError::WouldBlock)),
+            "the lock was given up while the store was still open"
+        );
+
+        done_tx.send(()).unwrap();
+        slow.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .expect("release did not finish once the store was dropped")
+            .unwrap();
+        // The successor takes the lock and opens the store at once.
+        probe.try_lock().expect("lock still held after release");
+        Store::open(&paths.db).expect("successor could not open the store");
     }
 
     #[tokio::test]
