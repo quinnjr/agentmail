@@ -264,9 +264,51 @@ fn reregister_from_same_process_keeps_address() {
     let procs = Procs::new(&[p(1)]);
     let (a, _) = register(&s, &procs, req("backend", "/w", Some(p(1))), 10);
     let (b, reclaimed) = register(&s, &procs, req("backend", "/w", Some(p(1))), 20);
-    assert!(reclaimed);
+    // Keeping the caller's own address is not a reclaim: nothing was taken back.
+    assert!(!reclaimed);
     assert_eq!(b.address, a.address);
+    assert_eq!(b.last_seen, 20);
     assert_eq!(s.list_agents().unwrap().len(), 1);
+}
+
+#[test]
+fn reregister_after_signoff_from_same_process_is_not_a_reclaim() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, req("backend", "/w", Some(p(1))), 10);
+    s.signoff(&a.address).unwrap();
+    let (b, reclaimed) = register(&s, &procs, req("backend", "/w", Some(p(1))), 20);
+    assert!(!reclaimed);
+    assert_eq!(b.address, a.address);
+    assert!(!b.signed_off);
+}
+
+#[test]
+fn reregister_prefers_own_binding_over_newer_gone_agent() {
+    let (_d, s) = store();
+    let mut procs = Procs::new(&[p(0), p(1)]);
+    let (y, _) = register(&s, &procs, req("backend", "/w", Some(p(0))), 5);
+    let mut fresh = req("backend", "/w", Some(p(1)));
+    fresh.fresh = true;
+    let (x, _) = register(&s, &procs, fresh, 10);
+    assert_ne!(x.address, y.address);
+    s.touch(&y.address, 50).unwrap();
+    procs.kill(p(0));
+
+    let mut again = req("backend", "/w", Some(p(1)));
+    again.role = Some("orders API".into());
+    let (b, reclaimed) = register(&s, &procs, again, 60);
+    assert_eq!(b.address, x.address);
+    assert!(!reclaimed);
+    assert_eq!(b.role.as_deref(), Some("orders API"));
+    // Y is untouched and still unbound from p1's session.
+    let y_now = s.get_agent(&y.address).unwrap().unwrap();
+    assert_eq!(y_now.proc_id, Some(p(0)));
+    assert_eq!(y_now.last_seen, 50);
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        x.address
+    );
 }
 
 #[test]

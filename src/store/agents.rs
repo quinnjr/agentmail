@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableTable;
 
 use super::{AGENTS, CONTACTS, Store, StoreError, all_json, encode, get_json};
 use crate::ids::{new_address, validate_name};
@@ -65,16 +65,27 @@ fn reclaimable(agent: &Agent, proc_id: Option<ProcId>, alive: Alive) -> bool {
     }
 }
 
+/// Whether `agent` is already bound to the requesting process `proc_id`.
+fn is_own(agent: &Agent, proc_id: Option<ProcId>) -> bool {
+    agent.proc_id.is_some() && agent.proc_id == proc_id
+}
+
 impl Store {
     /// Register an agent, reclaiming a gone agent's address when the spec's
     /// reclaim rule applies. Returns the agent and whether it was reclaimed.
     ///
     /// Reclaim: unless `fresh`, an agent with the same `name` and `cwd` that
     /// is not bound to a live process (or is bound to the requesting process
-    /// itself) is rebound; with several, the most recently seen wins. The
+    /// itself) is rebound. With several, one already bound to the requesting
+    /// process wins (a re-registration keeps the caller's current address);
+    /// otherwise the most recently seen wins. The
     /// address, `registered_at` and contacts are kept; `role`, `working_on`,
     /// `harness`, `repo`, `wake`, `proc_id` and `last_seen` are replaced and
     /// `signed_off` is cleared.
+    ///
+    /// The returned flag is true only when the address was taken back from a
+    /// different or absent process; a re-registration that keeps the address
+    /// already bound to `proc_id` is not a reclaim and reports false.
     ///
     /// One address per harness process: any other agent bound to `proc_id`
     /// is unbound (its `proc_id` cleared, so it shows as gone).
@@ -106,16 +117,14 @@ impl Store {
                     .filter(|a| a.name == req.name && a.cwd == req.cwd)
                     .filter(|a| reclaimable(a, req.proc_id, alive))
                     .max_by(|x, y| {
-                        (x.last_seen, x.registered_at, &x.address).cmp(&(
-                            y.last_seen,
-                            y.registered_at,
-                            &y.address,
-                        ))
+                        let key =
+                            |a: &Agent| (is_own(a, req.proc_id), a.last_seen, a.registered_at);
+                        key(x).cmp(&key(y)).then_with(|| x.address.cmp(&y.address))
                     })
                     .cloned()
             };
 
-            let reclaimed = reclaim.is_some();
+            let reclaimed = reclaim.as_ref().is_some_and(|a| !is_own(a, req.proc_id));
             let agent = match reclaim {
                 Some(mut a) => {
                     a.role = req.role;
@@ -304,7 +313,7 @@ impl Store {
 
     /// `owner`'s contacts, sorted by address.
     pub fn contacts(&self, owner: &str) -> Result<Vec<String>, StoreError> {
-        let txn = self.db.begin_read()?;
+        let txn = self.read()?;
         let table = txn.open_table(CONTACTS)?;
         let mut out = Vec::new();
         for row in table.range((owner, "")..)? {
