@@ -853,6 +853,17 @@ async fn daemon_cli_status_and_stop_handle_a_daemon_with_another_protocol() {
     assert!(out.contains("different protocol"), "{out}");
     assert!(out.contains("agentmail daemon stop"), "{out}");
 
+    let (code, out) = run_cli(&paths, &["daemon", "status", "--json"]).await;
+    assert_eq!(code, Some(3), "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["running"], true, "{v}");
+    assert!(v["pid"].is_null(), "{v}");
+    assert!(v["protocol"].is_null(), "{v}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("different protocol"),
+        "{v}"
+    );
+
     let (code, out) = run_cli(&paths, &["daemon", "stop"]).await;
     assert_eq!(code, Some(0), "{out}");
     assert!(!out.contains("not running"), "{out}");
@@ -862,7 +873,10 @@ async fn daemon_cli_status_and_stop_handle_a_daemon_with_another_protocol() {
         .await
         .expect("fake daemon was never stopped")
         .unwrap();
-    assert_eq!(conns, vec![vec!["hello"], vec!["hello", "shutdown"]]);
+    assert_eq!(
+        conns,
+        vec![vec!["hello"], vec!["hello"], vec!["hello", "shutdown"]]
+    );
 }
 
 #[tokio::test]
@@ -1277,6 +1291,19 @@ async fn daemon_status_reports_a_daemon_for_another_data_dir() {
     assert!(!out.contains("not running"), "{out}");
     assert!(out.contains("not for this data directory"), "{out}");
     assert!(out.contains("AGENTMAIL_SOCKET"), "{out}");
+
+    let (code, out) = run_cli(&paths, &["daemon", "status", "--json"]).await;
+    assert_eq!(code, Some(1), "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["running"], true, "{v}");
+    assert!(v["pid"].is_null(), "{v}");
+    assert!(
+        v["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not for this data directory"),
+        "{v}"
+    );
 }
 
 #[tokio::test]
@@ -1292,6 +1319,18 @@ async fn daemon_stop_refuses_a_daemon_for_another_data_dir() {
     assert!(!out.contains("daemon stopped"), "{out}");
     assert!(out.contains("not for this data directory"), "{out}");
     assert!(out.contains("AGENTMAIL_SOCKET"), "{out}");
+
+    let (code, out) = run_cli(&paths, &["daemon", "stop", "--json"]).await;
+    assert_eq!(code, Some(1), "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["stopped"], false, "{v}");
+    assert!(
+        v["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not for this data directory"),
+        "{v}"
+    );
 
     let err = Client::shutdown(&paths).await.expect_err("stopped it");
     assert!(

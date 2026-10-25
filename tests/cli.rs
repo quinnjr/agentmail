@@ -447,6 +447,24 @@ fn ids_are_case_insensitive() {
     let short = id[id.len() - 8..].to_ascii_lowercase();
     let v = ok_json(env.as_agent(&b).args(["read", &short, "--json"]));
     assert_eq!(v["id"], id.as_str());
+    // Four characters are enough; fewer match too much to be useful.
+    let v = ok_json(
+        env.as_agent(&b)
+            .args(["read", &id[id.len() - 4..], "--json"]),
+    );
+    assert_eq!(v["id"], id.as_str());
+    for tiny in [&id[id.len() - 1..], &id[id.len() - 3..]] {
+        let out = env
+            .as_agent(&b)
+            .args(["read", tiny, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        let v = json(&out);
+        assert_eq!(v["error"]["code"], "InvalidInput", "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("at least 4 characters"), "{msg}");
+    }
 }
 
 #[test]
@@ -800,6 +818,40 @@ fn daemon_status_and_stop() {
     ok_text(env.cmd().args(["daemon", "status"]));
     let out = ok_text(env.cmd().args(["daemon", "stop"]));
     assert!(out.contains("stopped"), "{out}");
+}
+
+#[test]
+fn daemon_actions_print_json() {
+    let env = Env::new();
+    let socket = env.socket().display().to_string();
+    let out = env
+        .cmd()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json(&out);
+    assert_eq!(v["running"], false, "{v}");
+    assert!(v["pid"].is_null(), "{v}");
+    assert_eq!(v["socket"], socket.as_str());
+    assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()), "{v}");
+
+    let v = ok_json(env.cmd().args(["daemon", "start", "--json"]));
+    assert_eq!(v["running"], true, "{v}");
+    let pid = v["pid"].as_u64().unwrap();
+    assert!(pid > 0);
+
+    let v = ok_json(env.cmd().args(["--json", "daemon", "status"]));
+    assert_eq!(v["running"], true, "{v}");
+    assert_eq!(v["pid"].as_u64(), Some(pid));
+    assert!(v["protocol"].as_u64().is_some(), "{v}");
+    assert_eq!(v["socket"], socket.as_str());
+    assert!(v["reason"].is_null(), "{v}");
+
+    let v = ok_json(env.cmd().args(["daemon", "stop", "--json"]));
+    assert_eq!(v["stopped"], true, "{v}");
+    let v = ok_json(env.cmd().args(["daemon", "stop", "--json"]));
+    assert_eq!(v["stopped"], false, "{v}");
 }
 
 #[test]

@@ -19,6 +19,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::client::{Client, ClientError, DataDirMismatch};
+use crate::daemon::handler::MAX_WAIT;
 use crate::daemon::{DaemonConfig, serve};
 use crate::identity;
 use crate::ids::now_ms;
@@ -34,6 +35,11 @@ pub const EXIT_PENDING: u8 = 3;
 const STATUS_OTHER_PROTOCOL: u8 = 3;
 /// Length of a full message id (a ULID).
 const ULID_LEN: usize = 26;
+/// The fewest characters a short id may have: fewer match too many
+/// messages to be useful, and each lookup scans every message.
+const MIN_SHORT_ID: usize = 4;
+/// How many matching ids an ambiguous short id's error lists.
+const AMBIGUOUS_SHOWN: usize = 5;
 /// The default for every `--timeout`.
 const DEFAULT_TIMEOUT: &str = "240s";
 
@@ -561,21 +567,53 @@ impl Session {
         if let Some(full) = normalize_full_id(id) {
             return Ok(full);
         }
+        if let Some(e) = too_short_id(id) {
+            return Err(e.into());
+        }
         let d = self.call(Request::ResolveId { id: id.to_string() }).await?;
         let mut found: Vec<String> = parse(&d)?;
         match found.len() {
             0 => Ok(id.to_string()),
             1 => Ok(found.remove(0)),
-            _ => Err(ClientError::new(
-                ErrorCode::InvalidInput,
-                format!(
-                    "id {id:?} matches several messages ({}); give more of it",
-                    found.join(", ")
-                ),
-            )
-            .into()),
+            _ => Err(ambiguous_id(id, &found).into()),
         }
     }
+}
+
+/// The error for a short id with fewer than `MIN_SHORT_ID` characters.
+fn too_short_id(id: &str) -> Option<ClientError> {
+    (id.chars().count() < MIN_SHORT_ID).then(|| {
+        ClientError::new(
+            ErrorCode::InvalidInput,
+            format!("id {id:?} is too short; give at least {MIN_SHORT_ID} characters of the id"),
+        )
+    })
+}
+
+/// The error for a short id that ends several stored ids, listing the
+/// first `AMBIGUOUS_SHOWN` of them.
+fn ambiguous_id(id: &str, found: &[String]) -> ClientError {
+    let shown = found[..found.len().min(AMBIGUOUS_SHOWN)].join(", ");
+    let more = match found.len().saturating_sub(AMBIGUOUS_SHOWN) {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    ClientError::new(
+        ErrorCode::InvalidInput,
+        format!(
+            "id {id:?} matches {} messages ({shown}{more}); give more of it",
+            found.len()
+        ),
+    )
+}
+
+/// What `wait` prints when no mail came within `timeout_secs`, cut to the
+/// longest wait the daemon allows, as it cuts the wait itself.
+fn wait_timeout_text(timeout_secs: u64) -> String {
+    format!(
+        "no new mail within {}\n",
+        humanize(timeout_secs.min(MAX_WAIT.as_secs()))
+    )
 }
 
 /// `id` as a full id when it is one (upper-cased), or empty; `None` for a
@@ -587,7 +625,7 @@ fn normalize_full_id(id: &str) -> Option<String> {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
     if let Command::Daemon { action } = cli.command {
-        return daemon(&paths, action.unwrap_or(DaemonAction::Status)).await;
+        return daemon(&paths, action.unwrap_or(DaemonAction::Status), cli.json).await;
     }
     let caller = identity::cli_caller(cli.as_who.is_some());
     if matches!(cli.command, Command::Register { .. }) && caller == Caller::Human {
@@ -863,10 +901,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                     let msgs: Vec<Message> = parse(&d["messages"])?;
                     Ok(render::thread(&msgs))
                 } else {
-                    Ok(format!(
-                        "no new mail within {}\n",
-                        humanize(timeout.as_secs())
-                    ))
+                    Ok(wait_timeout_text(timeout.as_secs()))
                 }
             })?;
             return Ok(blocking_exit(&d));
@@ -1018,7 +1053,33 @@ async fn daemon_pid(c: &mut Client) -> Result<u64> {
     Ok(hello["pid"].as_u64().unwrap_or(0))
 }
 
-async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
+/// Print `v` as JSON when `json` is set, else the line `text`.
+fn say(json: bool, v: Value, text: &str) -> Result<()> {
+    if json {
+        print_json(&v)
+    } else {
+        print_line(text)
+    }
+}
+
+/// `daemon status` as JSON: whether a daemon answers on the socket, its pid
+/// and protocol when it is ours, and why not otherwise.
+fn daemon_status_json(
+    paths: &Paths,
+    running: bool,
+    pid: Option<u64>,
+    reason: Option<String>,
+) -> Value {
+    json!({
+        "running": running,
+        "pid": pid,
+        "protocol": pid.map(|_| PROTOCOL_VERSION),
+        "socket": paths.socket.display().to_string(),
+        "reason": reason,
+    })
+}
+
+async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitCode> {
     match action {
         DaemonAction::Run => {
             serve(DaemonConfig {
@@ -1030,35 +1091,56 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
         DaemonAction::Start => {
             let mut c = Client::connect_or_spawn(paths).await?;
             let pid = daemon_pid(&mut c).await?;
-            print_line(&format!("daemon running (pid {pid})"))?;
+            say(
+                json,
+                json!({ "running": true, "pid": pid }),
+                &format!("daemon running (pid {pid})"),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         DaemonAction::Status => match Client::connect(paths).await {
             Ok(mut c) => {
                 let pid = daemon_pid(&mut c).await?;
-                print_line(&format!(
-                    "daemon running (pid {pid}, protocol {PROTOCOL_VERSION}, socket {})",
-                    paths.socket.display()
-                ))?;
+                say(
+                    json,
+                    daemon_status_json(paths, true, Some(pid), None),
+                    &format!(
+                        "daemon running (pid {pid}, protocol {PROTOCOL_VERSION}, socket {})",
+                        paths.socket.display()
+                    ),
+                )?;
                 Ok(ExitCode::SUCCESS)
             }
             Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
-                print_line(&format!(
-                    "daemon running, but not for this data directory: {e:#}"
-                ))?;
+                let reason = format!("not for this data directory: {e:#}");
+                say(
+                    json,
+                    daemon_status_json(paths, true, None, Some(reason.clone())),
+                    &format!("daemon running, but {reason}"),
+                )?;
                 Ok(ExitCode::FAILURE)
             }
             Err(e) => match e.downcast_ref::<ClientError>() {
                 Some(ce) if ce.code == ErrorCode::VersionMismatch => {
-                    print_line(&format!(
-                        "daemon running, but it speaks a different protocol (this client \
-                         speaks {PROTOCOL_VERSION}: {}); run `agentmail daemon stop`",
+                    let reason = format!(
+                        "it speaks a different protocol (this client speaks \
+                         {PROTOCOL_VERSION}: {}); run `agentmail daemon stop`",
                         ce.message
-                    ))?;
+                    );
+                    say(
+                        json,
+                        daemon_status_json(paths, true, None, Some(reason.clone())),
+                        &format!("daemon running, but {reason}"),
+                    )?;
                     Ok(ExitCode::from(STATUS_OTHER_PROTOCOL))
                 }
                 _ => {
-                    print_line(&format!("daemon not running ({e:#})"))?;
+                    let reason = format!("{e:#}");
+                    say(
+                        json,
+                        daemon_status_json(paths, false, None, Some(reason.clone())),
+                        &format!("daemon not running ({reason})"),
+                    )?;
                     Ok(ExitCode::FAILURE)
                 }
             },
@@ -1069,13 +1151,20 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
             match Client::shutdown(paths).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    print_line("daemon not running")?;
+                    say(
+                        json,
+                        json!({ "stopped": false, "reason": "daemon not running" }),
+                        "daemon not running",
+                    )?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
-                    print_line(&format!(
-                        "daemon running, but not for this data directory; not stopped: {e:#}"
-                    ))?;
+                    let reason = format!("not for this data directory; not stopped: {e:#}");
+                    say(
+                        json,
+                        json!({ "stopped": false, "reason": format!("daemon running, but {reason}") }),
+                        &format!("daemon running, but {reason}"),
+                    )?;
                     return Ok(ExitCode::FAILURE);
                 }
                 Err(e) => return Err(e),
@@ -1089,7 +1178,11 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> Result<ExitCode> {
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            print_line("daemon stopped")?;
+            say(
+                json,
+                json!({ "stopped": true, "reason": null }),
+                "daemon stopped",
+            )?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -1227,6 +1320,44 @@ mod tests {
             ce.message.contains("too large: 262154 bytes"),
             "{}",
             ce.message
+        );
+    }
+
+    #[test]
+    fn cli_short_ids_need_four_characters() {
+        for id in ["0", "ab", "xyz"] {
+            let e = too_short_id(id).unwrap();
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.contains("at least 4 characters"), "{}", e.message);
+        }
+        assert!(too_short_id("wxyz").is_none());
+        assert!(too_short_id("8wgwzt7p").is_none());
+    }
+
+    #[test]
+    fn cli_ambiguous_id_lists_a_few_candidates() {
+        let found: Vec<String> = (0..1000).map(|i| format!("ID{i:04}")).collect();
+        let e = ambiguous_id("0", &found);
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(
+            e.message
+                .contains("ID0000, ID0001, ID0002, ID0003, ID0004 and 995 more"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("ID0005"), "{}", e.message);
+        let e = ambiguous_id("abcd", &found[..2]);
+        assert!(e.message.contains("(ID0000, ID0001)"), "{}", e.message);
+        assert!(!e.message.contains(" and "), "{}", e.message);
+    }
+
+    #[test]
+    fn cli_wait_timeout_text_uses_the_effective_wait() {
+        assert_eq!(wait_timeout_text(90), "no new mail within 1m\n");
+        // The daemon cuts every wait to MAX_WAIT (a week).
+        assert_eq!(
+            wait_timeout_text(100 * 7 * 24 * 3600),
+            "no new mail within 7d\n"
         );
     }
 
