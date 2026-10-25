@@ -382,6 +382,48 @@ mod tests {
     }
 
     #[test]
+    fn held_question_to_a_named_waiter_is_refused() {
+        let (_d, s) = store();
+        let a = agent(&s, "frontend");
+        // backend (gone under `alive`) waits on frontend.
+        let b = agent(&s, "backend");
+        let q = s
+            .insert_message(msg(&b, &[&a], Kind::Question, None), 1)
+            .unwrap();
+        let before = s.list_agents().unwrap().len();
+        let err = s
+            .insert_held(
+                msg(&a, &[], Kind::Question, None),
+                2,
+                Path::new("/repo"),
+                &["backend".to_string()],
+                &|_| false,
+            )
+            .unwrap_err();
+        match err {
+            StoreError::Deadlock(found) => assert_eq!(found.id, q.id),
+            e => panic!("expected deadlock, got {e:?}"),
+        }
+        assert_eq!(index_ids(&s), vec![q.id.clone()]);
+        assert_eq!(s.list_agents().unwrap().len(), before);
+        // Nothing is held for backend: a new one gets no mail.
+        let fresh = agent(&s, "backend");
+        let released = s
+            .release_held(Path::new("/repo"), "backend", &fresh)
+            .unwrap();
+        assert!(released.is_empty(), "{released:?}");
+        // A note is still held as usual.
+        s.insert_held(
+            msg(&a, &[], Kind::Note, None),
+            3,
+            Path::new("/repo"),
+            &["backend".to_string()],
+            &|_| false,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn missing_row_is_rebuilt_open_on_release() {
         let (_d, s) = store();
         let a = agent(&s, "backend");

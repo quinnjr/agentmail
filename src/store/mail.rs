@@ -315,6 +315,11 @@ impl Store {
     /// result is [`StoreError::RecipientRegistered`]; the caller resolves
     /// again. Gone agents with the name do not count, since resolution holds
     /// mail for them too.
+    ///
+    /// A question is refused with [`StoreError::Deadlock`] when it would
+    /// close a wait cycle through its resolved recipients or through any
+    /// existing agent (of any presence) named one of `names` in `repo`,
+    /// since such an agent can receive the held question later.
     pub fn insert_held(
         &self,
         m: NewMessage,
@@ -341,6 +346,22 @@ impl Store {
                 "{} is now active as {:?} in {repo}",
                 agent.name, agent.address
             )));
+        }
+        if m.kind == Kind::Question {
+            // An existing agent named one of `names`, of any presence, may
+            // take the held question later (a gone one by reclaiming its
+            // address), so its open questions count as edges too. A newly
+            // registered agent asks nothing yet, so cannot close a cycle.
+            let mut to = m.to.clone();
+            for a in &agents {
+                if names.contains(&a.name)
+                    && a.address != m.from
+                    && agent_repo_key(a).as_deref() == Some(repo.as_str())
+                {
+                    push_unique(&mut to, &a.address);
+                }
+            }
+            self.refuse_deadlock(&txn, &m.from, &to)?;
         }
         let msg = self.insert_in_txn(&txn, m, now)?;
         {

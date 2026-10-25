@@ -620,7 +620,7 @@ impl Handler {
             if new.kind == Kind::Question
                 && let Some(q) = self
                     .store
-                    .would_deadlock(me, &resolved.addresses)
+                    .would_deadlock(me, &self.question_targets(me, &resolved)?)
                     .map_err(store_err)?
             {
                 return Err(deadlock(&q));
@@ -657,6 +657,34 @@ impl Handler {
             ErrorCode::Internal,
             "recipients kept registering while the message was being sent; try again",
         ))
+    }
+
+    /// Everyone a question from `me` to `resolved` may reach: the resolved
+    /// addresses plus every existing agent, of any presence, named one of
+    /// the held names in its repo. A gone one can reclaim its address and
+    /// receive the held question, and its open questions still count as
+    /// wait edges; a newly registered agent asks nothing yet.
+    fn question_targets(&self, me: &str, resolved: &Resolved) -> Result<Vec<String>, ClientError> {
+        let mut targets = resolved.addresses.clone();
+        if resolved.held_names.is_empty() {
+            return Ok(targets);
+        }
+        for a in self.store.list_agents().map_err(store_err)? {
+            if a.address == me || targets.contains(&a.address) {
+                continue;
+            }
+            let Some(key) = agent_repo_key(&a) else {
+                continue;
+            };
+            if resolved
+                .held_names
+                .iter()
+                .any(|(repo, name)| *name == a.name && Path::new(&key) == repo.as_path())
+            {
+                targets.push(a.address);
+            }
+        }
+        Ok(targets)
     }
 
     /// Reply to message `parent_id` from `me`: to the parent's sender and

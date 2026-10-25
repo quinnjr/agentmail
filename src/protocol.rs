@@ -136,8 +136,10 @@ pub enum Request {
         timeout_secs: u64,
     },
     /// Keep waiting on one's own question, as after [`Request::Ask`]
-    /// (`answered` at once if it already is). Replies present when the
-    /// call starts do not count as clarifications.
+    /// (`answered` at once if it already is). Replies the asker has already
+    /// read when the call starts do not count as clarifications; an unread
+    /// reply from someone else already in the thread is returned at once as
+    /// a clarification. A returned clarification is marked read.
     AwaitAnswer {
         question_id: String,
         timeout_secs: u64,

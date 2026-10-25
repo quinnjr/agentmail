@@ -428,6 +428,38 @@ async fn ask_deadlock_refused() {
 }
 
 #[tokio::test]
+async fn ask_by_name_of_a_gone_waiter_is_deadlock() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let (a, _ha) = active(&mut c, "frontend", d.dir.path()).await;
+    let (b, mut hb) = active(&mut c, "backend", d.dir.path()).await;
+
+    let first = c.call(&agent(&b), ask_req(&[&a], "q", 0)).await.unwrap();
+    assert_eq!(first["status"], "pending", "{first}");
+    let qid = str_of(&first, "question_id").to_string();
+
+    // B dies; its open question still counts, since B may reclaim.
+    hb.child.kill().unwrap();
+    hb.child.wait().unwrap();
+
+    let err = c
+        .call(&agent(&a), ask_req(&["backend"], "back at you", 5))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Deadlock, "{err:?}");
+    assert!(err.message.contains(&qid), "{}", err.message);
+    assert!(err.message.contains(&b), "{}", err.message);
+
+    // Nothing was stored or held: a new backend gets no mail.
+    let fresh = register(&mut c, "backend", d.dir.path()).await;
+    let inbox = c
+        .call(&agent(&fresh), Request::Inbox { all: true })
+        .await
+        .unwrap();
+    assert!(inbox.as_array().unwrap().is_empty(), "{inbox}");
+}
+
+#[tokio::test]
 async fn await_answer_errors() {
     let d = TestDaemon::start().await;
     let mut c = d.client().await;
