@@ -93,11 +93,6 @@ impl Handler {
         &self.hub
     }
 
-    /// Release the store, if this is its last handle.
-    pub fn into_store(self) -> Arc<Store> {
-        self.store
-    }
-
     /// Who `c` is: an agent address or [`HUMAN`]. Records activity for an
     /// agent.
     pub fn resolve_caller(&self, c: &Caller) -> Result<String, ClientError> {
@@ -333,14 +328,11 @@ impl Handler {
         }
         req.cwd = lexical(&req.cwd);
         req.repo = git_toplevel(&req.cwd);
-        let (agent, reclaimed) = self
+        // One transaction: an error never follows a committed registration,
+        // so a retry cannot mint an address the caller never learned.
+        let (agent, reclaimed, released) = self
             .store
-            .register(req, now_ms(), &procinfo::is_alive)
-            .map_err(store_err)?;
-        let home = agent.repo.as_deref().unwrap_or(&agent.cwd).to_path_buf();
-        let released = self
-            .store
-            .release_held(&home, &agent.name, &agent.address)
+            .register_and_release(req, now_ms(), &procinfo::is_alive)
             .map_err(store_err)?;
         let view = self.view(agent, &HashSet::new());
         self.publish_presence(&view);

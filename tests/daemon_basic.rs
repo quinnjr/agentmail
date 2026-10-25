@@ -74,9 +74,7 @@ fn daemons_for(data_dir: &Path) -> Vec<u32> {
 
 /// Stop a spawned daemon and wait until no process serves `paths`.
 async fn stop_spawned(paths: &Paths) {
-    if let Ok(mut c) = Client::connect(paths).await {
-        let _ = c.call(&Caller::Human, Request::Shutdown).await;
-    }
+    let _ = Client::shutdown(paths).await;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !daemons_for(&paths.data_dir).is_empty() {
         assert!(Instant::now() < deadline, "spawned daemon did not stop");
@@ -704,4 +702,124 @@ async fn register_records_git_toplevel_as_repo() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidInput, "{err:?}");
+}
+
+/// A fake "old" daemon on `paths.socket`: refuses `Hello` with
+/// `VersionMismatch` and honours `Shutdown` without one, then goes away.
+/// Returns the requests it saw, one list per connection.
+fn spawn_old_daemon(paths: &Paths) -> tokio::task::JoinHandle<Vec<Vec<&'static str>>> {
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let socket = paths.socket.clone();
+    tokio::spawn(async move {
+        let mut conns = Vec::new();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let mut ops = Vec::new();
+            while let Some(l) = lines.next_line().await.unwrap() {
+                let env: Envelope = serde_json::from_str(&l).unwrap();
+                let resp = match env.req {
+                    Request::Hello { .. } => {
+                        ops.push("hello");
+                        Response::Err {
+                            code: ErrorCode::VersionMismatch,
+                            message: "old daemon".into(),
+                            candidates: Vec::new(),
+                        }
+                    }
+                    Request::Shutdown => {
+                        ops.push("shutdown");
+                        Response::Ok { data: Value::Null }
+                    }
+                    _ => {
+                        ops.push("other");
+                        Response::Err {
+                            code: ErrorCode::VersionMismatch,
+                            message: "send hello first".into(),
+                            candidates: Vec::new(),
+                        }
+                    }
+                };
+                let mut out = serde_json::to_string(&resp).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+            let done = ops.contains(&"shutdown");
+            conns.push(ops);
+            if done {
+                break;
+            }
+        }
+        std::fs::remove_file(&socket).unwrap();
+        conns
+    })
+}
+
+async fn run_cli(paths: &Paths, args: &[&str]) -> (Option<i32>, String) {
+    let out = tokio::process::Command::new(bin())
+        .args(args)
+        .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &paths.socket)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(10), out)
+        .await
+        .expect("agentmail timed out")
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn daemon_cli_status_and_stop_handle_a_daemon_with_another_protocol() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let fake = spawn_old_daemon(&paths);
+
+    let (code, out) = run_cli(&paths, &["daemon", "status"]).await;
+    assert_eq!(code, Some(3), "{out}");
+    assert!(!out.contains("not running"), "{out}");
+    assert!(out.contains("different protocol"), "{out}");
+    assert!(out.contains("agentmail daemon stop"), "{out}");
+
+    let (code, out) = run_cli(&paths, &["daemon", "stop"]).await;
+    assert_eq!(code, Some(0), "{out}");
+    assert!(!out.contains("not running"), "{out}");
+    assert!(out.contains("stopped"), "{out}");
+
+    let conns = tokio::time::timeout(Duration::from_secs(5), fake)
+        .await
+        .expect("fake daemon was never stopped")
+        .unwrap();
+    assert_eq!(conns, vec![vec!["hello"], vec!["shutdown"]]);
+}
+
+#[tokio::test]
+async fn client_shutdown_reports_whether_a_daemon_answered() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    assert!(!Client::shutdown(&paths).await.unwrap());
+    // A stale socket file with no listener is not a daemon either. A child
+    // process another test is spawning can hold the dropped listener open
+    // between fork and exec, so a connection may briefly be accepted and
+    // then lost; it must never count as a daemon that answered.
+    drop(UnixListener::bind(&paths.socket).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Client::shutdown(&paths).await {
+            Ok(answered) => {
+                assert!(!answered, "a stale socket answered");
+                break;
+            }
+            Err(e) => assert!(Instant::now() < deadline, "{e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::remove_file(&paths.socket).unwrap();
+
+    let fake = spawn_old_daemon(&paths);
+    assert!(Client::shutdown(&paths).await.unwrap());
+    assert_eq!(fake.await.unwrap(), vec![vec!["shutdown"]]);
 }

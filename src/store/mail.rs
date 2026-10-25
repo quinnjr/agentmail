@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::questions::is_open;
 use super::{
-    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, Store, StoreError, THREADS, all_json,
-    encode, get_json,
+    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, RegisterReq, Store, StoreError,
+    THREADS, all_json, encode, get_json,
 };
 use crate::ids::{new_message_id, validate_name};
 use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message, Presence};
@@ -505,8 +505,47 @@ impl Store {
         name: &str,
         addr: &str,
     ) -> Result<Vec<Message>, StoreError> {
-        let repo = repo_key(repo)?;
         let txn = self.db.begin_write()?;
+        let released = self.release_held_in(&txn, repo, name, addr)?;
+        txn.commit()?;
+        Ok(released)
+    }
+
+    /// Register (see [`Store::register`]) and release the mail held for the
+    /// agent's name in its repo (its cwd when it has none; see
+    /// [`Store::release_held`]) in one transaction, so a registration is
+    /// never committed without its held mail. Nothing is released when that
+    /// path is not absolute, since held mail is only kept for absolute repos.
+    ///
+    /// Returns the agent, the reclaim flag and the released messages.
+    pub fn register_and_release(
+        &self,
+        req: RegisterReq,
+        now: i64,
+        alive: Alive,
+    ) -> Result<(Agent, bool, Vec<Message>), StoreError> {
+        let txn = self.db.begin_write()?;
+        let (agent, reclaimed) = self.register_in(&txn, req, now, alive)?;
+        let released = if agent_repo_key(&agent).is_some() {
+            let home = agent.repo.as_deref().unwrap_or(&agent.cwd);
+            self.release_held_in(&txn, home, &agent.name, &agent.address)?
+        } else {
+            Vec::new()
+        };
+        txn.commit()?;
+        Ok((agent, reclaimed, released))
+    }
+
+    /// [`Store::release_held`] inside the caller's write transaction, which
+    /// the caller commits.
+    fn release_held_in(
+        &self,
+        txn: &WriteTransaction,
+        repo: &Path,
+        name: &str,
+        addr: &str,
+    ) -> Result<Vec<Message>, StoreError> {
+        let repo = repo_key(repo)?;
         let released = {
             let agents = txn.open_table(AGENTS)?;
             let agent: Agent = get_json(&agents, addr)?
@@ -570,9 +609,8 @@ impl Store {
             .iter()
             .filter(|(m, appended)| *appended && m.kind == Kind::Question)
         {
-            self.on_question_recipient_added(&txn, msg, addr)?;
+            self.on_question_recipient_added(txn, msg, addr)?;
         }
-        txn.commit()?;
         Ok(released.into_iter().map(|(m, _)| m).collect())
     }
 

@@ -1070,3 +1070,95 @@ fn thread_filter_accepts_partial_json() {
         }
     );
 }
+
+fn register_req(name: &str, cwd: &str, repo: Option<&str>) -> agentmail::store::RegisterReq {
+    agentmail::store::RegisterReq {
+        name: name.into(),
+        role: None,
+        working_on: None,
+        harness: Harness::Other,
+        cwd: PathBuf::from(cwd),
+        repo: repo.map(PathBuf::from),
+        proc_id: None,
+        fresh: true,
+        wake: false,
+    }
+}
+
+#[test]
+fn register_and_release_delivers_held_mail_in_one_step() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let m = s
+        .insert_held(
+            note(&a, &[], "For frontend", "hi"),
+            1,
+            repo,
+            &names(&["frontend"]),
+            NOT_ALIVE,
+        )
+        .unwrap();
+    // Held for a repo-less agent by its cwd.
+    let m2 = s
+        .insert_held(
+            note(&a, &[], "For docs", "hi"),
+            2,
+            Path::new("/w"),
+            &names(&["docs"]),
+            NOT_ALIVE,
+        )
+        .unwrap();
+
+    let (f, reclaimed, released) = s
+        .register_and_release(
+            register_req("frontend", "/repo/sub", Some("/repo")),
+            3,
+            NOT_ALIVE,
+        )
+        .unwrap();
+    assert!(!reclaimed);
+    assert_eq!(ids(&released), vec![m.id.as_str()]);
+    assert_eq!(released[0].to, vec![f.address.clone()]);
+    assert_eq!(s.get_agent(&f.address).unwrap().unwrap(), f);
+    assert_eq!(
+        ids(&s.inbox(&f.address, false).unwrap()),
+        vec![m.id.as_str()]
+    );
+
+    let (d, _, released) = s
+        .register_and_release(register_req("docs", "/w", None), 4, NOT_ALIVE)
+        .unwrap();
+    assert_eq!(ids(&released), vec![m2.id.as_str()]);
+    assert_eq!(released[0].to, vec![d.address.clone()]);
+
+    // Released once only.
+    let (_, _, released) = s
+        .register_and_release(
+            register_req("frontend", "/repo", Some("/repo")),
+            5,
+            NOT_ALIVE,
+        )
+        .unwrap();
+    assert!(released.is_empty());
+}
+
+#[test]
+fn register_and_release_with_relative_cwd_registers_and_releases_nothing() {
+    let (_d, s) = store();
+    let (f, _, released) = s
+        .register_and_release(register_req("frontend", "relative/dir", None), 1, NOT_ALIVE)
+        .unwrap();
+    assert!(released.is_empty());
+    assert!(s.get_agent(&f.address).unwrap().is_some());
+}
+
+#[test]
+fn register_and_release_rejects_bad_name_without_registering() {
+    let (_d, s) = store();
+    let err = s
+        .register_and_release(register_req("Bad Name", "/repo", None), 1, NOT_ALIVE)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidName(_)), "{err:?}");
+    assert!(s.list_agents().unwrap().is_empty());
+}

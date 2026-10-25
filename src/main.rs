@@ -1,11 +1,15 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use agentmail::client::Client;
+use agentmail::client::{Client, ClientError};
 use agentmail::daemon::{DaemonConfig, serve};
 use agentmail::paths::Paths;
-use agentmail::protocol::{Caller, PROTOCOL_VERSION, Request};
+use agentmail::protocol::{Caller, ErrorCode, PROTOCOL_VERSION, Request};
 use clap::{Parser, Subcommand};
+
+/// `daemon status` exit code when a daemon answers but speaks another
+/// protocol version (1 means not running).
+const STATUS_OTHER_PROTOCOL: u8 = 3;
 
 #[derive(Parser)]
 #[command(
@@ -35,7 +39,8 @@ enum DaemonAction {
     Start,
     /// Stop the running daemon.
     Stop,
-    /// Report whether the daemon is running.
+    /// Report whether the daemon is running. Exits 1 when it is not, 3 when
+    /// it speaks another protocol version (stop it to replace it).
     Status,
 }
 
@@ -106,17 +111,27 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> anyhow::Result<ExitCode>
                 );
                 Ok(ExitCode::SUCCESS)
             }
-            Err(e) => {
-                println!("daemon not running ({e:#})");
-                Ok(ExitCode::FAILURE)
-            }
+            Err(e) => match e.downcast_ref::<ClientError>() {
+                Some(ce) if ce.code == ErrorCode::VersionMismatch => {
+                    println!(
+                        "daemon running, but it speaks a different protocol (this client \
+                         speaks {PROTOCOL_VERSION}: {}); run `agentmail daemon stop`",
+                        ce.message
+                    );
+                    Ok(ExitCode::from(STATUS_OTHER_PROTOCOL))
+                }
+                _ => {
+                    println!("daemon not running ({e:#})");
+                    Ok(ExitCode::FAILURE)
+                }
+            },
         },
         DaemonAction::Stop => {
-            let Ok(mut c) = Client::connect(paths).await else {
+            // No Hello, so this also stops a daemon of another protocol.
+            if !Client::shutdown(paths).await? {
                 println!("daemon not running");
                 return Ok(ExitCode::SUCCESS);
-            };
-            c.call(&Caller::Human, Request::Shutdown).await?;
+            }
             // Wait until it has released the database and lock, so a
             // following start gets a fresh daemon.
             let deadline = Instant::now() + Duration::from_secs(5);

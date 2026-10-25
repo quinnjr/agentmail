@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use redb::ReadableTable;
+use redb::{ReadableTable, WriteTransaction};
 
 use super::{AGENTS, CONTACTS, Store, StoreError, all_json, encode, get_json};
 use crate::ids::{new_address, validate_name};
@@ -95,6 +95,21 @@ impl Store {
         now: i64,
         alive: Alive,
     ) -> Result<(Agent, bool), StoreError> {
+        let txn = self.db.begin_write()?;
+        let result = self.register_in(&txn, req, now, alive)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// [`Store::register`] inside the caller's write transaction, which the
+    /// caller commits.
+    pub(super) fn register_in(
+        &self,
+        txn: &WriteTransaction,
+        req: RegisterReq,
+        now: i64,
+        alive: Alive,
+    ) -> Result<(Agent, bool), StoreError> {
         validate_name(&req.name).map_err(StoreError::InvalidName)?;
         check_utf8("cwd", &req.cwd)?;
         if let Some(repo) = &req.repo {
@@ -104,81 +119,74 @@ impl Store {
             check_working_on(w)?;
         }
 
-        let txn = self.db.begin_write()?;
-        let result = {
-            let mut table = txn.open_table(AGENTS)?;
-            let agents: Vec<Agent> = all_json(&table)?;
+        let mut table = txn.open_table(AGENTS)?;
+        let agents: Vec<Agent> = all_json(&table)?;
+        let reclaim = if req.fresh {
+            None
+        } else {
+            agents
+                .iter()
+                .filter(|a| a.name == req.name && a.cwd == req.cwd)
+                .filter(|a| reclaimable(a, req.proc_id, alive))
+                .max_by(|x, y| {
+                    let key = |a: &Agent| (is_own(a, req.proc_id), a.last_seen, a.registered_at);
+                    key(x).cmp(&key(y)).then_with(|| x.address.cmp(&y.address))
+                })
+                .cloned()
+        };
 
-            let reclaim = if req.fresh {
-                None
-            } else {
-                agents
-                    .iter()
-                    .filter(|a| a.name == req.name && a.cwd == req.cwd)
-                    .filter(|a| reclaimable(a, req.proc_id, alive))
-                    .max_by(|x, y| {
-                        let key =
-                            |a: &Agent| (is_own(a, req.proc_id), a.last_seen, a.registered_at);
-                        key(x).cmp(&key(y)).then_with(|| x.address.cmp(&y.address))
-                    })
-                    .cloned()
-            };
-
-            let reclaimed = reclaim.as_ref().is_some_and(|a| !is_own(a, req.proc_id));
-            let agent = match reclaim {
-                Some(mut a) => {
-                    a.role = req.role;
-                    a.working_on = req.working_on;
-                    a.harness = req.harness;
-                    a.repo = req.repo;
-                    a.proc_id = req.proc_id;
-                    a.wake = req.wake;
-                    a.last_seen = now;
-                    a.signed_off = false;
-                    a
-                }
-                None => {
-                    let mut address = None;
-                    for _ in 0..ADDRESS_ATTEMPTS {
-                        let candidate = new_address(&req.name);
-                        if table.get(candidate.as_str())?.is_none() {
-                            address = Some(candidate);
-                            break;
-                        }
-                    }
-                    let address = address.ok_or_else(|| {
-                        StoreError::Db(format!("could not find a free address for {:?}", req.name))
-                    })?;
-                    Agent {
-                        address,
-                        name: req.name,
-                        role: req.role,
-                        working_on: req.working_on,
-                        harness: req.harness,
-                        cwd: req.cwd,
-                        repo: req.repo,
-                        proc_id: req.proc_id,
-                        wake: req.wake,
-                        registered_at: now,
-                        last_seen: now,
-                        signed_off: false,
+        let reclaimed = reclaim.as_ref().is_some_and(|a| !is_own(a, req.proc_id));
+        let agent = match reclaim {
+            Some(mut a) => {
+                a.role = req.role;
+                a.working_on = req.working_on;
+                a.harness = req.harness;
+                a.repo = req.repo;
+                a.proc_id = req.proc_id;
+                a.wake = req.wake;
+                a.last_seen = now;
+                a.signed_off = false;
+                a
+            }
+            None => {
+                let mut address = None;
+                for _ in 0..ADDRESS_ATTEMPTS {
+                    let candidate = new_address(&req.name);
+                    if table.get(candidate.as_str())?.is_none() {
+                        address = Some(candidate);
+                        break;
                     }
                 }
-            };
-
-            if let Some(bound) = agent.proc_id {
-                for mut other in agents {
-                    if other.address != agent.address && other.proc_id == Some(bound) {
-                        other.proc_id = None;
-                        table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
-                    }
+                let address = address.ok_or_else(|| {
+                    StoreError::Db(format!("could not find a free address for {:?}", req.name))
+                })?;
+                Agent {
+                    address,
+                    name: req.name,
+                    role: req.role,
+                    working_on: req.working_on,
+                    harness: req.harness,
+                    cwd: req.cwd,
+                    repo: req.repo,
+                    proc_id: req.proc_id,
+                    wake: req.wake,
+                    registered_at: now,
+                    last_seen: now,
+                    signed_off: false,
                 }
             }
-            table.insert(agent.address.as_str(), encode(&agent)?.as_slice())?;
-            (agent, reclaimed)
         };
-        txn.commit()?;
-        Ok(result)
+
+        if let Some(bound) = agent.proc_id {
+            for mut other in agents {
+                if other.address != agent.address && other.proc_id == Some(bound) {
+                    other.proc_id = None;
+                    table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
+                }
+            }
+        }
+        table.insert(agent.address.as_str(), encode(&agent)?.as_slice())?;
+        Ok((agent, reclaimed))
     }
 
     /// Active while bound to a live process and not signed off; Gone otherwise.

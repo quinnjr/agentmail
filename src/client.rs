@@ -44,8 +44,9 @@ fn daemon_bin_from(env: Option<OsString>) -> Result<PathBuf> {
 }
 
 /// Start `bin daemon run` for `paths`, detached: its own process group, no
-/// stdio, working directory `/` (so it never pins the caller's directory). The paths are passed explicitly so the daemon serves exactly the
-/// socket this client will connect to.
+/// stdio, working directory `/` (so it never pins the caller's directory).
+/// The paths are passed explicitly so the daemon serves exactly the socket
+/// this client will connect to.
 fn spawn_daemon(paths: &Paths, bin: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let mut child = std::process::Command::new(bin)
@@ -95,6 +96,32 @@ impl Client {
             .with_context(|| format!("connecting to {}", paths.socket.display()))?;
         c.hello().await?;
         Ok(c)
+    }
+
+    /// Ask the daemon for `paths` to stop, without the `Hello` handshake, so
+    /// it works on a daemon of any protocol version. Never starts one.
+    ///
+    /// Returns false when no daemon is listening (no socket file, or a stale
+    /// one nobody accepts on), true once the daemon has acknowledged. The
+    /// daemon may still be releasing its lock when this returns.
+    pub async fn shutdown(paths: &Paths) -> Result<bool> {
+        let mut c = match Client::open(paths).await {
+            Ok(c) => c,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("connecting to {}", paths.socket.display())));
+            }
+        };
+        c.call(&Caller::Human, Request::Shutdown).await?;
+        Ok(true)
     }
 
     /// Connect, starting the daemon (see [`daemon_bin`]) if none is running.

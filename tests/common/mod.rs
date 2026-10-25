@@ -43,17 +43,26 @@ impl TestDaemon {
     /// or [`TestDaemon::kill`]).
     pub async fn restart(&mut self) {
         assert!(self.handle.is_none(), "daemon is still running");
-        let paths = self.paths.clone();
-        let handle = tokio::spawn(async move {
-            serve(DaemonConfig { paths }).await.expect("daemon failed");
-        });
+        let spawn = |paths: Paths| {
+            tokio::spawn(async move {
+                serve(DaemonConfig { paths }).await.expect("daemon failed");
+            })
+        };
+        let mut handle = spawn(self.paths.clone());
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if Client::connect(&self.paths).await.is_ok() {
                 break;
             }
-            assert!(!handle.is_finished(), "daemon exited before accepting");
             assert!(Instant::now() < deadline, "daemon did not start");
+            if handle.is_finished() {
+                // `serve` returns at once when the lock is held. Right after
+                // a shutdown that can be a child process another test is
+                // spawning: between fork and exec it shares our lock file
+                // description. Try again once it has exec'd.
+                handle.await.unwrap();
+                handle = spawn(self.paths.clone());
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.handle = Some(handle);
