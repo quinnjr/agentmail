@@ -17,11 +17,13 @@ use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message};
 pub const MAX_BODY: usize = MAX_BODY_BYTES;
 
 /// A message to store. Recipients are already-resolved full addresses (or
-/// `human`); name resolution and held mail are the caller's job.
+/// `human`); name resolution is the caller's job. Mail for names not yet
+/// registered goes through [`Store::insert_held`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewMessage {
     pub from: String,
-    /// May be empty only when the message is about to be held for a name.
+    /// Must be non-empty for [`Store::insert_message`]; may be empty for
+    /// [`Store::insert_held`].
     pub to: Vec<String>,
     /// Required on a new thread; ignored on a reply, which takes
     /// `Re: <root subject>`.
@@ -63,9 +65,18 @@ fn missing_message(id: &str) -> StoreError {
     StoreError::NotFound(format!("no message with id {id:?}"))
 }
 
-fn utf8(field: &str, path: &Path) -> Result<String, StoreError> {
-    path.to_str().map(str::to_string).ok_or_else(|| {
-        StoreError::InvalidInput(format!("{field} {} is not valid UTF-8", path.display()))
+/// The held-mail key for a repo path: it must be absolute, and is rebuilt
+/// from its components so `/repo`, `/repo/` and `/repo/.` are one key.
+fn repo_key(repo: &Path) -> Result<String, StoreError> {
+    if !repo.is_absolute() {
+        return Err(StoreError::InvalidInput(format!(
+            "repo {} is not an absolute path",
+            repo.display()
+        )));
+    }
+    let normalized: PathBuf = repo.components().collect();
+    normalized.to_str().map(str::to_string).ok_or_else(|| {
+        StoreError::InvalidInput(format!("repo {} is not valid UTF-8", repo.display()))
     })
 }
 
@@ -139,17 +150,37 @@ fn mailbox_rows(
     Ok(out)
 }
 
-/// The address must be `human` or a registered agent.
-fn require_known(
+fn is_known(
     agents: &impl ReadableTable<&'static str, &'static [u8]>,
-    role: &str,
+    addr: &str,
+) -> Result<bool, StoreError> {
+    Ok(addr == HUMAN || agents.get(addr)?.is_some())
+}
+
+/// The sender must be `human` or a registered agent.
+fn require_known_sender(
+    agents: &impl ReadableTable<&'static str, &'static [u8]>,
     addr: &str,
 ) -> Result<(), StoreError> {
-    if addr == HUMAN || agents.get(addr)?.is_some() {
+    if is_known(agents, addr)? {
         Ok(())
     } else {
         Err(StoreError::NotFound(format!(
-            "unknown {role} {addr:?}; use a full <name>-<id> address from `agents`"
+            "unknown sender {addr:?}; use a full <name>-<id> address from `agents`"
+        )))
+    }
+}
+
+/// A recipient must be `human` or a registered agent.
+fn require_known_recipient(
+    agents: &impl ReadableTable<&'static str, &'static [u8]>,
+    addr: &str,
+) -> Result<(), StoreError> {
+    if is_known(agents, addr)? {
+        Ok(())
+    } else {
+        Err(StoreError::UnknownRecipient(format!(
+            "unknown recipient {addr:?}; use a full <name>-<id> address from `agents`"
         )))
     }
 }
@@ -192,13 +223,64 @@ impl Store {
     /// Store a message and deliver it to each recipient's mailbox.
     ///
     /// A reply (`in_reply_to` set) joins the parent's thread and takes
-    /// `Re: <root subject>`; a new thread needs a non-blank subject. The
-    /// sender and every recipient must be `human` or a registered agent, and
-    /// the sender may not be a recipient. Duplicate recipients are dropped.
-    /// When `human` replies in a thread it had no part in, the reply is also
-    /// put in the human's mailbox, already read, so the thread lists under
-    /// `human`.
+    /// `Re: <root subject>`; a new thread needs a non-blank subject. `to`
+    /// must not be empty (mail for unregistered names goes through
+    /// [`Store::insert_held`]). The sender must be `human` or a registered
+    /// agent ([`StoreError::NotFound`] otherwise), every recipient too
+    /// ([`StoreError::UnknownRecipient`]), and the sender may not be a
+    /// recipient ([`StoreError::InvalidRecipient`]). Duplicate recipients are
+    /// dropped. When `human` replies in a thread it had no part in, the reply
+    /// is also put in the human's mailbox, already read, so the thread lists
+    /// under `human`.
     pub fn insert_message(&self, m: NewMessage, now: i64) -> Result<Message, StoreError> {
+        if m.to.is_empty() {
+            return Err(StoreError::InvalidInput("no recipients".into()));
+        }
+        let txn = self.db.begin_write()?;
+        let msg = self.insert_in_txn(&txn, m, now)?;
+        txn.commit()?;
+        Ok(msg)
+    }
+
+    /// Store a message, deliver it to `m.to` (which may be empty), and hold
+    /// it for each of `names` in `repo` until an agent registers under that
+    /// name (see [`Store::release_held`]), all in one transaction, so held
+    /// mail can never be stored without its hold. `names` must not be empty;
+    /// otherwise the rules of [`Store::insert_message`] apply.
+    pub fn insert_held(
+        &self,
+        m: NewMessage,
+        now: i64,
+        repo: &Path,
+        names: &[String],
+    ) -> Result<Message, StoreError> {
+        let repo = repo_key(repo)?;
+        if names.is_empty() {
+            return Err(StoreError::InvalidInput("no names to hold mail for".into()));
+        }
+        for name in names {
+            validate_name(name).map_err(StoreError::InvalidName)?;
+        }
+        let txn = self.db.begin_write()?;
+        let msg = self.insert_in_txn(&txn, m, now)?;
+        {
+            let mut held = txn.open_table(HELD)?;
+            for name in names {
+                held.insert((repo.as_str(), name.as_str(), msg.id.as_str()), ())?;
+            }
+        }
+        txn.commit()?;
+        Ok(msg)
+    }
+
+    /// The body of [`Store::insert_message`], minus the empty-`to` check and
+    /// the commit.
+    fn insert_in_txn(
+        &self,
+        txn: &WriteTransaction,
+        m: NewMessage,
+        now: i64,
+    ) -> Result<Message, StoreError> {
         if m.body.len() > MAX_BODY {
             return Err(StoreError::TooLarge);
         }
@@ -207,17 +289,16 @@ impl Store {
             push_unique(&mut to, addr);
         }
         if to.contains(&m.from) {
-            return Err(StoreError::InvalidInput(
+            return Err(StoreError::InvalidRecipient(
                 "a message cannot be sent to its own sender".into(),
             ));
         }
 
-        let txn = self.db.begin_write()?;
         let msg = {
             let agents = txn.open_table(AGENTS)?;
-            require_known(&agents, "sender", &m.from)?;
+            require_known_sender(&agents, &m.from)?;
             for addr in &to {
-                require_known(&agents, "recipient", addr)?;
+                require_known_recipient(&agents, addr)?;
             }
 
             let mut messages = txn.open_table(MESSAGES)?;
@@ -280,16 +361,17 @@ impl Store {
             msg
         };
         if msg.kind == Kind::Question {
-            self.on_question_inserted(&txn, &msg)?;
+            self.on_question_inserted(txn, &msg)?;
         }
-        txn.commit()?;
         Ok(msg)
     }
 
     /// Hold message `msg_id` for the first agent that registers as `name` in
-    /// `repo` (see [`Store::release_held`]).
+    /// `repo` (see [`Store::release_held`]). `repo` must be absolute. New
+    /// mail should use [`Store::insert_held`], which stores and holds in one
+    /// transaction.
     pub fn hold_for_name(&self, repo: &Path, name: &str, msg_id: &str) -> Result<(), StoreError> {
-        let repo = utf8("repo", repo)?;
+        let repo = repo_key(repo)?;
         validate_name(name).map_err(StoreError::InvalidName)?;
         let txn = self.db.begin_write()?;
         {
@@ -307,19 +389,33 @@ impl Store {
     /// Deliver every message held for `name` in `repo` to `addr`: each is
     /// added to `addr`'s mailbox (unread), gets `addr` appended to its `to`,
     /// and stops being held. Returns the released messages in id order.
+    ///
+    /// The agent at `addr` must exist ([`StoreError::NotFound`]) and be
+    /// named `name` in `repo` (its repo, or its cwd when it has none);
+    /// otherwise [`StoreError::InvalidInput`]. `repo` must be absolute.
     pub fn release_held(
         &self,
         repo: &Path,
         name: &str,
         addr: &str,
     ) -> Result<Vec<Message>, StoreError> {
-        let repo = utf8("repo", repo)?;
+        let repo = repo_key(repo)?;
         let txn = self.db.begin_write()?;
         let released = {
             let agents = txn.open_table(AGENTS)?;
-            if agents.get(addr)?.is_none() {
-                return Err(StoreError::NotFound(format!(
-                    "no agent with address {addr:?}"
+            let agent: Agent = get_json(&agents, addr)?
+                .ok_or_else(|| StoreError::NotFound(format!("no agent with address {addr:?}")))?;
+            if agent.name != name {
+                return Err(StoreError::InvalidInput(format!(
+                    "agent {addr:?} is named {:?}, not {name:?}",
+                    agent.name
+                )));
+            }
+            let agent_repo = agent.repo.as_deref().unwrap_or(&agent.cwd);
+            if repo_key(agent_repo)? != repo {
+                return Err(StoreError::InvalidInput(format!(
+                    "agent {addr:?} is in {}, not {repo}",
+                    agent_repo.display()
                 )));
             }
             let mut held = txn.open_table(HELD)?;

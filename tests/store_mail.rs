@@ -50,6 +50,10 @@ fn reply(from: &str, to: &[&str], parent: &str, body: &str) -> NewMessage {
     }
 }
 
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
 fn ids(msgs: &[Message]) -> Vec<&str> {
     msgs.iter().map(|m| m.id.as_str()).collect()
 }
@@ -96,7 +100,7 @@ fn unknown_sender_or_recipient_is_refused() {
     let err = s
         .insert_message(note(&a, &["frontend-zzzzzzzz"], "Orders", "hi"), 1)
         .unwrap_err();
-    assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+    assert!(matches!(err, StoreError::UnknownRecipient(_)), "{err:?}");
     let err = s
         .insert_message(note("ghost-zzzzzzzz", &[&a], "Orders", "hi"), 1)
         .unwrap_err();
@@ -220,18 +224,24 @@ fn held_mail_released_on_register() {
     let repo = Path::new("/repo");
     let a = agent(&s, "backend", Some("/repo"));
     let m = s
-        .insert_message(note(&a, &[], "For frontend", "hi"), 1)
+        .insert_held(
+            note(&a, &[], "For frontend", "hi"),
+            1,
+            repo,
+            &names(&["frontend"]),
+        )
         .unwrap();
-    s.hold_for_name(repo, "frontend", &m.id).unwrap();
+    assert!(m.to.is_empty());
     // Not released to a different name or repo.
     let other = agent(&s, "docs", Some("/repo"));
     assert!(s.release_held(repo, "docs", &other).unwrap().is_empty());
-    let f = agent(&s, "frontend", Some("/repo"));
+    let elsewhere = agent(&s, "frontend", Some("/other"));
     assert!(
-        s.release_held(Path::new("/other"), "frontend", &f)
+        s.release_held(Path::new("/other"), "frontend", &elsewhere)
             .unwrap()
             .is_empty()
     );
+    let f = agent(&s, "frontend", Some("/repo"));
 
     let released = s.release_held(repo, "frontend", &f).unwrap();
     assert_eq!(ids(&released), vec![m.id.as_str()]);
@@ -320,6 +330,7 @@ fn threads_filter_by_agent() {
         })
         .unwrap();
     assert_eq!(by_human.len(), 1);
+    assert_eq!(by_human[0].thread_id, t2.id);
 
     let by_repo = s
         .threads(&ThreadFilter {
@@ -405,8 +416,13 @@ fn prune_removes_old_threads_only() {
     let mixed_r = s
         .insert_message(reply(&b, &[&a], &mixed.id, "4"), 300)
         .unwrap();
-    let held = s.insert_message(note(&a, &[], "Held", "5"), 100).unwrap();
-    s.hold_for_name(Path::new("/repo"), "docs", &held.id)
+    let held = s
+        .insert_held(
+            note(&a, &[], "Held", "5"),
+            100,
+            Path::new("/repo"),
+            &names(&["docs"]),
+        )
         .unwrap();
 
     assert_eq!(s.prune(200).unwrap(), 2);
@@ -471,8 +487,9 @@ fn held_mail_is_never_released_to_its_sender() {
     let (_d, s) = store();
     let repo = Path::new("/repo");
     let a = agent(&s, "frontend", Some("/repo"));
-    let m = s.insert_message(note(&a, &[], "Hi", "x"), 1).unwrap();
-    s.hold_for_name(repo, "frontend", &m.id).unwrap();
+    let m = s
+        .insert_held(note(&a, &[], "Hi", "x"), 1, repo, &names(&["frontend"]))
+        .unwrap();
     assert!(s.release_held(repo, "frontend", &a).unwrap().is_empty());
     let b = agent(&s, "frontend", Some("/repo"));
     assert_eq!(
@@ -490,5 +507,152 @@ fn self_send_is_refused() {
     let (_d, s) = store();
     let a = agent(&s, "backend", None);
     let err = s.insert_message(note(&a, &[&a], "Me", "x"), 1).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidRecipient(_)), "{err:?}");
+    let err = s
+        .insert_held(
+            note(&a, &[&a], "Me", "x"),
+            1,
+            Path::new("/repo"),
+            &names(&["docs"]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidRecipient(_)), "{err:?}");
+}
+
+#[test]
+fn insert_message_without_recipients_is_refused() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", Some("/repo"));
+    let err = s
+        .insert_message(note(&a, &[], "Nobody", "x"), 1)
+        .unwrap_err();
+    assert_eq!(err, StoreError::InvalidInput("no recipients".into()));
+    assert!(s.search("Nobody").unwrap().is_empty());
+}
+
+#[test]
+fn insert_held_delivers_and_holds_atomically() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let b = agent(&s, "frontend", Some("/repo"));
+    let m = s
+        .insert_held(
+            note(&a, &[&b], "Mixed", "x"),
+            1,
+            repo,
+            &names(&["docs", "qa"]),
+        )
+        .unwrap();
+    assert_eq!(m.to, vec![b.clone()]);
+    assert_eq!(ids(&s.inbox(&b, false).unwrap()), vec![m.id.as_str()]);
+    let d = agent(&s, "docs", Some("/repo"));
+    assert_eq!(
+        ids(&s.release_held(repo, "docs", &d).unwrap()),
+        vec![m.id.as_str()]
+    );
+    let q = agent(&s, "qa", Some("/repo"));
+    let released = s.release_held(repo, "qa", &q).unwrap();
+    assert_eq!(released[0].to, vec![b, d, q]);
+
+    // Nothing is stored when any part fails.
+    let err = s
+        .insert_held(note(&a, &[], "Bad", "x"), 1, repo, &names(&["Not A Name"]))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidName(_)), "{err:?}");
+    let err = s
+        .insert_held(
+            note(&a, &[], "Bad", "x"),
+            1,
+            Path::new("rel"),
+            &names(&["docs"]),
+        )
+        .unwrap_err();
     assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    let err = s
+        .insert_held(note(&a, &[], "Bad", "x"), 1, repo, &[])
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    assert!(s.search("Bad").unwrap().is_empty());
+}
+
+#[test]
+fn held_repo_path_is_normalized() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", Some("/repo"));
+    let m = s
+        .insert_held(
+            note(&a, &[], "Slash", "x"),
+            1,
+            Path::new("/repo/"),
+            &names(&["frontend"]),
+        )
+        .unwrap();
+    let m2 = s
+        .insert_held(
+            note(&a, &[], "Dot", "y"),
+            2,
+            Path::new("/repo/./"),
+            &names(&["frontend"]),
+        )
+        .unwrap();
+    let f = agent(&s, "frontend", Some("/repo"));
+    assert_eq!(
+        ids(&s.release_held(Path::new("/repo"), "frontend", &f).unwrap()),
+        vec![m.id.as_str(), m2.id.as_str()]
+    );
+    let err = s
+        .hold_for_name(Path::new("repo"), "frontend", &m.id)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    let err = s
+        .release_held(Path::new("repo"), "frontend", &f)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    // hold_for_name normalizes too.
+    s.hold_for_name(Path::new("/repo//"), "docs", &m.id)
+        .unwrap();
+    let d = agent(&s, "docs", Some("/repo"));
+    assert_eq!(
+        ids(&s.release_held(Path::new("/repo"), "docs", &d).unwrap()),
+        vec![m.id.as_str()]
+    );
+}
+
+#[test]
+fn release_held_checks_agent_matches_name_and_repo() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let m = s
+        .insert_held(
+            note(&a, &[], "For frontend", "hi"),
+            1,
+            repo,
+            &names(&["frontend"]),
+        )
+        .unwrap();
+    // Wrong name.
+    let docs = agent(&s, "docs", Some("/repo"));
+    let err = s.release_held(repo, "frontend", &docs).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    // Right name, wrong repo.
+    let other = agent(&s, "frontend", Some("/other"));
+    let err = s.release_held(repo, "frontend", &other).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    // No repo: the cwd stands in for it.
+    let no_repo = agent(&s, "frontend", None);
+    let err = s.release_held(repo, "frontend", &no_repo).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    assert!(
+        s.release_held(Path::new("/w"), "frontend", &no_repo)
+            .unwrap()
+            .is_empty()
+    );
+    // Still held for the right agent.
+    let f = agent(&s, "frontend", Some("/repo"));
+    assert_eq!(
+        ids(&s.release_held(repo, "frontend", &f).unwrap()),
+        vec![m.id.as_str()]
+    );
 }

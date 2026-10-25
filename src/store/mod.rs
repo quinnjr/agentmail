@@ -48,6 +48,12 @@ pub enum StoreError {
     TooLarge,
     #[error("not found: {0}")]
     NotFound(String),
+    /// A recipient address that is neither `human` nor a registered agent.
+    #[error("unknown recipient: {0}")]
+    UnknownRecipient(String),
+    /// A recipient that may not receive this message, e.g. its own sender.
+    #[error("invalid recipient: {0}")]
+    InvalidRecipient(String),
     #[error("database error: {0}")]
     Db(String),
 }
