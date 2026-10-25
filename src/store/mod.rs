@@ -1,0 +1,169 @@
+//! The redb-backed store. Only the daemon opens it.
+//!
+//! Values are JSON (serde_json) so records can grow fields without a
+//! migration. Every public method runs in its own transaction.
+
+use std::path::Path;
+
+use anyhow::{Context, bail};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+mod agents;
+
+pub use agents::{Alive, RegisterReq};
+
+/// Agents by address. Value: JSON [`crate::model::Agent`].
+pub(crate) const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");
+/// Contact lists: `(owner, contact)`.
+pub(crate) const CONTACTS: TableDefinition<(&str, &str), ()> = TableDefinition::new("contacts");
+/// Store metadata, e.g. `schema_version`.
+pub(crate) const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// The on-disk schema this build reads and writes.
+pub const SCHEMA_VERSION: &str = "1";
+
+/// Errors from store operations.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum StoreError {
+    #[error("invalid name: {0}")]
+    InvalidName(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("{0} is too long")]
+    TooLong(&'static str),
+    #[error("message body is larger than 256 KiB")]
+    TooLarge,
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("database error: {0}")]
+    Db(String),
+}
+
+macro_rules! db_error_from {
+    ($($t:ty),* $(,)?) => {$(
+        impl From<$t> for StoreError {
+            fn from(e: $t) -> Self {
+                StoreError::Db(e.to_string())
+            }
+        }
+    )*};
+}
+
+db_error_from!(
+    redb::Error,
+    redb::DatabaseError,
+    redb::TransactionError,
+    redb::TableError,
+    redb::StorageError,
+    redb::CommitError,
+    serde_json::Error,
+);
+
+/// Handle to the agentmail database.
+pub struct Store {
+    db: Database,
+}
+
+impl Store {
+    /// Open (or create) the database at `path`, creating its parent
+    /// directory and every table, and checking the schema version.
+    pub fn open(path: &Path) -> anyhow::Result<Store> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
+        let txn = db.begin_write()?;
+        {
+            txn.open_table(AGENTS)?;
+            txn.open_table(CONTACTS)?;
+            let mut meta = txn.open_table(META)?;
+            let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());
+            match existing {
+                None => {
+                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)?;
+                }
+                Some(v) if v == SCHEMA_VERSION => {}
+                Some(v) => bail!(
+                    "{} has schema version {v}, this build supports {SCHEMA_VERSION}",
+                    path.display()
+                ),
+            }
+        }
+        txn.commit()?;
+        Ok(Store { db })
+    }
+
+    /// Start a read transaction.
+    pub(crate) fn read(&self) -> Result<redb::ReadTransaction, StoreError> {
+        Ok(self.db.begin_read()?)
+    }
+}
+
+/// Encode a record as JSON.
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
+    Ok(serde_json::to_vec(value)?)
+}
+
+/// Decode a JSON record.
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Read and decode one JSON record from a `&str`-keyed table.
+pub(crate) fn get_json<T: DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<T>, StoreError> {
+    table.get(key)?.map(|v| decode(v.value())).transpose()
+}
+
+/// Decode every JSON record in a `&str`-keyed table, in key order.
+pub(crate) fn all_json<T: DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<Vec<T>, StoreError> {
+    let mut out = Vec::new();
+    for row in table.iter()? {
+        let (_, v) = row?;
+        out.push(decode(v.value())?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_open_rejects_unknown_schema_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("agentmail.redb");
+        let store = Store::open(&path).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        txn.open_table(META)
+            .unwrap()
+            .insert(SCHEMA_VERSION_KEY, "999")
+            .unwrap();
+        txn.commit().unwrap();
+        drop(store);
+        let err = Store::open(&path)
+            .err()
+            .expect("schema 999 must be refused");
+        assert!(err.to_string().contains("schema version 999"), "{err}");
+    }
+
+    #[test]
+    fn store_open_records_schema_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("agentmail.redb")).unwrap();
+        let txn = store.read().unwrap();
+        let meta = txn.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(),
+            SCHEMA_VERSION
+        );
+    }
+}

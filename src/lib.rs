@@ -4,3 +4,4 @@ pub mod ids;
 pub mod model;
 pub mod paths;
 pub mod procinfo;
+pub mod store;
