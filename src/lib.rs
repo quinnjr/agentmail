@@ -8,3 +8,5 @@ pub mod paths;
 pub mod procinfo;
 pub mod protocol;
 pub mod store;
+#[cfg(test)]
+mod test_util;

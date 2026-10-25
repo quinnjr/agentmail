@@ -237,13 +237,20 @@ mod tests {
     fn paths_lock_held_sees_a_held_lock_only() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = Paths::in_dir(dir.path());
+        // `lock_held` probes by taking the lock itself, and a child that
+        // another test thread forks shares every lock file description we
+        // have open until it execs. So right after a probe or a release the
+        // lock can look held for a moment: the "not held" checks and our
+        // own `try_lock` retry briefly (see `test_util::eventually`).
+        let not_held =
+            || crate::test_util::eventually(|| if p.lock_held() { Err(()) } else { Ok(()) });
         assert!(!p.lock_held(), "a missing lock file must not count as held");
         let lock = std::fs::File::create(&p.lock).unwrap();
-        assert!(!p.lock_held());
-        lock.try_lock().unwrap();
+        assert_eq!(not_held(), Ok(()), "an unlocked file counts as held");
+        crate::test_util::eventually(|| lock.try_lock()).unwrap();
         assert!(p.lock_held());
         drop(lock);
-        assert!(!p.lock_held());
+        assert_eq!(not_held(), Ok(()), "a released lock still counts as held");
     }
 
     #[test]

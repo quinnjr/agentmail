@@ -30,8 +30,12 @@ use crate::store::Store;
 /// How often the daemon checks that its socket file is still its own.
 const SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// How many times a starting daemon tries to take the lock before deciding
-/// another daemon holds it.
-const LOCK_ATTEMPTS: u32 = 5;
+/// another daemon holds it: about half a second in all. A probe holds the
+/// lock for an instant, but under load the prober can be descheduled while
+/// holding it, and a child that a multi-threaded prober forks shares the
+/// lock until it execs; the window is wide enough to outlast both. A daemon
+/// that loses to a live one only lingers this long before exiting.
+const LOCK_ATTEMPTS: u32 = 25;
 /// The pause between those tries.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// How long to keep retrying to open the database (a previous daemon in
@@ -534,9 +538,13 @@ mod tests {
             .await
             .expect("release did not finish once the store was dropped")
             .unwrap();
-        // The successor takes the lock and opens the store at once.
-        probe.try_lock().expect("lock still held after release");
-        Store::open(&paths.db).expect("successor could not open the store");
+        // The successor takes the lock and opens the store. Both checks
+        // retry briefly: a child another test thread is forking can share
+        // our lock (and database) file descriptions until it execs, so
+        // they may look held for a moment after release.
+        crate::test_util::eventually(|| probe.try_lock()).expect("lock still held after release");
+        crate::test_util::eventually(|| Store::open(&paths.db))
+            .expect("successor could not open the store");
     }
 
     #[tokio::test]

@@ -74,13 +74,47 @@ fn daemons_for(data_dir: &Path) -> Vec<u32> {
     out
 }
 
-/// Stop a spawned daemon and wait until no process serves `paths`.
+/// How long to wait for spawned daemons to come and go. Generous, as
+/// process startup can take seconds on a heavily loaded machine.
+const PROCESS_WAIT: Duration = Duration::from_secs(10);
+
+/// Stop spawned daemons and wait until no process serves `paths`.
+///
+/// Autostart spawns a spare daemon whenever the first is slow to answer.
+/// A spare normally exits on finding the lock held, but one that is slower
+/// still can take the lock once the first has shut down, and then serve.
+/// So `Shutdown` is sent again for as long as any daemon remains.
 async fn stop_spawned(paths: &Paths) {
-    let _ = Client::shutdown(paths).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !daemons_for(&paths.data_dir).is_empty() {
-        assert!(Instant::now() < deadline, "spawned daemon did not stop");
+    let deadline = Instant::now() + PROCESS_WAIT;
+    loop {
+        let live = daemons_for(&paths.data_dir);
+        if live.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "spawned daemons did not stop: {live:?}"
+        );
+        let _ = Client::shutdown(paths).await;
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until `pid` is the only daemon for `data_dir`: spare daemons that
+/// autostart spawned while the first was slow to answer exit once they
+/// find the lock held, but may still be running when the client returns.
+fn assert_sole_daemon(data_dir: &Path, pid: u32) {
+    let deadline = Instant::now() + PROCESS_WAIT;
+    loop {
+        let live = daemons_for(data_dir);
+        if live == [pid] {
+            return;
+        }
+        assert!(
+            live.contains(&pid) && Instant::now() < deadline,
+            "expected only daemon {pid}, found {live:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -234,7 +268,7 @@ async fn stale_socket_is_replaced() {
 
     let mut c = Client::connect_or_spawn_with(&paths, &bin()).await.unwrap();
     let pid = hello_pid(&mut c).await;
-    assert_eq!(daemons_for(&paths.data_dir), vec![pid as u32]);
+    assert_sole_daemon(&paths.data_dir, pid as u32);
     let counts = c.call(&Caller::Human, Request::Counts).await.unwrap();
     assert_eq!(counts["unread"], 0);
     stop_spawned(&paths).await;
@@ -327,7 +361,7 @@ async fn version_mismatch_triggers_shutdown_and_respawn() {
     let mut c = Client::connect_or_spawn_with(&paths, &bin()).await.unwrap();
     assert_eq!(fake.await.unwrap(), vec!["hello", "shutdown"]);
     let pid = hello_pid(&mut c).await;
-    assert_eq!(daemons_for(&paths.data_dir), vec![pid as u32]);
+    assert_sole_daemon(&paths.data_dir, pid as u32);
     stop_spawned(&paths).await;
 }
 
@@ -636,7 +670,10 @@ async fn daemon_exits_when_its_socket_is_removed() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
     let mut c = Client::connect_or_spawn_with(&paths, &bin()).await.unwrap();
-    hello_pid(&mut c).await;
+    let pid = hello_pid(&mut c).await;
+    // A spare daemon still waiting for the lock would take over once ours
+    // exits, and serve on.
+    assert_sole_daemon(&paths.data_dir, pid as u32);
     std::fs::remove_file(&paths.socket).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !daemons_for(&paths.data_dir).is_empty() {
@@ -669,7 +706,13 @@ fn daemon_cli_start_status_stop() {
     let (code, out) = run(&["daemon", "start"]);
     assert_eq!(code, Some(0), "{out}");
     assert!(out.contains("running (pid"), "{out}");
-    assert_eq!(daemons_for(&paths.data_dir).len(), 1);
+    let pid: u32 = out
+        .split("running (pid ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no pid in {out:?}"));
+    assert_sole_daemon(&paths.data_dir, pid);
 
     let (code, out) = run(&["daemon", "status"]);
     assert_eq!(code, Some(0), "{out}");
@@ -1061,8 +1104,29 @@ async fn autostart_reports_a_lock_held_without_a_socket() {
     assert!(msg.contains(&paths.lock.display().to_string()), "{msg}");
     assert!(msg.contains("not listening"), "{msg}");
     assert!(msg.contains("XDG_RUNTIME_DIR"), "{msg}");
+    // The daemons autostart spawned give up on the held lock and exit. Wait
+    // for that before releasing it, or one still retrying would take it
+    // and serve on.
+    let deadline = Instant::now() + PROCESS_WAIT;
+    loop {
+        let live = daemons_for(&paths.data_dir);
+        if live.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "spawned daemons kept running: {live:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     drop(lock);
-    assert!(!paths.lock_held());
+    // A child another test thread is forking shares our lock until it
+    // execs, so the release can take a moment to show.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while paths.lock_held() {
+        assert!(Instant::now() < deadline, "lock still held after release");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Paths in `dir` with a socket path exactly `len` bytes long.
@@ -1240,6 +1304,9 @@ async fn daemon_starts_despite_a_momentary_lock_probe() {
         paths: paths.clone(),
     }));
     tokio::time::sleep(Duration::from_millis(30)).await;
+    // A child another test thread forks right now shares the probe's lock
+    // until it execs, so the lock may stay held a little longer than this;
+    // the daemon's retry window allows for that.
     drop(probe);
 
     let deadline = Instant::now() + Duration::from_secs(5);

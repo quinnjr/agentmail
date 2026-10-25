@@ -75,11 +75,29 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// keeps the pipe open then dies with it, so neither we nor the reader
 /// thread are held past the deadline.
 fn output_within(cmd: Command, limit: Duration) -> Option<Vec<u8>> {
-    output_within_with(cmd, limit, kill_group)
+    output_within_with(cmd, limit, kill_group).ok()
+}
+
+/// Why [`output_within_with`] gave up on a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GiveUp {
+    /// The command could not be started.
+    Spawn,
+    /// The command was still running at the deadline.
+    TimedOut,
+    /// The command exited unsuccessfully.
+    Failed,
+    /// The command succeeded, but something it left behind held stdout
+    /// open past the deadline.
+    StdoutHeld,
+    /// Reading stdout failed.
+    Read,
+    /// `waitid` could not tell whether the leader had exited.
+    LeaderUnknown,
 }
 
 /// [`output_within`] with the group kill injectable, so tests can observe
-/// when it happens.
+/// when it happens, and the reason for giving up reported.
 ///
 /// The group id is the leader's pid, and a pid (hence the group id) stays
 /// reserved for exactly as long as the leader is unreaped, alive or a
@@ -92,7 +110,7 @@ fn output_within_with(
     mut cmd: Command,
     limit: Duration,
     kill_group: impl Fn(u32),
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, GiveUp> {
     use std::os::unix::process::CommandExt;
 
     let deadline = Instant::now() + limit;
@@ -102,13 +120,13 @@ fn output_within_with(
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .ok()?;
+        .map_err(|_| GiveUp::Spawn)?;
     // With `process_group(0)` the group id is the child's pid.
     let pgid = child.id();
     let Some(mut stdout) = child.stdout.take() else {
         kill_group(pgid);
         let _ = child.wait();
-        return None;
+        return Err(GiveUp::Read);
     };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -124,7 +142,7 @@ fn output_within_with(
                 // Timed out: the leader is still running, so unreaped.
                 kill_group(pgid);
                 let _ = child.wait();
-                return None;
+                return Err(GiveUp::TimedOut);
             }
             Err(_) => {
                 // Cannot tell whether the leader is still ours to wait
@@ -132,7 +150,7 @@ fn output_within_with(
                 // the group, only the child std still tracks.
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(GiveUp::LeaderUnknown);
             }
         }
     };
@@ -144,11 +162,15 @@ fn output_within_with(
             .max(POLL_INTERVAL);
         // A timeout means something the command left behind still holds
         // stdout open past the deadline.
-        rx.recv_timeout(wait).ok().and_then(|res| res.ok())
+        match rx.recv_timeout(wait) {
+            Ok(Ok(buf)) => Ok(buf),
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => Err(GiveUp::Read),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(GiveUp::StdoutHeld),
+        }
     } else {
-        None
+        Err(GiveUp::Failed)
     };
-    if out.is_none() {
+    if out.is_err() {
         kill_group(pgid);
     }
     let _ = child.wait();
@@ -584,36 +606,89 @@ mod tests {
         );
     }
 
-    /// Run `script` (with `$1` a file to write a grandchild's pid to) under
-    /// a short limit and assert it yields `None` and the grandchild dies.
-    fn assert_grandchild_killed(script: &str) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pidfile = dir.path().join("grandchild.pid");
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(script).arg("sh").arg(&pidfile);
-        let started = Instant::now();
-        assert_eq!(output_within(cmd, Duration::from_millis(300)), None);
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let pid: u32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let gone = |pid: u32| match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Err(_) => true,
-            // A zombie awaiting its (new) parent is dead too.
-            Ok(stat) => stat
+    /// Limits to try, in turn, for a case that needs the command to get
+    /// somewhere (exit, or record a pid) before the deadline. Under heavy
+    /// load a shell can take longer than a short limit just to start; that
+    /// run then times out without exercising the case, and is retried with
+    /// a longer limit.
+    const GROWING_LIMITS: [Duration; 4] = [
+        Duration::from_millis(300),
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+        Duration::from_secs(10),
+    ];
+
+    /// Assert the process `pid` dies soon, failing with `context` and its
+    /// `/proc` status otherwise.
+    fn assert_dies(pid: u32, context: &str) {
+        let stat = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        // Dead already: a zombie awaiting its (new) parent (`Z`), or a
+        // process its parent is reaping (`X`, EXIT_DEAD). Under heavy load
+        // the reaper (init, for an orphan) can leave a reaped process in
+        // `X` for seconds before its `/proc` entry goes: stress runs showed
+        // such a grandchild, killed by SIGKILL (exit code 9) and still in
+        // the killed group, outlast a check that only accepted `Z`.
+        let gone = |pid: u32| match stat(pid) {
+            None => true,
+            Some(stat) => stat
                 .rsplit_once(") ")
-                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+                .is_some_and(|(_, rest)| rest.starts_with(['Z', 'X', 'x'])),
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // SIGKILL is not instant either: a process in uninterruptible sleep
+        // only dies once it leaves it, which on a heavily loaded machine
+        // (WSL in particular) can take seconds. The wait is generous, as
+        // only a process that was never signalled should fail this.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !gone(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
             gone(pid),
-            "grandchild {pid} of {script:?} outlived output_within"
+            "{context}: process {pid} survived (/proc/{pid}/stat: {:?})",
+            stat(pid)
         );
+    }
+
+    /// Run `script` (with `$1` a file to write a grandchild's pid to) and
+    /// assert it gives up for `why` and the grandchild dies.
+    fn assert_grandchild_killed(script: &str, why: GiveUp) {
+        for limit in GROWING_LIMITS {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pidfile = dir.path().join("grandchild.pid");
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script).arg("sh").arg(&pidfile);
+            let started = Instant::now();
+            let kills = std::sync::Mutex::new(Vec::new());
+            let out = output_within_with(cmd, limit, |pgid| {
+                kills.lock().unwrap().push(pgid);
+                kill_group(pgid);
+            });
+            let kills = kills.into_inner().unwrap();
+            assert!(started.elapsed() < limit + Duration::from_secs(10));
+            // Whatever happened, a grandchild that was started must die.
+            let pid = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if let Some(pid) = pid {
+                assert_dies(
+                    pid,
+                    &format!(
+                        "grandchild of {script:?} outlived output_within \
+                         (limit {limit:?}, gave up with {out:?}, group kills {kills:?})"
+                    ),
+                );
+            }
+            if out == Err(why) && pid.is_some() {
+                return;
+            }
+            // Only a run that was too slow to get anywhere is retried.
+            assert_eq!(
+                out,
+                Err(GiveUp::TimedOut),
+                "{script:?} gave up for the wrong reason"
+            );
+        }
+        panic!("{script:?} never gave up for {why:?}, even with a long limit");
     }
 
     /// Whenever the command is given up on, its whole process group is
@@ -622,18 +697,18 @@ mod tests {
     #[test]
     fn bounded_output_kills_grandchildren_when_giving_up() {
         // The command itself outlives the deadline.
-        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; wait");
+        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; wait", GiveUp::TimedOut);
         // The command succeeds, but a grandchild keeps stdout open.
-        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 0");
+        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 0", GiveUp::StdoutHeld);
         // The command fails, leaving a grandchild behind.
-        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 1");
+        assert_grandchild_killed("sleep 30 & echo $! > \"$1\"; exit 1", GiveUp::Failed);
     }
 
     /// Run `cmd` with a kill hook that records, for each group kill,
     /// whether the leader was still unreaped (alive or a zombie) at that
-    /// moment, then performs the real kill. Returns the output, those
-    /// records and the leader's pid.
-    fn run_with_kill_probe(cmd: Command, limit: Duration) -> (Option<Vec<u8>>, Vec<bool>) {
+    /// moment, then performs the real kill. Returns the outcome and those
+    /// records.
+    fn run_with_kill_probe(cmd: Command, limit: Duration) -> (Result<Vec<u8>, GiveUp>, Vec<bool>) {
         let seen = std::sync::Mutex::new(Vec::new());
         let out = output_within_with(cmd, limit, |pgid| {
             let pid = libc::pid_t::try_from(pgid).unwrap();
@@ -658,19 +733,29 @@ mod tests {
         };
         // Exits non-zero with nothing left in the group.
         let (out, kills) = run_with_kill_probe(sh("exit 3"), Duration::from_secs(5));
-        assert_eq!(out, None);
+        assert_eq!(out, Err(GiveUp::Failed));
         assert_eq!(kills, vec![true]);
         // Outlives the deadline.
         let (out, kills) = run_with_kill_probe(sh("exec sleep 30"), Duration::from_millis(200));
-        assert_eq!(out, None);
+        assert_eq!(out, Err(GiveUp::TimedOut));
         assert_eq!(kills, vec![true]);
         // Succeeds, but a grandchild holds stdout open past the deadline.
-        let (out, kills) = run_with_kill_probe(sh("sleep 30 & exit 0"), Duration::from_millis(300));
-        assert_eq!(out, None);
-        assert_eq!(kills, vec![true]);
+        // A run too slow to even exit before the deadline times out
+        // instead; retry it with a longer limit.
+        let mut held = false;
+        for limit in GROWING_LIMITS {
+            let (out, kills) = run_with_kill_probe(sh("sleep 30 & exit 0"), limit);
+            assert_eq!(kills, vec![true]);
+            if out == Err(GiveUp::StdoutHeld) {
+                held = true;
+                break;
+            }
+            assert_eq!(out, Err(GiveUp::TimedOut));
+        }
+        assert!(held, "the grandchild case never got past the deadline");
         // Succeeds cleanly: nothing to kill.
         let (out, kills) = run_with_kill_probe(sh("echo hi"), Duration::from_secs(5));
-        assert_eq!(out, Some(b"hi\n".to_vec()));
+        assert_eq!(out, Ok(b"hi\n".to_vec()));
         assert!(kills.is_empty());
     }
 
@@ -692,10 +777,11 @@ mod tests {
             let leader = std::sync::Mutex::new(None);
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(script);
-            output_within_with(cmd, limit, |pgid| {
+            let out = output_within_with(cmd, limit, |pgid| {
                 *leader.lock().unwrap() = Some(pgid);
                 kill_group(pgid);
             });
+            assert!(out.is_err(), "{script:?} did not give up");
             let pgid = leader.into_inner().unwrap().expect("group was killed");
             gone(libc::pid_t::try_from(pgid).unwrap(), script);
         }
