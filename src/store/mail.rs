@@ -174,7 +174,7 @@ fn open_questions(thread: &[Message]) -> HashSet<&str> {
 }
 
 /// A thread's messages, in id order.
-fn thread_messages(
+pub(super) fn thread_messages(
     threads: &impl ReadableTable<(&'static str, &'static str), ()>,
     messages: &impl ReadableTable<&'static str, &'static [u8]>,
     thread_id: &str,
@@ -282,55 +282,14 @@ struct MailboxView {
     open: HashSet<String>,
 }
 
-// The question hooks below take the open `WriteTransaction` (unlike the
-// plan's one-argument `on_question_inserted(&msg)`), because the questions
-// table must change in the same transaction as the messages. Task 5 fills in
-// these bodies with these signatures; it does not add other forms.
 impl Store {
-    /// Hook for the questions table (Task 5): called inside the write
-    /// transaction exactly once per question, when the message is stored
-    /// (by [`Store::insert_message`] or [`Store::insert_held`]). It creates
-    /// the question row. Releasing held mail never calls it again; see
-    /// [`Store::on_question_recipient_added`].
-    fn on_question_inserted(
-        &self,
-        _txn: &WriteTransaction,
-        _msg: &Message,
-    ) -> Result<(), StoreError> {
-        Ok(())
-    }
-
-    /// Hook for the questions table (Task 5): called inside the release
-    /// transaction when held question `msg` is delivered to `addr`, only
-    /// when `addr` was newly appended to `msg.to` (never for an agent the
-    /// question was already addressed to). It adds `addr` to the existing
-    /// question row's recipients and must never create a second row.
-    fn on_question_recipient_added(
-        &self,
-        _txn: &WriteTransaction,
-        _msg: &Message,
-        _addr: &str,
-    ) -> Result<(), StoreError> {
-        Ok(())
-    }
-
-    /// Hook for the questions table (Task 5): called inside the prune
-    /// transaction with the ids of the deleted messages, after every other
-    /// table handle is closed, so it may open any table.
-    fn on_messages_pruned(
-        &self,
-        _txn: &WriteTransaction,
-        _ids: &HashSet<String>,
-    ) -> Result<(), StoreError> {
-        Ok(())
-    }
-
     /// Store a message and deliver it to each recipient's mailbox.
     ///
     /// A reply (`in_reply_to` set) joins the parent's thread and takes
     /// `Re: <root subject>`; a new thread needs a non-blank subject. An
-    /// [`Kind::Answer`] must be a reply ([`StoreError::InvalidInput`]
-    /// otherwise), since only a reply can close a question. `to`
+    /// [`Kind::Answer`] must be a reply that closes at least one open
+    /// question on its reply chain (`InvalidInput("not an open question")`
+    /// otherwise). `to`
     /// must not be empty (mail for unregistered names goes through
     /// [`Store::insert_held`]). The sender must be `human` or a registered
     /// agent ([`StoreError::NotFound`] otherwise), every recipient too
@@ -505,8 +464,10 @@ impl Store {
             }
             msg
         };
-        if msg.kind == Kind::Question {
-            self.on_question_inserted(txn, &msg)?;
+        match msg.kind {
+            Kind::Question => self.on_question_inserted(txn, &msg)?,
+            Kind::Answer => self.on_answer_inserted(txn, &msg)?,
+            Kind::Note => {}
         }
         Ok(msg)
     }

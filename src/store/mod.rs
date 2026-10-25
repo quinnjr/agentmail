@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 
 mod agents;
 mod mail;
+mod questions;
 
 pub use agents::{Alive, RegisterReq};
 pub use mail::{MAX_BODY, NewMessage, ThreadFilter, ThreadSummary};
@@ -28,6 +29,8 @@ pub(crate) const MAILBOX: TableDefinition<(&str, &str), bool> = TableDefinition:
 pub(crate) const THREADS: TableDefinition<(&str, &str), ()> = TableDefinition::new("threads");
 /// Mail held for a name not yet registered: `(repo, name, message id)`.
 pub(crate) const HELD: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("held");
+/// Questions by message id. Value: JSON [`crate::model::Question`].
+pub(crate) const QUESTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("questions");
 /// Store metadata, e.g. `schema_version`.
 pub(crate) const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
@@ -106,6 +109,7 @@ impl Store {
             txn.open_table(MAILBOX)?;
             txn.open_table(THREADS)?;
             txn.open_table(HELD)?;
+            txn.open_table(QUESTIONS)?;
             let mut meta = txn.open_table(META)?;
             let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());
             match existing {
