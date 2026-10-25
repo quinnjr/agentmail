@@ -15,6 +15,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use crate::paths::Paths;
 pub use crate::protocol::ClientError;
 use crate::protocol::{Caller, Envelope, ErrorCode, Event, PROTOCOL_VERSION, Request, Response};
+use crate::store::lexical;
 
 /// How often to retry connecting while a daemon starts.
 const RETRY_INTERVAL: Duration = Duration::from_millis(25);
@@ -79,6 +80,64 @@ enum Handshake {
     Refused(Box<Client>, ClientError),
     /// The peer did not answer in time.
     TimedOut(anyhow::Error),
+    /// The daemon at the socket serves another data directory.
+    WrongDataDir(anyhow::Error),
+}
+
+/// The daemon at the socket serves another data directory than the
+/// client's (or did not say which one it serves).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDirMismatch {
+    /// The socket both resolve.
+    pub socket: PathBuf,
+    /// The client's data directory, lexically normalized.
+    pub ours: PathBuf,
+    /// The daemon's data directory, lexically normalized; `None` when the
+    /// daemon did not report one.
+    pub theirs: Option<PathBuf>,
+}
+
+impl std::fmt::Display for DataDirMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.theirs {
+            Some(theirs) => write!(
+                f,
+                "the daemon at {} serves data directory {}, not {}; set \
+                 AGENTMAIL_SOCKET so each data directory has its own socket",
+                self.socket.display(),
+                theirs.display(),
+                self.ours.display()
+            ),
+            None => write!(
+                f,
+                "the daemon at {} did not report its data directory (expected {}); \
+                 stop it with `agentmail daemon stop`",
+                self.socket.display(),
+                self.ours.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DataDirMismatch {}
+
+/// Check that the daemon that answered `Hello` with `hello` serves the data
+/// directory of `paths`. Both sides are compared after lexical
+/// normalization, so different spellings of one directory match.
+fn check_data_dir(paths: &Paths, hello: &Value) -> Result<(), DataDirMismatch> {
+    let ours = lexical(&paths.data_dir);
+    let theirs = hello
+        .get("data_dir")
+        .and_then(Value::as_str)
+        .map(|d| lexical(Path::new(d)));
+    match theirs {
+        Some(t) if t.to_string_lossy() == ours.to_string_lossy() => Ok(()),
+        theirs => Err(DataDirMismatch {
+            socket: paths.socket.clone(),
+            ours,
+            theirs,
+        }),
+    }
 }
 
 impl Client {
@@ -117,7 +176,10 @@ impl Client {
         let attempt = async {
             let mut c = Client::open(paths).await.map_err(Handshake::Open)?;
             match c.hello().await {
-                Ok(_) => Ok(c),
+                Ok(hello) => match check_data_dir(paths, &hello) {
+                    Ok(()) => Ok(c),
+                    Err(e) => Err(Handshake::WrongDataDir(e.into())),
+                },
                 Err(e) => Err(Handshake::Refused(Box::new(c), e)),
             }
         };
@@ -136,7 +198,7 @@ impl Client {
                     .context(format!("connecting to {}", paths.socket.display())))
             }
             Err(Handshake::Refused(_, e)) => Err(e.into()),
-            Err(Handshake::TimedOut(e)) => Err(e),
+            Err(Handshake::TimedOut(e) | Handshake::WrongDataDir(e)) => Err(e),
         }
     }
 
@@ -180,9 +242,11 @@ impl Client {
     /// [`Client::connect_or_spawn`] with an explicit daemon binary.
     ///
     /// A daemon speaking another protocol version is sent `Shutdown` and
-    /// replaced, once. A peer that accepts but does not answer is an error:
-    /// starting another daemon would not help, as the silent one either
-    /// holds the lock or is not a daemon at all.
+    /// replaced, once. A daemon serving another data directory is an error
+    /// ([`DataDirMismatch`]): a new daemon would take over its socket. So is
+    /// a peer that accepts but does not answer: starting another daemon would
+    /// not help, as the silent one either holds the lock or is not a daemon
+    /// at all.
     pub async fn connect_or_spawn_with(paths: &Paths, bin: &Path) -> Result<Client> {
         match Client::open_and_hello(paths, ANSWER_WAIT).await {
             Ok(c) => return Ok(c),
@@ -194,7 +258,7 @@ impl Client {
             // The daemon is going away; start a new one below.
             Err(Handshake::Refused(_, e)) if e.code == ErrorCode::ConnectionLost => {}
             Err(Handshake::Refused(_, e)) => return Err(e.into()),
-            Err(Handshake::TimedOut(e)) => return Err(e),
+            Err(Handshake::TimedOut(e) | Handshake::WrongDataDir(e)) => return Err(e),
             // Nothing listening: start a daemon below.
             Err(Handshake::Open(_)) => {}
         }
@@ -214,6 +278,7 @@ impl Client {
                 Err(Handshake::Refused(_, e)) => last_err = e.into(),
                 Err(Handshake::Open(e)) => last_err = e.into(),
                 Err(Handshake::TimedOut(e)) => last_err = e,
+                Err(Handshake::WrongDataDir(e)) => return Err(e),
             }
             if Instant::now() >= deadline {
                 // A daemon that holds the lock but is not at our socket is
@@ -352,5 +417,24 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         assert_eq!(daemon_bin_from(Some("".into())).unwrap(), exe);
         assert_eq!(daemon_bin_from(None).unwrap(), exe);
+    }
+
+    #[test]
+    fn check_data_dir_compares_lexically_and_requires_the_field() {
+        let paths = Paths::in_dir(Path::new("/data/a"));
+        let hello = |d: &str| serde_json::json!({ "version": 1, "pid": 1, "data_dir": d });
+        assert_eq!(check_data_dir(&paths, &hello("/data/a")), Ok(()));
+        assert_eq!(check_data_dir(&paths, &hello("/data/./b/../a/")), Ok(()));
+
+        let err = check_data_dir(&paths, &hello("/data/b")).unwrap_err();
+        assert_eq!(err.theirs, Some(PathBuf::from("/data/b")));
+        assert_eq!(err.ours, PathBuf::from("/data/a"));
+        let msg = err.to_string();
+        assert!(msg.contains("/data/b") && msg.contains("/data/a"), "{msg}");
+        assert!(msg.contains("AGENTMAIL_SOCKET"), "{msg}");
+
+        let err = check_data_dir(&paths, &serde_json::json!({ "version": 1 })).unwrap_err();
+        assert_eq!(err.theirs, None);
+        assert!(err.to_string().contains("did not report"), "{err}");
     }
 }

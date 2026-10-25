@@ -5,7 +5,9 @@
 //! connection carries one request at a time. The first request on a
 //! connection must be [`Request::Hello`]; the daemon answers `Ok` when the
 //! versions match and `Err` with [`ErrorCode::VersionMismatch`] otherwise
-//! (and to any other request sent before a successful `Hello`).
+//! (and to any other request sent before a successful `Hello`). The `Ok`
+//! data is `{"version", "pid", "data_dir"}`: clients refuse a daemon whose
+//! `data_dir` is not theirs, since it would serve another database.
 //!
 //! Compatibility invariant: the encodings of `Hello`, `Shutdown` and of the
 //! `VersionMismatch` error never change, and `Shutdown` is honoured even

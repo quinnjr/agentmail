@@ -1061,3 +1061,84 @@ async fn too_long_socket_path_is_refused_by_name() {
     assert!(!msg.contains(".d/s"), "{msg}");
     assert!(std::fs::symlink_metadata(&paths.socket).is_err());
 }
+
+#[tokio::test]
+async fn hello_reports_the_data_dir() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let data = c
+        .call(
+            &Caller::Human,
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        data["data_dir"].as_str().unwrap(),
+        d.paths.data_dir.to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn client_refuses_a_daemon_serving_another_data_dir() {
+    let d = TestDaemon::start().await;
+    let other = TempDir::new().unwrap();
+    // Shares the daemon's socket (as XDG_RUNTIME_DIR would) but names
+    // another data directory.
+    let paths = Paths {
+        socket: d.paths.socket.clone(),
+        ..Paths::in_dir(other.path())
+    };
+    let check = |err: anyhow::Error| {
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&d.paths.data_dir.display().to_string()),
+            "{msg}"
+        );
+        assert!(msg.contains(&other.path().display().to_string()), "{msg}");
+        assert!(msg.contains("AGENTMAIL_SOCKET"), "{msg}");
+    };
+
+    check(Client::connect(&paths).await.err().expect("connected"));
+    // Autostart must not start another daemon either: it would take over
+    // the shared socket.
+    check(
+        Client::connect_or_spawn_with(&paths, &bin())
+            .await
+            .err()
+            .expect("connected"),
+    );
+    assert!(daemons_for(other.path()).is_empty());
+    assert!(!paths.lock_held());
+    // The daemon itself is unaffected.
+    d.client().await;
+}
+
+#[tokio::test]
+async fn client_accepts_another_spelling_of_the_same_data_dir() {
+    let d = TestDaemon::start().await;
+    let mut spelled = d.paths.data_dir.join("sub").join("..");
+    spelled.push(".");
+    let paths = Paths {
+        data_dir: spelled,
+        ..d.paths.clone()
+    };
+    Client::connect(&paths).await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_status_reports_a_daemon_for_another_data_dir() {
+    let d = TestDaemon::start().await;
+    let other = TempDir::new().unwrap();
+    let paths = Paths {
+        socket: d.paths.socket.clone(),
+        ..Paths::in_dir(other.path())
+    };
+    let (code, out) = run_cli(&paths, &["daemon", "status"]).await;
+    assert_eq!(code, Some(1), "{out}");
+    assert!(!out.contains("not running"), "{out}");
+    assert!(out.contains("not for this data directory"), "{out}");
+    assert!(out.contains("AGENTMAIL_SOCKET"), "{out}");
+}

@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use agentmail::client::{Client, ClientError};
+use agentmail::client::{Client, ClientError, DataDirMismatch};
 use agentmail::daemon::{DaemonConfig, serve};
 use agentmail::paths::Paths;
 use agentmail::protocol::{Caller, ErrorCode, PROTOCOL_VERSION, Request};
@@ -98,6 +98,10 @@ async fn daemon(paths: &Paths, action: DaemonAction) -> anyhow::Result<ExitCode>
                     paths.socket.display()
                 );
                 Ok(ExitCode::SUCCESS)
+            }
+            Err(e) if e.downcast_ref::<DataDirMismatch>().is_some() => {
+                println!("daemon running, but not for this data directory: {e:#}");
+                Ok(ExitCode::FAILURE)
             }
             Err(e) => match e.downcast_ref::<ClientError>() {
                 Some(ce) if ce.code == ErrorCode::VersionMismatch => {

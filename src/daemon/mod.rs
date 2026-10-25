@@ -187,6 +187,7 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
 
     let store_ref = Arc::downgrade(&store);
     let handler = Arc::new(Handler::new(store, Hub::new()));
+    let data_dir: Arc<Path> = Arc::from(paths.data_dir.as_path());
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let mut conns = JoinSet::new();
@@ -196,7 +197,12 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
         tokio::select! {
             res = listener.accept() => match res {
                 Ok((stream, _)) => {
-                    conns.spawn(connection(stream, handler.clone(), stop_tx.clone()));
+                    conns.spawn(connection(
+                        stream,
+                        handler.clone(),
+                        data_dir.clone(),
+                        stop_tx.clone(),
+                    ));
                 }
                 Err(e) => {
                     eprintln!("agentmail daemon: accept failed: {e}");
@@ -287,7 +293,15 @@ fn to_response(res: Result<Value, ClientError>) -> Response {
     }
 }
 
-async fn connection(stream: UnixStream, handler: Arc<Handler>, stop: watch::Sender<bool>) {
+/// Serve one connection. `data_dir` is reported in the `Hello` answer, so a
+/// client can tell a daemon for another data directory that shares its
+/// socket path.
+async fn connection(
+    stream: UnixStream,
+    handler: Arc<Handler>,
+    data_dir: Arc<Path>,
+    stop: watch::Sender<bool>,
+) {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut greeted = false;
@@ -317,7 +331,11 @@ async fn connection(stream: UnixStream, handler: Arc<Handler>, stop: watch::Send
         let res = match env.req {
             Request::Hello { version } if version == PROTOCOL_VERSION => {
                 greeted = true;
-                Ok(json!({ "version": PROTOCOL_VERSION, "pid": std::process::id() }))
+                Ok(json!({
+                    "version": PROTOCOL_VERSION,
+                    "pid": std::process::id(),
+                    "data_dir": data_dir.to_string_lossy(),
+                }))
             }
             Request::Hello { version } => Err(ClientError::new(
                 ErrorCode::VersionMismatch,
