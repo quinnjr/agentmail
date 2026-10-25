@@ -54,6 +54,12 @@ pub enum StoreError {
     /// A recipient that may not receive this message, e.g. its own sender.
     #[error("invalid recipient: {0}")]
     InvalidRecipient(String),
+    /// [`Store::insert_held`] found an active agent registered under a
+    /// name it was asked to hold mail for (it registered after the caller
+    /// resolved the name). Nothing was stored; resolve the recipients again
+    /// and send to that agent.
+    #[error("recipient registered: {0}; resolve the recipients again")]
+    RecipientRegistered(String),
     #[error("database error: {0}")]
     Db(String),
 }

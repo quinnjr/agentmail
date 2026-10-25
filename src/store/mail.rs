@@ -8,10 +8,10 @@ use redb::{ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AGENTS, HELD, MAILBOX, MESSAGES, Store, StoreError, THREADS, all_json, encode, get_json,
+    AGENTS, Alive, HELD, MAILBOX, MESSAGES, Store, StoreError, THREADS, all_json, encode, get_json,
 };
 use crate::ids::{new_message_id, validate_name};
-use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message};
+use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message, Presence};
 
 /// Longest message body, in bytes (256 KiB).
 pub const MAX_BODY: usize = MAX_BODY_BYTES;
@@ -254,10 +254,21 @@ fn require_known_recipient(
     }
 }
 
-fn push_unique(list: &mut Vec<String>, addr: &str) {
-    if !list.iter().any(|a| a == addr) {
+/// Append `addr` unless `list` already has it. Returns whether it appended.
+fn push_unique(list: &mut Vec<String>, addr: &str) -> bool {
+    if list.iter().any(|a| a == addr) {
+        false
+    } else {
         list.push(addr.to_string());
+        true
     }
+}
+
+/// The repo an agent is in, as a held-mail key: its repo, or its cwd when it
+/// has none. `None` when that path is not absolute (register does not
+/// require one), so it can never match a held key.
+fn agent_repo_key(agent: &Agent) -> Option<String> {
+    repo_key(agent.repo.as_deref().unwrap_or(&agent.cwd)).ok()
 }
 
 /// A mailbox listing for `addr`: its messages paired with read state, plus
@@ -267,6 +278,10 @@ struct MailboxView {
     open: HashSet<String>,
 }
 
+// The question hooks below take the open `WriteTransaction` (unlike the
+// plan's one-argument `on_question_inserted(&msg)`), because the questions
+// table must change in the same transaction as the messages. Task 5 fills in
+// these bodies with these signatures; it does not add other forms.
 impl Store {
     /// Hook for the questions table (Task 5): called inside the write
     /// transaction exactly once per question, when the message is stored
@@ -282,8 +297,9 @@ impl Store {
     }
 
     /// Hook for the questions table (Task 5): called inside the release
-    /// transaction when held question `msg` is delivered to `addr`, after
-    /// `addr` was appended to `msg.to`. It adds `addr` to the existing
+    /// transaction when held question `msg` is delivered to `addr`, only
+    /// when `addr` was newly appended to `msg.to` (never for an agent the
+    /// question was already addressed to). It adds `addr` to the existing
     /// question row's recipients and must never create a second row.
     fn on_question_recipient_added(
         &self,
@@ -337,12 +353,22 @@ impl Store {
     /// name (see [`Store::release_held`]), all in one transaction, so held
     /// mail can never be stored without its hold. `names` must not be empty;
     /// otherwise the rules of [`Store::insert_message`] apply.
+    ///
+    /// The caller resolves names before calling, so an agent may register
+    /// under one of `names` in between. To keep that agent from missing its
+    /// mail, the transaction re-checks: if an agent that is active under
+    /// `alive` (see [`Store::presence`]) is named one of `names` in `repo`
+    /// (its repo, or its cwd when it has none), nothing is stored and the
+    /// result is [`StoreError::RecipientRegistered`]; the caller resolves
+    /// again. Gone agents with the name do not count, since resolution holds
+    /// mail for them too.
     pub fn insert_held(
         &self,
         m: NewMessage,
         now: i64,
         repo: &Path,
         names: &[String],
+        alive: Alive,
     ) -> Result<Message, StoreError> {
         let repo = repo_key(repo)?;
         if names.is_empty() {
@@ -352,6 +378,17 @@ impl Store {
             validate_name(name).map_err(StoreError::InvalidName)?;
         }
         let txn = self.db.begin_write()?;
+        let agents: Vec<Agent> = all_json(&txn.open_table(AGENTS)?)?;
+        if let Some(agent) = agents.iter().find(|a| {
+            names.contains(&a.name)
+                && Store::presence(a, alive) == Presence::Active
+                && agent_repo_key(a).as_deref() == Some(repo.as_str())
+        }) {
+            return Err(StoreError::RecipientRegistered(format!(
+                "{} is now active as {:?} in {repo}",
+                agent.name, agent.address
+            )));
+        }
         let msg = self.insert_in_txn(&txn, m, now)?;
         {
             let mut held = txn.open_table(HELD)?;
@@ -473,7 +510,8 @@ impl Store {
     /// Hold message `msg_id` for the first agent that registers as `name` in
     /// `repo` (see [`Store::release_held`]). `repo` must be absolute. New
     /// mail should use [`Store::insert_held`], which stores and holds in one
-    /// transaction.
+    /// transaction and refuses when an agent with the name is already
+    /// active; this method does neither check.
     pub fn hold_for_name(&self, repo: &Path, name: &str, msg_id: &str) -> Result<(), StoreError> {
         let repo = repo_key(repo)?;
         validate_name(name).map_err(StoreError::InvalidName)?;
@@ -492,7 +530,10 @@ impl Store {
 
     /// Deliver every message held for `name` in `repo` to `addr`: each is
     /// added to `addr`'s mailbox (unread), gets `addr` appended to its `to`,
-    /// and stops being held. Returns the released messages in id order.
+    /// and stops being held. Returns the newly delivered messages in id
+    /// order. A held message that `addr` already had (already in its `to`
+    /// and its mailbox) stops being held but is not returned, so callers
+    /// never announce it twice.
     ///
     /// The agent at `addr` must exist ([`StoreError::NotFound`]) and be
     /// named `name` in `repo` (its repo, or its cwd when it has none; a
@@ -516,14 +557,13 @@ impl Store {
                     agent.name
                 )));
             }
-            let agent_repo = agent.repo.as_deref().unwrap_or(&agent.cwd);
             // A non-absolute stored path (register does not require one)
             // can never match `repo`; report it as a mismatch, not as a
             // fault in the caller's `repo`.
-            if repo_key(agent_repo).ok().as_deref() != Some(repo.as_str()) {
+            if agent_repo_key(&agent).as_deref() != Some(repo.as_str()) {
                 return Err(StoreError::InvalidInput(format!(
                     "agent {addr:?} is in {}, not {repo}",
-                    agent_repo.display()
+                    agent.repo.as_deref().unwrap_or(&agent.cwd).display()
                 )));
             }
             let mut held = txn.open_table(HELD)?;
@@ -539,6 +579,7 @@ impl Store {
 
             let mut messages = txn.open_table(MESSAGES)?;
             let mut mailbox = txn.open_table(MAILBOX)?;
+            // (message, whether addr was newly appended to its `to`)
             let mut released = Vec::with_capacity(ids.len());
             for id in &ids {
                 let Some(mut msg): Option<Message> = get_json(&messages, id)? else {
@@ -551,20 +592,28 @@ impl Store {
                     continue;
                 }
                 held.remove((repo.as_str(), name, id.as_str()))?;
-                push_unique(&mut msg.to, addr);
-                messages.insert(id.as_str(), encode(&msg)?.as_slice())?;
-                if mailbox.get((addr, id.as_str()))?.is_none() {
+                let appended = push_unique(&mut msg.to, addr);
+                if appended {
+                    messages.insert(id.as_str(), encode(&msg)?.as_slice())?;
+                }
+                let boxed = mailbox.get((addr, id.as_str()))?.is_none();
+                if boxed {
                     mailbox.insert((addr, id.as_str()), false)?;
                 }
-                released.push(msg);
+                if appended || boxed {
+                    released.push((msg, appended));
+                }
             }
             released
         };
-        for msg in released.iter().filter(|m| m.kind == Kind::Question) {
+        for (msg, _) in released
+            .iter()
+            .filter(|(m, appended)| *appended && m.kind == Kind::Question)
+        {
             self.on_question_recipient_added(&txn, msg, addr)?;
         }
         txn.commit()?;
-        Ok(released)
+        Ok(released.into_iter().map(|(m, _)| m).collect())
     }
 
     fn mailbox_view(&self, addr: &str) -> Result<MailboxView, StoreError> {

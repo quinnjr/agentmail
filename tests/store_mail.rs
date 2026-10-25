@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use agentmail::model::{HUMAN, Harness, Kind, Message};
-use agentmail::store::{MAX_BODY, NewMessage, Store, StoreError, ThreadFilter};
+use agentmail::model::{HUMAN, Harness, Kind, Message, ProcId};
+use agentmail::store::{Alive, MAX_BODY, NewMessage, Store, StoreError, ThreadFilter};
 use tempfile::TempDir;
 
 fn store() -> (TempDir, Store) {
@@ -27,6 +27,26 @@ fn agent(store: &Store, name: &str, repo: Option<&str>) -> String {
         wake: false,
     };
     store.register(req, 1, &|_| false).unwrap().0.address
+}
+
+/// Liveness check under which no process is alive.
+const NOT_ALIVE: Alive<'static> = &|_| false;
+
+/// Register an agent bound to live process `pid` (under `|_| true`) and
+/// return its address.
+fn live_agent(store: &Store, name: &str, repo: &str, pid: u32) -> String {
+    let req = agentmail::store::RegisterReq {
+        name: name.into(),
+        role: None,
+        working_on: None,
+        harness: Harness::Other,
+        cwd: PathBuf::from(repo),
+        repo: Some(PathBuf::from(repo)),
+        proc_id: Some(ProcId { pid, start_time: 1 }),
+        fresh: true,
+        wake: false,
+    };
+    store.register(req, 1, &|_| true).unwrap().0.address
 }
 
 fn note(from: &str, to: &[&str], subject: &str, body: &str) -> NewMessage {
@@ -229,6 +249,7 @@ fn held_mail_released_on_register() {
             1,
             repo,
             &names(&["frontend"]),
+            NOT_ALIVE,
         )
         .unwrap();
     assert!(m.to.is_empty());
@@ -434,6 +455,7 @@ fn prune_removes_old_threads_only() {
             100,
             Path::new("/repo"),
             &names(&["docs"]),
+            NOT_ALIVE,
         )
         .unwrap();
 
@@ -505,7 +527,13 @@ fn held_mail_is_never_released_to_its_sender() {
     let repo = Path::new("/repo");
     let a = agent(&s, "frontend", Some("/repo"));
     let m = s
-        .insert_held(note(&a, &[], "Hi", "x"), 1, repo, &names(&["frontend"]))
+        .insert_held(
+            note(&a, &[], "Hi", "x"),
+            1,
+            repo,
+            &names(&["frontend"]),
+            NOT_ALIVE,
+        )
         .unwrap();
     assert!(s.release_held(repo, "frontend", &a).unwrap().is_empty());
     let b = agent(&s, "frontend", Some("/repo"));
@@ -531,6 +559,7 @@ fn self_send_is_refused() {
             1,
             Path::new("/repo"),
             &names(&["docs"]),
+            NOT_ALIVE,
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidRecipient(_)), "{err:?}");
@@ -559,6 +588,7 @@ fn insert_held_delivers_and_holds_atomically() {
             1,
             repo,
             &names(&["docs", "qa"]),
+            NOT_ALIVE,
         )
         .unwrap();
     assert_eq!(m.to, vec![b.clone()]);
@@ -574,7 +604,13 @@ fn insert_held_delivers_and_holds_atomically() {
 
     // Nothing is stored when any part fails.
     let err = s
-        .insert_held(note(&a, &[], "Bad", "x"), 1, repo, &names(&["Not A Name"]))
+        .insert_held(
+            note(&a, &[], "Bad", "x"),
+            1,
+            repo,
+            &names(&["Not A Name"]),
+            NOT_ALIVE,
+        )
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidName(_)), "{err:?}");
     let err = s
@@ -583,11 +619,12 @@ fn insert_held_delivers_and_holds_atomically() {
             1,
             Path::new("rel"),
             &names(&["docs"]),
+            NOT_ALIVE,
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
     let err = s
-        .insert_held(note(&a, &[], "Bad", "x"), 1, repo, &[])
+        .insert_held(note(&a, &[], "Bad", "x"), 1, repo, &[], NOT_ALIVE)
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
     assert!(s.search("Bad").unwrap().is_empty());
@@ -603,6 +640,7 @@ fn held_repo_path_is_normalized() {
             1,
             Path::new("/repo/"),
             &names(&["frontend"]),
+            NOT_ALIVE,
         )
         .unwrap();
     let m2 = s
@@ -611,6 +649,7 @@ fn held_repo_path_is_normalized() {
             2,
             Path::new("/repo/./"),
             &names(&["frontend"]),
+            NOT_ALIVE,
         )
         .unwrap();
     let m3 = s
@@ -619,6 +658,7 @@ fn held_repo_path_is_normalized() {
             3,
             Path::new("/repo/sub/.."),
             &names(&["frontend"]),
+            NOT_ALIVE,
         )
         .unwrap();
     let m4 = s
@@ -627,6 +667,7 @@ fn held_repo_path_is_normalized() {
             4,
             Path::new("/../repo/x/../"),
             &names(&["frontend"]),
+            NOT_ALIVE,
         )
         .unwrap();
     // The agent's own repo may be spelled with `..` as well.
@@ -669,6 +710,7 @@ fn release_held_checks_agent_matches_name_and_repo() {
             1,
             repo,
             &names(&["frontend"]),
+            NOT_ALIVE,
         )
         .unwrap();
     // Wrong name.
@@ -790,7 +832,13 @@ fn released_held_question_is_open_to_its_new_recipient() {
     let repo = Path::new("/repo");
     let a = agent(&s, "backend", Some("/repo"));
     let q = s
-        .insert_held(question(&a, &[], "Q"), 1, repo, &names(&["docs"]))
+        .insert_held(
+            question(&a, &[], "Q"),
+            1,
+            repo,
+            &names(&["docs"]),
+            NOT_ALIVE,
+        )
         .unwrap();
     assert_eq!(open_question_threads(&s), 1);
     let d = agent(&s, "docs", Some("/repo"));
@@ -834,6 +882,7 @@ fn answer_without_parent_is_refused() {
             1,
             Path::new("/repo"),
             &names(&["docs"]),
+            NOT_ALIVE,
         )
         .unwrap_err();
     assert_eq!(
@@ -922,4 +971,70 @@ fn release_held_to_agent_with_relative_cwd_is_a_repo_mismatch() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn release_held_skips_mail_already_delivered_to_the_agent() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    let f = agent(&s, "frontend", Some("/repo"));
+    let q = s
+        .insert_message(question(&a, &[&f], "Already yours"), 1)
+        .unwrap();
+    s.hold_for_name(repo, "frontend", &q.id).unwrap();
+    let released = s.release_held(repo, "frontend", &f).unwrap();
+    assert!(released.is_empty(), "already delivered: {released:?}");
+    assert_eq!(s.get_message(&q.id).unwrap().unwrap().to, vec![f.clone()]);
+    assert_eq!(ids(&s.inbox(&f, false).unwrap()), vec![q.id.as_str()]);
+    // The hold is gone: a later frontend gets nothing.
+    let g = agent(&s, "frontend", Some("/repo"));
+    assert!(s.release_held(repo, "frontend", &g).unwrap().is_empty());
+}
+
+#[test]
+fn insert_held_refuses_when_an_active_agent_has_the_name() {
+    let (_d, s) = store();
+    let repo = Path::new("/repo");
+    let a = agent(&s, "backend", Some("/repo"));
+    // frontend registered after the sender resolved the name.
+    let f = live_agent(&s, "frontend", "/repo/.", 7);
+    let err = s
+        .insert_held(
+            note(&a, &[], "For frontend", "hi"),
+            1,
+            repo,
+            &names(&["frontend"]),
+            &|_| true,
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::RecipientRegistered(_)), "{err:?}");
+    // Nothing was stored: no message, nothing held.
+    assert!(s.search("For frontend").unwrap().is_empty());
+    assert!(s.release_held(repo, "frontend", &f).unwrap().is_empty());
+    // A gone (not live) agent with the name does not block holding.
+    let m = s
+        .insert_held(
+            note(&a, &[], "For frontend", "hi"),
+            2,
+            repo,
+            &names(&["frontend"]),
+            NOT_ALIVE,
+        )
+        .unwrap();
+    // Nor does an active agent with that name in another repo.
+    let _elsewhere = live_agent(&s, "docs", "/other", 8);
+    s.insert_held(
+        note(&a, &[], "For docs", "x"),
+        3,
+        repo,
+        &names(&["docs"]),
+        &|_| true,
+    )
+    .unwrap();
+    let g = agent(&s, "frontend", Some("/repo"));
+    assert_eq!(
+        ids(&s.release_held(repo, "frontend", &g).unwrap()),
+        vec![m.id.as_str()]
+    );
 }
