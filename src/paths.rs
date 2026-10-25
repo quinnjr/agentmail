@@ -27,19 +27,27 @@ impl Paths {
     /// Data dir: `AGENTMAIL_DATA_DIR`, else `$XDG_DATA_HOME/agentmail`, else
     /// `$HOME/.local/share/agentmail`. Socket: `AGENTMAIL_SOCKET`, else
     /// `$XDG_RUNTIME_DIR/agentmail.sock`, else `<data_dir>/agentmail.sock`.
+    ///
+    /// This is a thin wrapper over [`Paths::from_vars`]; the tests exercise
+    /// `from_vars` directly to avoid mutating the process environment.
     pub fn from_env() -> Result<Paths> {
         Self::from_vars(|k| std::env::var(k).ok())
     }
 
     /// Resolve paths from an arbitrary variable lookup. Empty values count as unset.
+    ///
+    /// Per the XDG Base Directory spec, relative `XDG_DATA_HOME` and
+    /// `XDG_RUNTIME_DIR` values are ignored, as is a relative `HOME`, so every
+    /// process resolves the same paths regardless of its working directory.
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Paths> {
         let var = |k: &str| get(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let abs_var = |k: &str| var(k).filter(|p| p.is_absolute());
 
         let data_dir = if let Some(dir) = var("AGENTMAIL_DATA_DIR") {
             dir
-        } else if let Some(xdg) = var("XDG_DATA_HOME") {
+        } else if let Some(xdg) = abs_var("XDG_DATA_HOME") {
             xdg.join("agentmail")
-        } else if let Some(home) = var("HOME") {
+        } else if let Some(home) = abs_var("HOME") {
             home.join(".local").join("share").join("agentmail")
         } else {
             bail!("cannot locate data directory: set HOME, XDG_DATA_HOME or AGENTMAIL_DATA_DIR");
@@ -47,7 +55,7 @@ impl Paths {
 
         let socket = if let Some(sock) = var("AGENTMAIL_SOCKET") {
             sock
-        } else if let Some(run) = var("XDG_RUNTIME_DIR") {
+        } else if let Some(run) = abs_var("XDG_RUNTIME_DIR") {
             run.join(SOCKET_FILE)
         } else {
             data_dir.join(SOCKET_FILE)
@@ -138,6 +146,26 @@ mod tests {
             p.socket,
             PathBuf::from("/home/u/.local/share/agentmail/agentmail.sock")
         );
+    }
+
+    #[test]
+    fn paths_relative_runtime_dir_is_ignored() {
+        let p = Paths::from_vars(vars(&[("HOME", "/home/u"), ("XDG_RUNTIME_DIR", "rel")])).unwrap();
+        assert_eq!(
+            p.socket,
+            PathBuf::from("/home/u/.local/share/agentmail/agentmail.sock")
+        );
+    }
+
+    #[test]
+    fn paths_relative_xdg_data_home_is_ignored() {
+        let p = Paths::from_vars(vars(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "rel")])).unwrap();
+        assert_eq!(p.data_dir, PathBuf::from("/home/u/.local/share/agentmail"));
+    }
+
+    #[test]
+    fn paths_relative_home_is_ignored() {
+        assert!(Paths::from_vars(vars(&[("HOME", "rel")])).is_err());
     }
 
     #[test]
