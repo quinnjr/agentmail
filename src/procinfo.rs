@@ -25,18 +25,33 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 
 /// The ancestors of `pid`, nearest (the parent) first. Excludes `pid` itself
 /// and ends at PID 1, or earlier if a parent is outside our PID namespace or
-/// exits during the walk.
+/// exits during the walk (including when its PID is reused).
 pub fn ancestors(pid: u32) -> Vec<ProcId> {
+    walk_ancestors(pid, read_stat)
+}
+
+/// The ancestry walk behind [`ancestors`], with the `/proc/<pid>/stat` reader
+/// injected so the walk can be tested against a fake process table.
+fn walk_ancestors(pid: u32, read: impl Fn(u32) -> Option<(u32, u64)>) -> Vec<ProcId> {
     let mut chain = Vec::new();
-    let mut cur = pid;
-    while cur > 1 && chain.len() < MAX_ANCESTRY_DEPTH {
-        let Some(ppid) = parent_pid(cur) else { break };
-        if ppid == 0 {
+    let Some((mut ppid, mut child_start)) = read(pid) else {
+        return chain;
+    };
+    while ppid > 0 && chain.len() < MAX_ANCESTRY_DEPTH {
+        let Some((next_ppid, start_time)) = read(ppid) else {
+            break;
+        };
+        // PID-reuse guard: a real parent cannot start after its child, so a
+        // later start time means the parent exited and its PID was reused.
+        if start_time > child_start {
             break;
         }
-        let Some(parent) = proc_id(ppid) else { break };
-        chain.push(parent);
-        cur = ppid;
+        chain.push(ProcId {
+            pid: ppid,
+            start_time,
+        });
+        child_start = start_time;
+        ppid = next_ppid;
     }
     chain
 }
@@ -109,6 +124,8 @@ mod tests {
 
     #[test]
     fn procinfo_parse_stat_handles_parens_and_spaces_in_comm() {
+        // Literal form: "123 (we (ird) x) S 45 0 0 ... 0 987654 1 2 3",
+        // i.e. fields 5..=21 are "0" and field 22 (starttime) is 987654.
         let mut fields = vec!["S", "45"];
         // fields 5..=21 then starttime (22)
         fields.extend(std::iter::repeat_n("0", 17));
@@ -123,6 +140,47 @@ mod tests {
         assert_eq!(parse_stat("no paren here"), None);
         assert_eq!(parse_stat("1 (x) S"), None);
         assert_eq!(parse_stat("1 (x) S notanumber"), None);
+    }
+
+    #[test]
+    fn procinfo_parse_stat_literal_line() {
+        let line = "123 (we (ird) x) S 45 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 987654 1 2 3";
+        assert_eq!(parse_stat(line), Some((45, 987654)));
+    }
+
+    #[test]
+    fn procinfo_walk_ancestors_follows_chain_to_init() {
+        let table = std::collections::HashMap::from([
+            (30, (20, 300)),
+            (20, (10, 200)),
+            (10, (1, 100)),
+            (1, (0, 1)),
+        ]);
+        let chain = walk_ancestors(30, |p| table.get(&p).copied());
+        let pids: Vec<u32> = chain.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![20, 10, 1]);
+        assert_eq!(chain[0].start_time, 200);
+    }
+
+    #[test]
+    fn procinfo_walk_ancestors_stops_at_reused_parent_pid() {
+        // PID 10 was reused by a process that started after its "child" 20.
+        let table = std::collections::HashMap::from([
+            (30, (20, 300)),
+            (20, (10, 200)),
+            (10, (1, 250)),
+            (1, (0, 1)),
+        ]);
+        let chain = walk_ancestors(30, |p| table.get(&p).copied());
+        let pids: Vec<u32> = chain.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![20]);
+    }
+
+    #[test]
+    fn procinfo_walk_ancestors_stops_at_missing_parent() {
+        let table = std::collections::HashMap::from([(30, (20, 300))]);
+        assert!(walk_ancestors(30, |p| table.get(&p).copied()).is_empty());
+        assert!(walk_ancestors(99, |p| table.get(&p).copied()).is_empty());
     }
 
     #[test]
@@ -191,30 +249,51 @@ mod tests {
             assert!(ancestors(u32::MAX - 1).is_empty());
         }
 
+        /// Kills the fake harness and its backgrounded grandchild on drop, so
+        /// neither leaks even when the test panics part-way through.
+        struct Cleanup {
+            child: std::process::Child,
+            grandchild: Option<u32>,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(pid) = self.grandchild {
+                    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
         #[test]
         fn procinfo_harness_ancestor_of_claude_like_parent() {
             // A child running under a process named "claude" finds it.
             let dir = tempfile::tempdir().unwrap();
             let fake = dir.path().join("claude");
             std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
-            let mut out = Command::new(&fake)
-                .arg("-c")
-                .arg("sleep 5 & echo $!; wait")
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
+            let mut guard = Cleanup {
+                child: Command::new(&fake)
+                    .arg("-c")
+                    .arg("sleep 5 & echo $!; wait")
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+                grandchild: None,
+            };
+            let harness_pid = guard.child.id();
             let mut line = String::new();
             use std::io::BufRead;
-            std::io::BufReader::new(out.stdout.take().unwrap())
+            std::io::BufReader::new(guard.child.stdout.take().unwrap())
                 .read_line(&mut line)
                 .unwrap();
             let grandchild: u32 = line.trim().parse().unwrap();
+            guard.grandchild = Some(grandchild);
             let found = find_harness_ancestor(grandchild);
-            let _ = out.kill();
-            let _ = out.wait();
+            drop(guard);
             let (p, h) = found.expect("harness ancestor");
             assert_eq!(h, Harness::ClaudeCode);
-            assert_eq!(p.pid, out.id());
+            assert_eq!(p.pid, harness_pid);
         }
     }
 }
