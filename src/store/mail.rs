@@ -36,7 +36,11 @@ pub struct NewMessage {
 }
 
 /// Which threads [`Store::threads`] returns. Every set field must match.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Missing fields deserialize to their defaults, so a client may send a
+/// partial filter such as `{}` or `{"agent":"x"}`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
 pub struct ThreadFilter {
     /// Threads this address (an agent or `human`) sent or received in.
     pub agent: Option<String>,

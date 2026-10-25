@@ -1038,3 +1038,35 @@ fn insert_held_refuses_when_an_active_agent_has_the_name() {
         vec![m.id.as_str()]
     );
 }
+
+#[test]
+fn thread_filter_round_trips_through_json() {
+    let default = ThreadFilter::default();
+    let json = serde_json::to_string(&default).unwrap();
+    let back: ThreadFilter = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, default);
+
+    let full = ThreadFilter {
+        agent: Some("x".into()),
+        repo: Some(PathBuf::from("/r")),
+        open_questions: true,
+    };
+    let json = serde_json::to_string(&full).unwrap();
+    let back: ThreadFilter = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, full);
+}
+
+#[test]
+fn thread_filter_accepts_partial_json() {
+    let empty: ThreadFilter = serde_json::from_str("{}").unwrap();
+    assert_eq!(empty, ThreadFilter::default());
+
+    let partial: ThreadFilter = serde_json::from_str(r#"{"agent":"x"}"#).unwrap();
+    assert_eq!(
+        partial,
+        ThreadFilter {
+            agent: Some("x".into()),
+            ..ThreadFilter::default()
+        }
+    );
+}
