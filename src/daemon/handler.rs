@@ -19,6 +19,9 @@ use crate::procinfo;
 use crate::protocol::{Caller, ClientError, ErrorCode, Event, Request};
 use crate::store::{NewMessage, RegisterReq, Store, StoreError, lexical};
 
+/// How stale an agent's `last_seen` may get before a request refreshes it.
+pub const TOUCH_INTERVAL_MS: i64 = 1000;
+
 /// Shared state behind every connection.
 pub struct Handler {
     store: Arc<Store>,
@@ -94,29 +97,35 @@ impl Handler {
     }
 
     /// Who `c` is: an agent address or [`HUMAN`]. Records activity for an
-    /// agent.
+    /// agent, at most once per [`TOUCH_INTERVAL_MS`]: `touch` is a durable
+    /// write, and most requests (counts, inbox polls) are read-only.
     pub fn resolve_caller(&self, c: &Caller) -> Result<String, ClientError> {
-        let address = match c {
+        let agent = match c {
             Caller::Human => return Ok(HUMAN.to_string()),
             Caller::Address { address } => {
-                let known =
-                    address != HUMAN && self.store.get_agent(address).map_err(store_err)?.is_some();
-                if !known {
-                    return Err(ClientError::new(
+                let found = if address == HUMAN {
+                    None
+                } else {
+                    self.store.get_agent(address).map_err(store_err)?
+                };
+                found.ok_or_else(|| {
+                    ClientError::new(
                         ErrorCode::NoIdentity,
                         format!(
                             "{address:?} is not a registered address: run \
                              `agentmail register <name>` (or use --as human)"
                         ),
-                    ));
-                }
-                address.clone()
+                    )
+                })?
             }
             Caller::Procs { .. } => return Err(unimplemented("process-ancestry callers")),
         };
-        // Best effort: a failed touch never fails the request.
-        let _ = self.store.touch(&address, now_ms());
-        Ok(address)
+        let now = now_ms();
+        if now.saturating_sub(agent.last_seen) >= TOUCH_INTERVAL_MS {
+            // Best effort: a failed touch never fails the request.
+            let _ = self.store.touch(&agent.address, now);
+        }
+        Ok(agent.address)
     }
 
     fn view(&self, agent: Agent, contacts: &HashSet<String>) -> AgentView {

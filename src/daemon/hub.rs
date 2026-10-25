@@ -5,6 +5,9 @@ use tokio::sync::broadcast;
 use crate::protocol::Event;
 
 /// How many events a slow subscriber may fall behind before it skips some.
+/// Delivery is best effort: a subscriber that lags must not treat the hub
+/// as the record of what happened. Watchers are told and their stream ends;
+/// anything that waits on the hub must re-check the store after a lag.
 const CAPACITY: usize = 1024;
 
 /// Broadcasts [`Event`]s to every subscriber.

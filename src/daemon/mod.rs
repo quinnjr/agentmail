@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
@@ -23,7 +23,7 @@ use self::handler::Handler;
 use self::hub::{Hub, involves};
 use crate::paths::Paths;
 use crate::protocol::{
-    ClientError, Envelope, ErrorCode, MAX_REQUEST_BYTES, PROTOCOL_VERSION, Request, Response,
+    ClientError, Envelope, ErrorCode, Event, MAX_REQUEST_BYTES, PROTOCOL_VERSION, Request, Response,
 };
 use crate::store::Store;
 
@@ -72,14 +72,74 @@ async fn open_store(path: &Path) -> Result<Store> {
     }
 }
 
+/// Bind a listener at `socket` that is never reachable with looser
+/// permissions than 0600.
+///
+/// The socket is bound inside a fresh private (0700) directory next to
+/// `socket`, restricted to 0600 there, and only then renamed onto `socket`
+/// (replacing any leftover file). Binding directly would create the socket
+/// with the process umask, leaving it connectable by others until the
+/// chmod. The umask itself is process-wide, so changing it is not an
+/// option in a multi-threaded process.
+fn bind_private(socket: &Path) -> Result<UnixListener> {
+    let parent = socket
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = socket
+        .file_name()
+        .with_context(|| format!("{} has no file name", socket.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp");
+    let tmp_dir = parent.join(tmp_name);
+    let tmp_sock = tmp_dir.join("s");
+
+    // A crashed predecessor may have left the staging directory behind.
+    // We hold the lock, so nothing else is using it. Never remove more
+    // than what we put there.
+    match std::fs::remove_file(&tmp_sock) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", tmp_sock.display())),
+    }
+    match std::fs::remove_dir(&tmp_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", tmp_dir.display())),
+    }
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&tmp_dir)
+        .with_context(|| format!("creating {}", tmp_dir.display()))?;
+
+    let staged = (|| -> Result<UnixListener> {
+        let listener = UnixListener::bind(&tmp_sock)
+            .with_context(|| format!("binding {}", tmp_sock.display()))?;
+        std::fs::set_permissions(&tmp_sock, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", tmp_sock.display()))?;
+        std::fs::rename(&tmp_sock, socket)
+            .with_context(|| format!("moving {} to {}", tmp_sock.display(), socket.display()))?;
+        Ok(listener)
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp_sock);
+    }
+    let _ = std::fs::remove_dir(&tmp_dir);
+    staged
+}
+
 /// Run the daemon until a client sends `Shutdown` or the socket file is
 /// removed or replaced.
 ///
 /// Startup: create the data directory (mode 0700) and take an exclusive
 /// lock on `paths.lock`. If another daemon holds it, return `Ok` at once
-/// without touching anything: that daemon serves. Otherwise remove any
-/// leftover socket file (no live daemon can own it while we hold the lock),
-/// bind, restrict the socket to mode 0600, open the store and accept.
+/// without touching anything: that daemon serves. Otherwise open the store
+/// (so a database that cannot be opened never leaves a socket behind),
+/// then put a mode-0600 socket in place of any leftover one (no live daemon
+/// can own it while we hold the lock) and accept. Every fallible startup
+/// step runs before the socket appears, so a daemon that fails to start
+/// never leaves a socket without a listener behind.
 pub async fn serve(cfg: DaemonConfig) -> Result<()> {
     let paths = cfg.paths;
     create_private_dir(&paths.data_dir)?;
@@ -98,22 +158,17 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
         }
     }
 
+    let store = Arc::new(open_store(&paths.db).await?);
+
     if let Some(parent) = paths.socket.parent() {
         create_private_dir(parent)?;
     }
-    match std::fs::remove_file(&paths.socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| format!("removing {}", paths.socket.display()));
-        }
-    }
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("binding {}", paths.socket.display()))?;
-    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
-    let socket_id = file_id(&paths.socket).context("socket vanished after bind")?;
+    let listener = bind_private(&paths.socket)?;
+    let Some(socket_id) = file_id(&paths.socket) else {
+        // Someone removed it already; there is nothing of ours to clean up.
+        anyhow::bail!("{} vanished after bind", paths.socket.display());
+    };
 
-    let store = Arc::new(open_store(&paths.db).await?);
     let store_ref = Arc::downgrade(&store);
     let handler = Arc::new(Handler::new(store, Hub::new()));
 
@@ -184,7 +239,7 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<Frame> 
     Ok(Frame::Line(buf))
 }
 
-async fn write_response(w: &mut OwnedWriteHalf, resp: &Response) -> io::Result<()> {
+async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> io::Result<()> {
     let mut line = serde_json::to_vec(resp).map_err(io::Error::other)?;
     line.push(b'\n');
     w.write_all(&line).await?;
@@ -264,7 +319,8 @@ async fn connection(stream: UnixStream, handler: Arc<Handler>, stop: watch::Send
     }
 }
 
-/// Stream hub events to the client until it disconnects.
+/// Acknowledge a watch and stream hub events to the client until it
+/// disconnects.
 async fn watch_events(
     reader: &mut BufReader<OwnedReadHalf>,
     w: &mut OwnedWriteHalf,
@@ -273,13 +329,32 @@ async fn watch_events(
 ) {
     // Subscribe before acknowledging, so nothing published after the
     // client sees `Ok` is missed.
-    let mut rx = hub.subscribe();
+    let rx = hub.subscribe();
     if write_response(w, &Response::Ok { data: Value::Null })
         .await
         .is_err()
     {
         return;
     }
+    stream_events(reader, w, rx, agent).await;
+}
+
+/// Forward events from `rx` (those involving `agent`, or all) to `w` until
+/// the client disconnects or the hub closes.
+///
+/// A watcher that falls so far behind that the hub drops events for it is
+/// told so with an `Internal` error and the stream ends: a silent gap would
+/// look like nothing happened. The client can watch again and re-read the
+/// store for what it missed.
+async fn stream_events<R, W>(
+    reader: &mut R,
+    w: &mut W,
+    mut rx: broadcast::Receiver<Event>,
+    agent: Option<&str>,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut scratch = [0u8; 1024];
     loop {
         tokio::select! {
@@ -292,7 +367,14 @@ async fn watch_events(
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    let err = ClientError::new(
+                        ErrorCode::Internal,
+                        format!("watch fell behind; {n} events dropped"),
+                    );
+                    let _ = write_response(w, &err.into_response()).await;
+                    return;
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
             n = reader.read(&mut scratch) => match n {
@@ -301,5 +383,93 @@ async fn watch_events(
                 Ok(_) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Agent, AgentView, Harness, Presence};
+    use std::path::PathBuf;
+    use tokio::io::{AsyncBufReadExt, duplex};
+
+    fn presence(address: &str) -> Event {
+        Event::Presence {
+            agent: AgentView {
+                agent: Agent {
+                    address: address.into(),
+                    name: "a".into(),
+                    role: None,
+                    working_on: None,
+                    harness: Harness::Other,
+                    cwd: PathBuf::from("/w"),
+                    repo: None,
+                    proc_id: None,
+                    wake: false,
+                    registered_at: 0,
+                    last_seen: 0,
+                    signed_off: false,
+                },
+                presence: Presence::Active,
+                is_contact: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn lagged_watch_reports_dropped_events_and_ends() {
+        let (tx, rx) = broadcast::channel(2);
+        for i in 0..5 {
+            tx.send(presence(&format!("a-{i}"))).unwrap();
+        }
+        // The client end stays open and silent; only the lag ends the stream.
+        let (_client_in, mut daemon_in) = duplex(64);
+        let (mut daemon_out, client_out) = duplex(64 * 1024);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut daemon_in, &mut daemon_out, rx, None),
+        )
+        .await
+        .expect("stream did not end after lagging");
+        drop(daemon_out);
+
+        let mut lines = BufReader::new(client_out).lines();
+        let first: Response =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        match first {
+            Response::Err { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Internal);
+                assert!(message.contains("3 events dropped"), "{message}");
+            }
+            other => panic!("expected a lag error, got {other:?}"),
+        }
+        assert!(lines.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_forwards_filtered_events_until_eof() {
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(presence("x-1")).unwrap();
+        tx.send(presence("y-1")).unwrap();
+        let (client_in, mut daemon_in) = duplex(64);
+        let (mut daemon_out, client_out) = duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            stream_events(&mut daemon_in, &mut daemon_out, rx, Some("y-1")).await;
+        });
+        let mut lines = BufReader::new(client_out).lines();
+        let first: Response =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            first,
+            Response::Event {
+                event: presence("y-1")
+            }
+        );
+        drop(client_in);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stream did not end at EOF")
+            .unwrap();
+        drop(tx);
     }
 }

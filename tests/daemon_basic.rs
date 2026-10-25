@@ -8,10 +8,12 @@ use std::pin::pin;
 use std::time::{Duration, Instant};
 
 use agentmail::client::Client;
+use agentmail::daemon::handler::TOUCH_INTERVAL_MS;
+use agentmail::daemon::{DaemonConfig, serve};
 use agentmail::model::HUMAN;
 use agentmail::paths::Paths;
 use agentmail::protocol::{
-    Caller, Envelope, ErrorCode, Event, PROTOCOL_VERSION, Request, Response,
+    Caller, Envelope, ErrorCode, Event, MAX_REQUEST_BYTES, PROTOCOL_VERSION, Request, Response,
 };
 use common::{TestDaemon, agent, bin, register, send_req};
 use futures_util::StreamExt;
@@ -822,4 +824,112 @@ async fn client_shutdown_reports_whether_a_daemon_answered() {
     let fake = spawn_old_daemon(&paths);
     assert!(Client::shutdown(&paths).await.unwrap());
     assert_eq!(fake.await.unwrap(), vec![vec!["shutdown"]]);
+}
+
+#[tokio::test]
+async fn oversized_request_is_too_large_and_closes_the_connection() {
+    let d = TestDaemon::start().await;
+    let stream = UnixStream::connect(&d.paths.socket).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    // One byte past the limit, with no newline. The daemon stops reading
+    // there, so write from a task and ignore a broken pipe.
+    let writer = tokio::spawn(async move {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut left = MAX_REQUEST_BYTES + 1;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            if w.write_all(&chunk[..n]).await.is_err() {
+                break;
+            }
+            left -= n;
+        }
+        w
+    });
+    let mut reader = BufReader::new(r);
+    let mut buf = String::new();
+    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut buf))
+        .await
+        .expect("no response to an oversized request")
+        .unwrap();
+    let resp: Response = serde_json::from_str(&buf).unwrap();
+    assert_eq!(err_code(&resp), ErrorCode::TooLarge, "{resp:?}");
+    buf.clear();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+        .await
+        .expect("connection stayed open")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF, got {buf:?}");
+    drop(writer.await.unwrap());
+
+    let mut c = d.client().await;
+    let me = c.call(&Caller::Human, Request::Whoami).await.unwrap();
+    assert_eq!(me["address"], HUMAN);
+}
+
+#[tokio::test]
+async fn unopenable_store_fails_without_leaving_a_socket() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    std::fs::create_dir(&paths.db).unwrap();
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        serve(DaemonConfig {
+            paths: paths.clone(),
+        }),
+    )
+    .await
+    .expect("serve hung");
+    assert!(
+        res.is_err(),
+        "serve succeeded with a directory for a database"
+    );
+    assert!(
+        std::fs::symlink_metadata(&paths.socket).is_err(),
+        "socket left behind"
+    );
+}
+
+#[tokio::test]
+async fn bind_leaves_no_staging_files_and_replaces_leftovers() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    // A crashed predecessor's staging directory and socket.
+    let staging = dir.path().join(".agentmail.sock.tmp");
+    std::fs::create_dir(&staging).unwrap();
+    let _old = std::os::unix::net::UnixListener::bind(staging.join("s")).unwrap();
+    std::fs::write(&paths.socket, b"stale").unwrap();
+
+    let d = TestDaemon::start_in(dir).await;
+    let mut c = d.client().await;
+    c.call(&Caller::Human, Request::Whoami).await.unwrap();
+    assert!(!staging.exists(), "staging directory left behind");
+    let mode = std::fs::metadata(&d.paths.socket)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn last_seen_is_refreshed_at_most_once_per_interval() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let a = register(&mut c, "poller", d.dir.path()).await;
+    let seen = |v: &Value| v["agent"]["last_seen"].as_i64().unwrap();
+    let t0 = seen(&c.call(&agent(&a), Request::Whoami).await.unwrap());
+
+    // Requests inside the interval do not write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.call(&agent(&a), Request::Counts).await.unwrap();
+    let t1 = seen(&c.call(&agent(&a), Request::Whoami).await.unwrap());
+    assert_eq!(t1, t0, "last_seen was rewritten within the interval");
+
+    // Once the interval has passed, a request refreshes it.
+    tokio::time::sleep(Duration::from_millis(TOUCH_INTERVAL_MS as u64 + 100)).await;
+    c.call(&agent(&a), Request::Counts).await.unwrap();
+    let t2 = seen(&c.call(&agent(&a), Request::Whoami).await.unwrap());
+    assert!(
+        t2 >= t0 + TOUCH_INTERVAL_MS,
+        "last_seen did not advance: {t0} -> {t2}"
+    );
 }

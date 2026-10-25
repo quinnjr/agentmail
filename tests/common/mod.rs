@@ -28,7 +28,11 @@ pub struct TestDaemon {
 impl TestDaemon {
     /// Start a daemon and wait until it accepts connections.
     pub async fn start() -> TestDaemon {
-        let dir = TempDir::new().unwrap();
+        TestDaemon::start_in(TempDir::new().unwrap()).await
+    }
+
+    /// Start a daemon serving from `dir`, which may already hold files.
+    pub async fn start_in(dir: TempDir) -> TestDaemon {
         let paths = Paths::in_dir(dir.path());
         let mut daemon = TestDaemon {
             dir,
