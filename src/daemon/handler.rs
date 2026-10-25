@@ -1120,6 +1120,10 @@ impl Handler {
                 self.resolve_caller(caller)?;
                 to_json(&self.store.threads(&filter).map_err(store_err)?)
             }
+            Request::ResolveId { id } => {
+                self.resolve_caller(caller)?;
+                to_json(&self.store.ids_ending_with(&id).map_err(store_err)?)
+            }
             Request::Search { query } => {
                 self.resolve_caller(caller)?;
                 to_json(&self.store.search(&query).map_err(store_err)?)

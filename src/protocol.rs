@@ -164,6 +164,12 @@ pub enum Request {
         #[serde(default)]
         filter: ThreadFilter,
     },
+    /// The full ids of every message (or thread) whose id ends with `id`,
+    /// compared without regard to case; resolves the short ids the CLI
+    /// prints. Data: `[id]`.
+    ResolveId {
+        id: String,
+    },
     Search {
         query: String,
     },
@@ -306,6 +312,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Request::Shutdown).unwrap(),
             json!({"op":"shutdown"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::ResolveId { id: "x".into() }).unwrap(),
+            json!({"op":"resolve_id","id":"x"})
         );
         let err = ClientError::new(ErrorCode::VersionMismatch, "x").into_response();
         assert_eq!(

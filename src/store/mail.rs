@@ -699,6 +699,24 @@ impl Store {
         get_json(&messages, id)
     }
 
+    /// The ids of every stored message (thread ids included, as a thread's
+    /// id is its root message's) ending with `suffix`, compared without
+    /// regard to case. In id order.
+    pub fn ids_ending_with(&self, suffix: &str) -> Result<Vec<String>, StoreError> {
+        let want = suffix.to_ascii_uppercase();
+        let txn = self.read()?;
+        let messages = txn.open_table(MESSAGES)?;
+        let mut out = Vec::new();
+        for row in messages.iter()? {
+            let (k, _) = row?;
+            let id = k.value();
+            if id.to_ascii_uppercase().ends_with(&want) {
+                out.push(id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// Every message in a thread, ordered by id; empty if there is no such
     /// thread.
     pub fn thread(&self, thread_id: &str) -> Result<Vec<Message>, StoreError> {

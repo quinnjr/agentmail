@@ -302,27 +302,62 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(total))
 }
 
-/// The error for a body over the limit; `size` is its length in bytes.
-fn too_large(size: u64) -> anyhow::Error {
+/// How much of a body was read: all of it, or more than a stopping point
+/// before the end was reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Size {
+    Exact(u64),
+    MoreThan(u64),
+}
+
+impl Size {
+    fn over_limit(self) -> bool {
+        match self {
+            Size::Exact(n) => n > MAX_BODY_BYTES as u64,
+            Size::MoreThan(n) => n >= MAX_BODY_BYTES as u64,
+        }
+    }
+}
+
+impl std::fmt::Display for Size {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Size::Exact(n) => write!(f, "{n} bytes"),
+            Size::MoreThan(n) => write!(f, "more than {n} bytes"),
+        }
+    }
+}
+
+/// How much of an over-long stdin body is read (and discarded) before
+/// giving up: enough that a writer of a modestly oversized body never sees
+/// a broken pipe, bounded so an endless one (`yes | agentmail send ...`)
+/// is refused instead of hanging.
+const STDIN_DRAIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The error for a body over the limit.
+fn too_large(size: Size) -> anyhow::Error {
     ClientError::new(
         ErrorCode::TooLarge,
         format!(
-            "message body is too large: {size} bytes, the limit is {MAX_BODY_BYTES} bytes \
+            "message body is too large: {size}, the limit is {MAX_BODY_BYTES} bytes \
              (256 KiB); nothing was sent"
         ),
     )
     .into()
 }
 
-/// Read all of `r`, keeping at most `MAX_BODY_BYTES + 1` bytes. The rest is
-/// drained (so a writer never sees a broken pipe) and only counted.
-fn read_capped(mut r: impl Read) -> Result<(Vec<u8>, u64)> {
+/// Read `r` to its end or until more than `stop_after` bytes have been
+/// seen, keeping at most `MAX_BODY_BYTES + 1` bytes. Bytes past the cap are
+/// only counted.
+fn read_capped(mut r: impl Read, stop_after: u64) -> Result<(Vec<u8>, Size)> {
     let cap = MAX_BODY_BYTES + 1;
     let mut kept = Vec::new();
     let mut total: u64 = 0;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = match r.read(&mut buf) {
+        // Never ask for more than one byte past the stop.
+        let want = (stop_after + 1 - total).min(buf.len() as u64) as usize;
+        let n = match r.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -331,15 +366,18 @@ fn read_capped(mut r: impl Read) -> Result<(Vec<u8>, u64)> {
         total += n as u64;
         let room = cap.saturating_sub(kept.len());
         kept.extend_from_slice(&buf[..n.min(room)]);
+        if total > stop_after {
+            return Ok((kept, Size::MoreThan(stop_after)));
+        }
     }
-    Ok((kept, total))
+    Ok((kept, Size::Exact(total)))
 }
 
 /// A body's bytes as text: refused, never truncated, when it is over the
 /// limit; refused when it is not UTF-8.
-fn body_text(bytes: Vec<u8>, total: u64) -> Result<String> {
-    if total > MAX_BODY_BYTES as u64 {
-        return Err(too_large(total));
+fn body_text(bytes: Vec<u8>, size: Size) -> Result<String> {
+    if size.over_limit() {
+        return Err(too_large(size));
     }
     String::from_utf8(bytes).map_err(|e| {
         anyhow!(
@@ -352,17 +390,23 @@ fn body_text(bytes: Vec<u8>, total: u64) -> Result<String> {
 /// The body from whichever source was given, byte for byte.
 fn read_body(b: &BodyArgs) -> Result<String> {
     if let Some(text) = &b.body {
-        return body_text(text.clone().into_bytes(), text.len() as u64);
+        return body_text(text.clone().into_bytes(), Size::Exact(text.len() as u64));
     }
     if let Some(path) = &b.body_file {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("reading body file {}", path.display()))?;
-        let (bytes, total) =
-            read_capped(file).with_context(|| format!("reading body file {}", path.display()))?;
-        return body_text(bytes, total);
+        let context = || format!("reading body file {}", path.display());
+        let file = std::fs::File::open(path).with_context(context)?;
+        // A regular file's length is known up front; anything else (a
+        // device, a FIFO) is read no further than one byte past the limit.
+        let meta = file.metadata().with_context(context)?;
+        if meta.is_file() && meta.len() > MAX_BODY_BYTES as u64 {
+            return Err(too_large(Size::Exact(meta.len())));
+        }
+        let (bytes, size) = read_capped(file, MAX_BODY_BYTES as u64).with_context(context)?;
+        return body_text(bytes, size);
     }
-    let (bytes, total) = read_capped(std::io::stdin().lock()).context("reading body from stdin")?;
-    body_text(bytes, total)
+    let (bytes, size) = read_capped(std::io::stdin().lock(), STDIN_DRAIN_BYTES)
+        .context("reading body from stdin")?;
+    body_text(bytes, size)
 }
 
 /// `p` made absolute against the working directory.
@@ -456,24 +500,16 @@ impl Session {
         }
     }
 
-    /// The full id for `id`: a full id as is; otherwise the one message or
-    /// thread id in the caller's mailbox ending with it (case-insensitive).
-    /// No match passes `id` through, so the daemon reports it.
+    /// The full id for `id`: a full id upper-cased (ids are Crockford
+    /// base32, so case does not matter); otherwise the one stored message
+    /// or thread id ending with it, compared without regard to case. No
+    /// match passes `id` through, so the daemon reports it.
     async fn full_id(&mut self, id: &str) -> Result<String> {
-        if id.len() == ULID_LEN || id.is_empty() {
-            return Ok(id.to_string());
+        if let Some(full) = normalize_full_id(id) {
+            return Ok(full);
         }
-        let want = id.to_ascii_uppercase();
-        let inbox = self.call(Request::Inbox { all: true }).await?;
-        let msgs: Vec<Message> = parse(&inbox)?;
-        let mut found: Vec<String> = Vec::new();
-        for m in &msgs {
-            for cand in [&m.id, &m.thread_id] {
-                if cand.ends_with(&want) && !found.contains(cand) {
-                    found.push(cand.clone());
-                }
-            }
-        }
+        let d = self.call(Request::ResolveId { id: id.to_string() }).await?;
+        let mut found: Vec<String> = parse(&d)?;
         match found.len() {
             0 => Ok(id.to_string()),
             1 => Ok(found.remove(0)),
@@ -489,12 +525,31 @@ impl Session {
     }
 }
 
+/// `id` as a full id when it is one (upper-cased), or empty; `None` for a
+/// short id that needs looking up.
+fn normalize_full_id(id: &str) -> Option<String> {
+    (id.len() == ULID_LEN || id.is_empty()).then(|| id.to_ascii_uppercase())
+}
+
 async fn run(cli: Cli) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
     if let Command::Daemon { action } = cli.command {
         return daemon(&paths, action.unwrap_or(DaemonAction::Status)).await;
     }
     let caller = identity::cli_caller(cli.as_who.is_some());
+    if matches!(cli.command, Command::Register { .. }) && caller == Caller::Human {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "register cannot act as {HUMAN}: {HUMAN} is the reserved operator \
+                     address and never registers; drop --as {HUMAN} (and unset \
+                     AGENTMAIL_HUMAN) to register an agent"
+                ),
+            )
+            .exit();
+    }
     let client = Client::connect_or_spawn(&paths).await?;
     let mut s = Session {
         client,
@@ -1019,15 +1074,33 @@ mod tests {
     fn cli_body_limits_are_exact() {
         let at = vec![b'x'; MAX_BODY_BYTES];
         assert_eq!(
-            body_text(at.clone(), at.len() as u64).unwrap().len(),
+            body_text(at.clone(), Size::Exact(at.len() as u64))
+                .unwrap()
+                .len(),
             MAX_BODY_BYTES
         );
-        let err = body_text(vec![b'x'; MAX_BODY_BYTES + 1], MAX_BODY_BYTES as u64 + 1).unwrap_err();
+        let err = body_text(
+            vec![b'x'; MAX_BODY_BYTES + 1],
+            Size::Exact(MAX_BODY_BYTES as u64 + 1),
+        )
+        .unwrap_err();
         let ce = err.downcast_ref::<ClientError>().unwrap();
         assert_eq!(ce.code, ErrorCode::TooLarge);
-        assert!(ce.message.contains("too large"), "{}", ce.message);
         assert!(
-            body_text(vec![0xff], 1)
+            ce.message.contains("too large: 262145 bytes"),
+            "{}",
+            ce.message
+        );
+        let err = body_text(vec![], Size::MoreThan(MAX_BODY_BYTES as u64)).unwrap_err();
+        let ce = err.downcast_ref::<ClientError>().unwrap();
+        assert_eq!(ce.code, ErrorCode::TooLarge);
+        assert!(
+            ce.message.contains("too large: more than 262144 bytes"),
+            "{}",
+            ce.message
+        );
+        assert!(
+            body_text(vec![0xff], Size::Exact(1))
                 .unwrap_err()
                 .to_string()
                 .contains("UTF-8")
@@ -1035,13 +1108,72 @@ mod tests {
     }
 
     #[test]
-    fn cli_read_capped_counts_everything_but_keeps_the_cap() {
+    fn cli_read_capped_counts_up_to_the_stop_but_keeps_the_cap() {
         let data = vec![b'a'; MAX_BODY_BYTES * 2 + 7];
-        let (kept, total) = read_capped(&data[..]).unwrap();
+        let (kept, size) = read_capped(&data[..], STDIN_DRAIN_BYTES).unwrap();
         assert_eq!(kept.len(), MAX_BODY_BYTES + 1);
-        assert_eq!(total, data.len() as u64);
-        let (kept, total) = read_capped(&b"hi\r\n"[..]).unwrap();
-        assert_eq!((kept.as_slice(), total), (&b"hi\r\n"[..], 4));
+        assert_eq!(size, Size::Exact(data.len() as u64));
+        let (kept, size) = read_capped(&b"hi\r\n"[..], STDIN_DRAIN_BYTES).unwrap();
+        assert_eq!((kept.as_slice(), size), (&b"hi\r\n"[..], Size::Exact(4)));
+        // Exactly at the stop is still exact.
+        let (_, size) = read_capped(&b"abcd"[..], 4).unwrap();
+        assert_eq!(size, Size::Exact(4));
+        let (kept, size) = read_capped(&b"abcde"[..], 4).unwrap();
+        assert_eq!(size, Size::MoreThan(4));
+        assert!(kept.len() <= MAX_BODY_BYTES + 1);
+    }
+
+    #[test]
+    fn cli_read_capped_stops_on_an_endless_reader() {
+        let (kept, size) = read_capped(std::io::repeat(b'y'), MAX_BODY_BYTES as u64).unwrap();
+        assert_eq!(kept.len(), MAX_BODY_BYTES + 1);
+        assert_eq!(size, Size::MoreThan(MAX_BODY_BYTES as u64));
+        let (_, size) = read_capped(std::io::repeat(b'y'), STDIN_DRAIN_BYTES).unwrap();
+        assert_eq!(size, Size::MoreThan(STDIN_DRAIN_BYTES));
+        assert!(body_text(kept, size).is_err());
+    }
+
+    #[test]
+    fn cli_body_file_endless_is_refused() {
+        let b = BodyArgs {
+            body: None,
+            body_file: Some(PathBuf::from("/dev/zero")),
+            stdin: None,
+        };
+        let err = read_body(&b).unwrap_err();
+        let ce = err.downcast_ref::<ClientError>().unwrap();
+        assert_eq!(ce.code, ErrorCode::TooLarge);
+        assert!(
+            ce.message.contains("more than 262144 bytes"),
+            "{}",
+            ce.message
+        );
+        // A large regular file is refused with its exact size.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("big.md");
+        std::fs::write(&path, vec![b'x'; MAX_BODY_BYTES + 10]).unwrap();
+        let b = BodyArgs {
+            body: None,
+            body_file: Some(path),
+            stdin: None,
+        };
+        let err = read_body(&b).unwrap_err();
+        let ce = err.downcast_ref::<ClientError>().unwrap();
+        assert!(
+            ce.message.contains("too large: 262154 bytes"),
+            "{}",
+            ce.message
+        );
+    }
+
+    #[test]
+    fn cli_full_ulids_are_upper_cased() {
+        assert_eq!(
+            normalize_full_id("01m5te0000abcdefghjkmnpqrs"),
+            Some("01M5TE0000ABCDEFGHJKMNPQRS".to_string())
+        );
+        assert_eq!(normalize_full_id("8wgwzt7p"), None);
+        assert_eq!(normalize_full_id(""), Some(String::new()));
     }
 
     #[test]

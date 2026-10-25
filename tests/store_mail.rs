@@ -1186,3 +1186,25 @@ fn register_and_release_rejects_bad_name_without_registering() {
     assert!(matches!(err, StoreError::InvalidName(_)), "{err:?}");
     assert!(s.list_agents().unwrap().is_empty());
 }
+
+#[test]
+fn ids_ending_with_matches_any_message_case_insensitively() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let m1 = s.insert_message(note(&a, &[&b], "One", "x"), 1).unwrap();
+    let m2 = s.insert_message(note(&b, &[&a], "Two", "y"), 2).unwrap();
+    let tail = |id: &str| id[id.len() - 8..].to_string();
+    assert_eq!(
+        s.ids_ending_with(&tail(&m1.id)).unwrap(),
+        vec![m1.id.clone()]
+    );
+    assert_eq!(
+        s.ids_ending_with(&tail(&m2.id).to_ascii_lowercase())
+            .unwrap(),
+        vec![m2.id.clone()]
+    );
+    // The empty suffix matches everything; an unknown one nothing.
+    assert_eq!(s.ids_ending_with("").unwrap().len(), 2);
+    assert!(s.ids_ending_with("@@@@").unwrap().is_empty());
+}

@@ -414,6 +414,57 @@ fn answer_then_await() {
     assert_eq!(v["answer"]["body"], "ok");
     let shown = ok_text(env.as_agent(&a).args(["await", &qid]));
     assert!(shown.contains("ok"), "{shown}");
+    // The asker's short id works too, though the question is not in its
+    // inbox, in either case.
+    let short = &qid[qid.len() - 8..];
+    for id in [short.to_string(), short.to_ascii_lowercase()] {
+        let v = ok_json(env.as_agent(&a).args(["await", &id, "--json"]));
+        assert_eq!(v["status"], "answered", "{id}");
+        assert_eq!(v["question_id"], qid.as_str(), "{id}");
+    }
+    // So does the full id in lower case.
+    let v = ok_json(
+        env.as_agent(&a)
+            .args(["await", &qid.to_ascii_lowercase(), "--json"]),
+    );
+    assert_eq!(v["status"], "answered");
+    // The human can show a thread it is not addressed in by short id.
+    let shown = ok_json(env.as_human().args(["show", short, "--json"]));
+    assert_eq!(shown["thread"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn ids_are_case_insensitive() {
+    let mut env = Env::new();
+    let a = env.agent("backend");
+    let b = env.agent("frontend");
+    let id = send_stdin(&env, &a, &b, b"hi");
+    let v = ok_json(
+        env.as_agent(&b)
+            .args(["read", &id.to_ascii_lowercase(), "--json"]),
+    );
+    assert_eq!(v["id"], id.as_str());
+    let short = id[id.len() - 8..].to_ascii_lowercase();
+    let v = ok_json(env.as_agent(&b).args(["read", &short, "--json"]));
+    assert_eq!(v["id"], id.as_str());
+}
+
+#[test]
+fn register_refuses_the_human() {
+    let env = Env::new();
+    let out = env.as_human().args(["register", "foo"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("human"), "{}", text(&out.stderr));
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_HUMAN", "1")
+        .args(["register", "foo"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stdout));
+    // Nothing was registered.
+    let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
+    assert_eq!(v.as_array().unwrap().len(), 0, "{v}");
 }
 
 #[test]

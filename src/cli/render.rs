@@ -9,6 +9,8 @@ use crate::store::ThreadSummary;
 
 /// Longest working-on summary shown in a table cell, in characters.
 const SUMMARY_CELL: usize = 60;
+/// Widest role cell in the agents table, in characters.
+const ROLE_CELL: usize = 24;
 
 /// How long ago `then_ms` was, at `now_ms`, in the largest whole unit:
 /// `12s`, `14m`, `3h`, `2d`. Future times count as `0s`.
@@ -224,8 +226,8 @@ fn harness(v: &AgentView) -> String {
         .unwrap_or_default()
 }
 
-/// The agent directory: address (`*` marks a contact), presence, harness,
-/// repo (or cwd), working-on summary and last-seen.
+/// The agent directory: address (`*` marks a contact), role, presence,
+/// harness, repo (or cwd), working-on summary and last-seen.
 pub fn agents(views: &[AgentView], now_ms: i64) -> String {
     if views.is_empty() {
         return "no agents\n".to_string();
@@ -233,6 +235,7 @@ pub fn agents(views: &[AgentView], now_ms: i64) -> String {
     let mut rows = vec![
         [
             "  ADDRESS",
+            "ROLE",
             "PRESENCE",
             "HARNESS",
             "REPO",
@@ -248,6 +251,7 @@ pub fn agents(views: &[AgentView], now_ms: i64) -> String {
         let place = a.repo.as_ref().unwrap_or(&a.cwd);
         rows.push(vec![
             format!("{mark}{}", a.address),
+            clip(a.role.as_deref().unwrap_or("-"), ROLE_CELL),
             presence(v.presence).to_string(),
             harness(v),
             place.display().to_string(),
@@ -453,12 +457,19 @@ mod tests {
 
     #[test]
     fn render_agents_table_marks_contacts() {
-        let out = agents(
-            &[view(true, Presence::Active), view(false, Presence::Gone)],
-            14 * 60_000,
-        );
+        let mut with_role = view(false, Presence::Gone);
+        with_role.agent.role = Some(format!("API owner {}", "x".repeat(80)));
+        let out = agents(&[view(true, Presence::Active), with_role], 14 * 60_000);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("  ADDRESS"));
+        assert!(lines[0].contains("ROLE"), "{out}");
+        // No role shows as `-`; a long one is clipped like WORKING ON.
+        assert!(lines[1].contains(" - "), "{out}");
+        assert!(lines[2].contains("API owner"), "{out}");
+        assert!(
+            lines[2].contains('…') && !lines[2].contains(&"x".repeat(80)),
+            "{out}"
+        );
         assert!(lines[1].starts_with("* backend-abcd1234"), "{out}");
         assert!(lines[1].contains("active") && lines[1].contains("idle 14m"));
         assert!(lines[1].contains("claude-code") && lines[1].contains("orders API"));
