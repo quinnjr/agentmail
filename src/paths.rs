@@ -1,5 +1,6 @@
 //! Filesystem locations for the database, socket and daemon lock.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -28,10 +29,13 @@ impl Paths {
     /// `$HOME/.local/share/agentmail`. Socket: `AGENTMAIL_SOCKET`, else
     /// `$XDG_RUNTIME_DIR/agentmail.sock`, else `<data_dir>/agentmail.sock`.
     ///
+    /// Values are read with [`std::env::var_os`], so non-UTF-8 paths are used
+    /// as given rather than treated as unset.
+    ///
     /// This is a thin wrapper over [`Paths::from_vars`]; the tests exercise
     /// `from_vars` directly to avoid mutating the process environment.
     pub fn from_env() -> Result<Paths> {
-        Self::from_vars(|k| std::env::var(k).ok())
+        Self::from_vars(|k| std::env::var_os(k))
     }
 
     /// Resolve paths from an arbitrary variable lookup. Empty values count as unset.
@@ -39,11 +43,22 @@ impl Paths {
     /// Per the XDG Base Directory spec, relative `XDG_DATA_HOME` and
     /// `XDG_RUNTIME_DIR` values are ignored, as is a relative `HOME`, so every
     /// process resolves the same paths regardless of its working directory.
-    pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Paths> {
+    /// For the same reason, relative `AGENTMAIL_DATA_DIR` and `AGENTMAIL_SOCKET`
+    /// overrides are rejected with an error: an explicit override that cannot
+    /// be honoured consistently should fail loudly rather than fall back.
+    pub fn from_vars(get: impl Fn(&str) -> Option<OsString>) -> Result<Paths> {
         let var = |k: &str| get(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let abs_var = |k: &str| var(k).filter(|p| p.is_absolute());
+        let override_var = |k: &str| -> Result<Option<PathBuf>> {
+            match var(k) {
+                Some(p) if !p.is_absolute() => {
+                    bail!("{k} must be an absolute path, got {}", p.display())
+                }
+                other => Ok(other),
+            }
+        };
 
-        let data_dir = if let Some(dir) = var("AGENTMAIL_DATA_DIR") {
+        let data_dir = if let Some(dir) = override_var("AGENTMAIL_DATA_DIR")? {
             dir
         } else if let Some(xdg) = abs_var("XDG_DATA_HOME") {
             xdg.join("agentmail")
@@ -53,7 +68,7 @@ impl Paths {
             bail!("cannot locate data directory: set HOME, XDG_DATA_HOME or AGENTMAIL_DATA_DIR");
         };
 
-        let socket = if let Some(sock) = var("AGENTMAIL_SOCKET") {
+        let socket = if let Some(sock) = override_var("AGENTMAIL_SOCKET")? {
             sock
         } else if let Some(run) = abs_var("XDG_RUNTIME_DIR") {
             run.join(SOCKET_FILE)
@@ -84,12 +99,13 @@ impl Paths {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let map: HashMap<String, OsString> = pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), OsString::from(v)))
             .collect();
         move |k| map.get(k).cloned()
     }
@@ -166,6 +182,32 @@ mod tests {
     #[test]
     fn paths_relative_home_is_ignored() {
         assert!(Paths::from_vars(vars(&[("HOME", "rel")])).is_err());
+    }
+
+    #[test]
+    fn paths_relative_data_dir_override_is_rejected() {
+        let err = Paths::from_vars(vars(&[("HOME", "/home/u"), ("AGENTMAIL_DATA_DIR", "rel")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("AGENTMAIL_DATA_DIR"), "{err}");
+    }
+
+    #[test]
+    fn paths_relative_socket_override_is_rejected() {
+        let err = Paths::from_vars(vars(&[("HOME", "/home/u"), ("AGENTMAIL_SOCKET", "a.sock")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("AGENTMAIL_SOCKET"), "{err}");
+    }
+
+    #[test]
+    fn paths_non_utf8_home_is_used_as_a_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = OsString::from_vec(b"/home/\xffu".to_vec());
+        let expected = PathBuf::from(home.clone())
+            .join(".local")
+            .join("share")
+            .join("agentmail");
+        let p = Paths::from_vars(move |k| (k == "HOME").then(|| home.clone())).unwrap();
+        assert_eq!(p.data_dir, expected);
     }
 
     #[test]
