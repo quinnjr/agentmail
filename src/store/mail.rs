@@ -1,0 +1,576 @@
+//! Messages: insert, mailboxes and read state, threads, held mail, search
+//! and prune.
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use redb::{ReadableTable, WriteTransaction};
+use serde::{Deserialize, Serialize};
+
+use super::{
+    AGENTS, HELD, MAILBOX, MESSAGES, Store, StoreError, THREADS, all_json, encode, get_json,
+};
+use crate::ids::{new_message_id, validate_name};
+use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message};
+
+/// Longest message body, in bytes (256 KiB).
+pub const MAX_BODY: usize = MAX_BODY_BYTES;
+
+/// A message to store. Recipients are already-resolved full addresses (or
+/// `human`); name resolution and held mail are the caller's job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewMessage {
+    pub from: String,
+    /// May be empty only when the message is about to be held for a name.
+    pub to: Vec<String>,
+    /// Required on a new thread; ignored on a reply, which takes
+    /// `Re: <root subject>`.
+    pub subject: Option<String>,
+    pub body: String,
+    pub kind: Kind,
+    pub urgent: bool,
+    pub refs: Vec<String>,
+    pub in_reply_to: Option<String>,
+}
+
+/// Which threads [`Store::threads`] returns. Every set field must match.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThreadFilter {
+    /// Threads this address (an agent or `human`) sent or received in.
+    pub agent: Option<String>,
+    /// Threads with a participant whose repo (or cwd) is this path or
+    /// inside it.
+    pub repo: Option<PathBuf>,
+    /// Only threads with at least one open question.
+    pub open_questions: bool,
+}
+
+/// One row of a thread listing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    /// The root message's subject.
+    pub subject: String,
+    /// Every sender and recipient, in order of first appearance.
+    pub participants: Vec<String>,
+    pub messages: usize,
+    /// `created_at` of the newest message.
+    pub last_at: i64,
+    pub open_questions: usize,
+}
+
+fn missing_message(id: &str) -> StoreError {
+    StoreError::NotFound(format!("no message with id {id:?}"))
+}
+
+fn utf8(field: &str, path: &Path) -> Result<String, StoreError> {
+    path.to_str().map(str::to_string).ok_or_else(|| {
+        StoreError::InvalidInput(format!("{field} {} is not valid UTF-8", path.display()))
+    })
+}
+
+/// `Re: <subject>`, without stacking a second `Re:`.
+fn reply_subject(root: &str) -> String {
+    let has_re = root.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+    if has_re {
+        root.to_string()
+    } else {
+        format!("Re: {root}")
+    }
+}
+
+/// Whether question `q` is still open given every message in its thread:
+/// only an `answer` replying to it from someone other than the asker
+/// closes it.
+fn is_open_question(q: &Message, thread: &[Message]) -> bool {
+    q.kind == Kind::Question
+        && !thread.iter().any(|m| {
+            m.kind == Kind::Answer && m.in_reply_to.as_deref() == Some(&q.id) && m.from != q.from
+        })
+}
+
+/// A thread's messages, in id order.
+fn thread_messages(
+    threads: &impl ReadableTable<(&'static str, &'static str), ()>,
+    messages: &impl ReadableTable<&'static str, &'static [u8]>,
+    thread_id: &str,
+) -> Result<Vec<Message>, StoreError> {
+    let mut out = Vec::new();
+    for row in threads.range((thread_id, "")..)? {
+        let (key, _) = row?;
+        let (t, id) = key.value();
+        if t != thread_id {
+            break;
+        }
+        if let Some(m) = get_json(messages, id)? {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// Every thread's message ids, grouped by thread id.
+fn all_threads(
+    threads: &impl ReadableTable<(&'static str, &'static str), ()>,
+) -> Result<BTreeMap<String, Vec<String>>, StoreError> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in threads.iter()? {
+        let (key, _) = row?;
+        let (t, id) = key.value();
+        out.entry(t.to_string()).or_default().push(id.to_string());
+    }
+    Ok(out)
+}
+
+/// `addr`'s mailbox rows: `(message id, read)`, in id order.
+fn mailbox_rows(
+    mailbox: &impl ReadableTable<(&'static str, &'static str), bool>,
+    addr: &str,
+) -> Result<Vec<(String, bool)>, StoreError> {
+    let mut out = Vec::new();
+    for row in mailbox.range((addr, "")..)? {
+        let (key, read) = row?;
+        let (a, id) = key.value();
+        if a != addr {
+            break;
+        }
+        out.push((id.to_string(), read.value()));
+    }
+    Ok(out)
+}
+
+/// The address must be `human` or a registered agent.
+fn require_known(
+    agents: &impl ReadableTable<&'static str, &'static [u8]>,
+    role: &str,
+    addr: &str,
+) -> Result<(), StoreError> {
+    if addr == HUMAN || agents.get(addr)?.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound(format!(
+            "unknown {role} {addr:?}; use a full <name>-<id> address from `agents`"
+        )))
+    }
+}
+
+fn push_unique(list: &mut Vec<String>, addr: &str) {
+    if !list.iter().any(|a| a == addr) {
+        list.push(addr.to_string());
+    }
+}
+
+/// A mailbox listing for `addr`: its messages paired with read state, plus
+/// which of them are open questions addressed to `addr`.
+struct MailboxView {
+    entries: Vec<(Message, bool)>,
+    open: HashSet<String>,
+}
+
+impl Store {
+    /// Hook for the questions table (Task 5): called inside the write
+    /// transaction when a question message is inserted, and again when a
+    /// held question gains a recipient.
+    fn on_question_inserted(
+        &self,
+        _txn: &WriteTransaction,
+        _msg: &Message,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Hook for the questions table (Task 5): called inside the prune
+    /// transaction with the ids of the deleted messages.
+    fn on_messages_pruned(
+        &self,
+        _txn: &WriteTransaction,
+        _ids: &HashSet<String>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Store a message and deliver it to each recipient's mailbox.
+    ///
+    /// A reply (`in_reply_to` set) joins the parent's thread and takes
+    /// `Re: <root subject>`; a new thread needs a non-blank subject. The
+    /// sender and every recipient must be `human` or a registered agent, and
+    /// the sender may not be a recipient. Duplicate recipients are dropped.
+    /// When `human` replies in a thread it had no part in, the reply is also
+    /// put in the human's mailbox, already read, so the thread lists under
+    /// `human`.
+    pub fn insert_message(&self, m: NewMessage, now: i64) -> Result<Message, StoreError> {
+        if m.body.len() > MAX_BODY {
+            return Err(StoreError::TooLarge);
+        }
+        let mut to: Vec<String> = Vec::with_capacity(m.to.len());
+        for addr in &m.to {
+            push_unique(&mut to, addr);
+        }
+        if to.contains(&m.from) {
+            return Err(StoreError::InvalidInput(
+                "a message cannot be sent to its own sender".into(),
+            ));
+        }
+
+        let txn = self.db.begin_write()?;
+        let msg = {
+            let agents = txn.open_table(AGENTS)?;
+            require_known(&agents, "sender", &m.from)?;
+            for addr in &to {
+                require_known(&agents, "recipient", addr)?;
+            }
+
+            let mut messages = txn.open_table(MESSAGES)?;
+            let mut threads = txn.open_table(THREADS)?;
+            let mut mailbox = txn.open_table(MAILBOX)?;
+            let id = new_message_id();
+
+            let (thread_id, subject, human_joins) = match &m.in_reply_to {
+                Some(parent_id) => {
+                    let parent: Message = get_json(&messages, parent_id)?
+                        .ok_or_else(|| missing_message(parent_id))?;
+                    let thread = thread_messages(&threads, &messages, &parent.thread_id)?;
+                    let root_subject = thread
+                        .iter()
+                        .find(|t| t.id == parent.thread_id)
+                        .map_or(parent.subject.as_str(), |root| root.subject.as_str());
+                    let human_joins = m.from == HUMAN
+                        && !thread
+                            .iter()
+                            .any(|t| t.from == HUMAN || t.to.iter().any(|a| a == HUMAN));
+                    (
+                        parent.thread_id.clone(),
+                        reply_subject(root_subject),
+                        human_joins,
+                    )
+                }
+                None => {
+                    let subject = m
+                        .subject
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| StoreError::InvalidInput("subject required".into()))?;
+                    (id.clone(), subject.to_string(), false)
+                }
+            };
+
+            let msg = Message {
+                id,
+                thread_id,
+                in_reply_to: m.in_reply_to,
+                from_human: m.from == HUMAN,
+                from: m.from,
+                to,
+                subject,
+                body: m.body,
+                kind: m.kind,
+                urgent: m.urgent,
+                refs: m.refs,
+                created_at: now,
+            };
+            messages.insert(msg.id.as_str(), encode(&msg)?.as_slice())?;
+            threads.insert((msg.thread_id.as_str(), msg.id.as_str()), ())?;
+            for addr in &msg.to {
+                mailbox.insert((addr.as_str(), msg.id.as_str()), false)?;
+            }
+            if human_joins {
+                mailbox.insert((HUMAN, msg.id.as_str()), true)?;
+            }
+            msg
+        };
+        if msg.kind == Kind::Question {
+            self.on_question_inserted(&txn, &msg)?;
+        }
+        txn.commit()?;
+        Ok(msg)
+    }
+
+    /// Hold message `msg_id` for the first agent that registers as `name` in
+    /// `repo` (see [`Store::release_held`]).
+    pub fn hold_for_name(&self, repo: &Path, name: &str, msg_id: &str) -> Result<(), StoreError> {
+        let repo = utf8("repo", repo)?;
+        validate_name(name).map_err(StoreError::InvalidName)?;
+        let txn = self.db.begin_write()?;
+        {
+            let messages = txn.open_table(MESSAGES)?;
+            if messages.get(msg_id)?.is_none() {
+                return Err(missing_message(msg_id));
+            }
+            let mut held = txn.open_table(HELD)?;
+            held.insert((repo.as_str(), name, msg_id), ())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Deliver every message held for `name` in `repo` to `addr`: each is
+    /// added to `addr`'s mailbox (unread), gets `addr` appended to its `to`,
+    /// and stops being held. Returns the released messages in id order.
+    pub fn release_held(
+        &self,
+        repo: &Path,
+        name: &str,
+        addr: &str,
+    ) -> Result<Vec<Message>, StoreError> {
+        let repo = utf8("repo", repo)?;
+        let txn = self.db.begin_write()?;
+        let released = {
+            let agents = txn.open_table(AGENTS)?;
+            if agents.get(addr)?.is_none() {
+                return Err(StoreError::NotFound(format!(
+                    "no agent with address {addr:?}"
+                )));
+            }
+            let mut held = txn.open_table(HELD)?;
+            let mut ids = Vec::new();
+            for row in held.range((repo.as_str(), name, "")..)? {
+                let (key, _) = row?;
+                let (r, n, id) = key.value();
+                if r != repo || n != name {
+                    break;
+                }
+                ids.push(id.to_string());
+            }
+
+            let mut messages = txn.open_table(MESSAGES)?;
+            let mut mailbox = txn.open_table(MAILBOX)?;
+            let mut released = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let Some(mut msg): Option<Message> = get_json(&messages, id)? else {
+                    held.remove((repo.as_str(), name, id.as_str()))?;
+                    continue;
+                };
+                if msg.from == addr {
+                    // Never deliver mail to its own sender; it stays held
+                    // for the next agent with this name.
+                    continue;
+                }
+                held.remove((repo.as_str(), name, id.as_str()))?;
+                push_unique(&mut msg.to, addr);
+                messages.insert(id.as_str(), encode(&msg)?.as_slice())?;
+                if mailbox.get((addr, id.as_str()))?.is_none() {
+                    mailbox.insert((addr, id.as_str()), false)?;
+                }
+                released.push(msg);
+            }
+            released
+        };
+        for msg in released.iter().filter(|m| m.kind == Kind::Question) {
+            self.on_question_inserted(&txn, msg)?;
+        }
+        txn.commit()?;
+        Ok(released)
+    }
+
+    fn mailbox_view(&self, addr: &str) -> Result<MailboxView, StoreError> {
+        let txn = self.read()?;
+        let mailbox = txn.open_table(MAILBOX)?;
+        let messages = txn.open_table(MESSAGES)?;
+        let threads = txn.open_table(THREADS)?;
+        let mut entries = Vec::new();
+        let mut open = HashSet::new();
+        for (id, read) in mailbox_rows(&mailbox, addr)? {
+            let Some(msg): Option<Message> = get_json(&messages, &id)? else {
+                continue;
+            };
+            if msg.kind == Kind::Question && msg.to.iter().any(|a| a == addr) {
+                let thread = thread_messages(&threads, &messages, &msg.thread_id)?;
+                if is_open_question(&msg, &thread) {
+                    open.insert(msg.id.clone());
+                }
+            }
+            entries.push((msg, read));
+        }
+        Ok(MailboxView { entries, open })
+    }
+
+    /// `addr`'s mail: open questions addressed to `addr` first (read or not),
+    /// then the rest by id. Without `include_read`, read messages other than
+    /// open questions are left out.
+    pub fn inbox(&self, addr: &str, include_read: bool) -> Result<Vec<Message>, StoreError> {
+        let MailboxView { entries, open } = self.mailbox_view(addr)?;
+        let (questions, rest): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|(m, _)| open.contains(&m.id));
+        Ok(questions
+            .into_iter()
+            .map(|(m, _)| m)
+            .chain(
+                rest.into_iter()
+                    .filter(|(_, read)| include_read || !read)
+                    .map(|(m, _)| m),
+            )
+            .collect())
+    }
+
+    /// `(unread messages, open questions addressed to addr)`.
+    pub fn unread_counts(&self, addr: &str) -> Result<(usize, usize), StoreError> {
+        let MailboxView { entries, open } = self.mailbox_view(addr)?;
+        let unread = entries.iter().filter(|(_, read)| !read).count();
+        Ok((unread, open.len()))
+    }
+
+    pub fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
+        let txn = self.read()?;
+        let messages = txn.open_table(MESSAGES)?;
+        get_json(&messages, id)
+    }
+
+    /// Every message in a thread, ordered by id; empty if there is no such
+    /// thread.
+    pub fn thread(&self, thread_id: &str) -> Result<Vec<Message>, StoreError> {
+        let txn = self.read()?;
+        let threads = txn.open_table(THREADS)?;
+        let messages = txn.open_table(MESSAGES)?;
+        thread_messages(&threads, &messages, thread_id)
+    }
+
+    /// Mark messages read for `addr`. Ids not in `addr`'s mailbox are
+    /// ignored, so a whole thread can be marked read at once.
+    pub fn mark_read(&self, addr: &str, ids: &[String]) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut mailbox = txn.open_table(MAILBOX)?;
+            for id in ids {
+                let unread = mailbox
+                    .get((addr, id.as_str()))?
+                    .is_some_and(|read| !read.value());
+                if unread {
+                    mailbox.insert((addr, id.as_str()), true)?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Thread summaries matching `f`, most recently active first.
+    pub fn threads(&self, f: &ThreadFilter) -> Result<Vec<ThreadSummary>, StoreError> {
+        let txn = self.read()?;
+        let threads = txn.open_table(THREADS)?;
+        let messages = txn.open_table(MESSAGES)?;
+        let repo_members: Option<HashSet<String>> = match &f.repo {
+            None => None,
+            Some(repo) => {
+                let agents: Vec<Agent> = all_json(&txn.open_table(AGENTS)?)?;
+                Some(
+                    agents
+                        .into_iter()
+                        .filter(|a| {
+                            a.repo.as_deref().is_some_and(|r| r.starts_with(repo))
+                                || a.cwd.starts_with(repo)
+                        })
+                        .map(|a| a.address)
+                        .collect(),
+                )
+            }
+        };
+
+        let mut out = Vec::new();
+        for thread_id in all_threads(&threads)?.into_keys() {
+            let msgs = thread_messages(&threads, &messages, &thread_id)?;
+            let Some(first) = msgs.first() else {
+                continue;
+            };
+            let mut participants = Vec::new();
+            for m in &msgs {
+                push_unique(&mut participants, &m.from);
+                for a in &m.to {
+                    push_unique(&mut participants, a);
+                }
+            }
+            if let Some(agent) = &f.agent
+                && !participants.contains(agent)
+            {
+                continue;
+            }
+            if let Some(members) = &repo_members
+                && !participants.iter().any(|p| members.contains(p))
+            {
+                continue;
+            }
+            let open_questions = msgs.iter().filter(|m| is_open_question(m, &msgs)).count();
+            if f.open_questions && open_questions == 0 {
+                continue;
+            }
+            let subject = msgs
+                .iter()
+                .find(|m| m.id == thread_id)
+                .unwrap_or(first)
+                .subject
+                .clone();
+            out.push(ThreadSummary {
+                subject,
+                participants,
+                messages: msgs.len(),
+                last_at: msgs.iter().map(|m| m.created_at).max().unwrap_or(0),
+                open_questions,
+                thread_id,
+            });
+        }
+        out.sort_by(|x, y| {
+            y.last_at
+                .cmp(&x.last_at)
+                .then_with(|| y.thread_id.cmp(&x.thread_id))
+        });
+        Ok(out)
+    }
+
+    /// Messages whose subject, body or sender contains `q`, ignoring case,
+    /// in id order. A blank query is refused.
+    pub fn search(&self, q: &str) -> Result<Vec<Message>, StoreError> {
+        if q.trim().is_empty() {
+            return Err(StoreError::InvalidInput("search query is empty".into()));
+        }
+        let needle = q.to_lowercase();
+        let txn = self.read()?;
+        let all: Vec<Message> = all_json(&txn.open_table(MESSAGES)?)?;
+        Ok(all
+            .into_iter()
+            .filter(|m| {
+                [&m.subject, &m.body, &m.from]
+                    .iter()
+                    .any(|field| field.to_lowercase().contains(&needle))
+            })
+            .collect())
+    }
+
+    /// Delete every thread whose newest message is older than `before`
+    /// (Unix ms), with its mailbox and held rows. Returns how many threads
+    /// were deleted.
+    pub fn prune(&self, before: i64) -> Result<usize, StoreError> {
+        let txn = self.db.begin_write()?;
+        let pruned = {
+            let mut threads = txn.open_table(THREADS)?;
+            let mut messages = txn.open_table(MESSAGES)?;
+            let mut doomed: HashSet<String> = HashSet::new();
+            let mut doomed_threads = Vec::new();
+            for (thread_id, ids) in all_threads(&threads)? {
+                let mut newest = i64::MIN;
+                for id in &ids {
+                    if let Some(m) = get_json::<Message>(&messages, id)? {
+                        newest = newest.max(m.created_at);
+                    }
+                }
+                if newest < before {
+                    doomed.extend(ids.iter().cloned());
+                    doomed_threads.push((thread_id, ids));
+                }
+            }
+            for (thread_id, ids) in &doomed_threads {
+                for id in ids {
+                    threads.remove((thread_id.as_str(), id.as_str()))?;
+                    messages.remove(id.as_str())?;
+                }
+            }
+            txn.open_table(MAILBOX)?
+                .retain(|(_, id), _| !doomed.contains(id))?;
+            txn.open_table(HELD)?
+                .retain(|(_, _, id), _| !doomed.contains(id))?;
+            self.on_messages_pruned(&txn, &doomed)?;
+            doomed_threads.len()
+        };
+        txn.commit()?;
+        Ok(pruned)
+    }
+}

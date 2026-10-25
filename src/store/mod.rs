@@ -11,13 +11,23 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 mod agents;
+mod mail;
 
 pub use agents::{Alive, RegisterReq};
+pub use mail::{MAX_BODY, NewMessage, ThreadFilter, ThreadSummary};
 
 /// Agents by address. Value: JSON [`crate::model::Agent`].
 pub(crate) const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");
 /// Contact lists: `(owner, contact)`.
 pub(crate) const CONTACTS: TableDefinition<(&str, &str), ()> = TableDefinition::new("contacts");
+/// Messages by id (ULID). Value: JSON [`crate::model::Message`].
+pub(crate) const MESSAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("messages");
+/// Per-recipient delivery and read state: `(address, message id) -> read`.
+pub(crate) const MAILBOX: TableDefinition<(&str, &str), bool> = TableDefinition::new("mailbox");
+/// Thread membership: `(thread id, message id)`.
+pub(crate) const THREADS: TableDefinition<(&str, &str), ()> = TableDefinition::new("threads");
+/// Mail held for a name not yet registered: `(repo, name, message id)`.
+pub(crate) const HELD: TableDefinition<(&str, &str, &str), ()> = TableDefinition::new("held");
 /// Store metadata, e.g. `schema_version`.
 pub(crate) const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
@@ -80,6 +90,10 @@ impl Store {
         {
             txn.open_table(AGENTS)?;
             txn.open_table(CONTACTS)?;
+            txn.open_table(MESSAGES)?;
+            txn.open_table(MAILBOX)?;
+            txn.open_table(THREADS)?;
+            txn.open_table(HELD)?;
             let mut meta = txn.open_table(META)?;
             let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());
             match existing {
