@@ -2,7 +2,7 @@
 //! and prune.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use redb::{ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
@@ -74,7 +74,20 @@ fn repo_key(repo: &Path) -> Result<String, StoreError> {
             repo.display()
         )));
     }
-    let normalized: PathBuf = repo.components().collect();
+    // Lexical normalization only (never touches the filesystem): drop `.`,
+    // repeated and trailing slashes, and resolve `..` against the previous
+    // component, so every spelling of one repo maps to one HELD key. `..`
+    // at the root stays at the root, as the OS does.
+    let mut normalized = PathBuf::new();
+    for c in repo.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
     normalized.to_str().map(str::to_string).ok_or_else(|| {
         StoreError::InvalidInput(format!("repo {} is not valid UTF-8", repo.display()))
     })

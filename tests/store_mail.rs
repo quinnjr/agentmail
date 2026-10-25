@@ -232,8 +232,14 @@ fn held_mail_released_on_register() {
         )
         .unwrap();
     assert!(m.to.is_empty());
-    // Not released to a different name or repo.
+    // A message already delivered to an existing recipient can also be held
+    // for a name that is not registered yet.
     let other = agent(&s, "docs", Some("/repo"));
+    let m2 = s
+        .insert_message(note(&a, &[&other], "Also for frontend", "hey"), 2)
+        .unwrap();
+    s.hold_for_name(repo, "frontend", &m2.id).unwrap();
+    // Not released to a different name or repo.
     assert!(s.release_held(repo, "docs", &other).unwrap().is_empty());
     let elsewhere = agent(&s, "frontend", Some("/other"));
     assert!(
@@ -244,12 +250,18 @@ fn held_mail_released_on_register() {
     let f = agent(&s, "frontend", Some("/repo"));
 
     let released = s.release_held(repo, "frontend", &f).unwrap();
-    assert_eq!(ids(&released), vec![m.id.as_str()]);
+    assert_eq!(ids(&released), vec![m.id.as_str(), m2.id.as_str()]);
     assert_eq!(released[0].to, vec![f.clone()]);
+    assert!(released[1].to.contains(&f));
+    assert!(released[1].to.contains(&other));
     let inbox = s.inbox(&f, false).unwrap();
-    assert_eq!(ids(&inbox), vec![m.id.as_str()]);
-    assert!(inbox[0].to.contains(&f));
+    let mut inbox_ids = ids(&inbox);
+    inbox_ids.sort_unstable();
+    assert_eq!(inbox_ids, vec![m.id.as_str(), m2.id.as_str()]);
+    assert!(inbox.iter().all(|msg| msg.to.contains(&f)));
     assert_eq!(s.get_message(&m.id).unwrap().unwrap().to, vec![f.clone()]);
+    let stored2 = s.get_message(&m2.id).unwrap().unwrap().to;
+    assert!(stored2.contains(&f) && stored2.contains(&other));
     // Released once only.
     let g = agent(&s, "frontend", Some("/repo"));
     assert!(s.release_held(repo, "frontend", &g).unwrap().is_empty());
@@ -601,10 +613,32 @@ fn held_repo_path_is_normalized() {
             &names(&["frontend"]),
         )
         .unwrap();
-    let f = agent(&s, "frontend", Some("/repo"));
+    let m3 = s
+        .insert_held(
+            note(&a, &[], "Parent", "z"),
+            3,
+            Path::new("/repo/sub/.."),
+            &names(&["frontend"]),
+        )
+        .unwrap();
+    let m4 = s
+        .insert_held(
+            note(&a, &[], "Above root", "w"),
+            4,
+            Path::new("/../repo/x/../"),
+            &names(&["frontend"]),
+        )
+        .unwrap();
+    // The agent's own repo may be spelled with `..` as well.
+    let f = agent(&s, "frontend", Some("/other/../repo"));
     assert_eq!(
         ids(&s.release_held(Path::new("/repo"), "frontend", &f).unwrap()),
-        vec![m.id.as_str(), m2.id.as_str()]
+        vec![
+            m.id.as_str(),
+            m2.id.as_str(),
+            m3.id.as_str(),
+            m4.id.as_str()
+        ]
     );
     let err = s
         .hold_for_name(Path::new("repo"), "frontend", &m.id)
