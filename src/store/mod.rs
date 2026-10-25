@@ -15,8 +15,8 @@ mod mail;
 mod questions;
 
 pub use agents::{Alive, RegisterReq};
-pub(crate) use mail::lexical;
 pub use mail::{MAX_BODY, NewMessage, ThreadFilter, ThreadSummary};
+pub(crate) use mail::{agent_repo_key, lexical};
 
 /// Agents by address. Value: JSON [`crate::model::Agent`].
 pub(crate) const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");

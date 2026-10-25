@@ -258,7 +258,7 @@ fn push_unique(list: &mut Vec<String>, addr: &str) -> bool {
 /// The repo an agent is in, as a held-mail key: its repo, or its cwd when it
 /// has none. `None` when that path is not absolute (register does not
 /// require one), so it can never match a held key.
-fn agent_repo_key(agent: &Agent) -> Option<String> {
+pub(crate) fn agent_repo_key(agent: &Agent) -> Option<String> {
     repo_key(agent.repo.as_deref().unwrap_or(&agent.cwd)).ok()
 }
 

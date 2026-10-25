@@ -53,6 +53,20 @@ pub fn new_address(name: &str) -> String {
     format!("{name}-{}", ADDRESS_SUFFIX.create_id())
 }
 
+/// Whether `s` has the shape of a full address: a valid name, `-`, then
+/// [`ADDRESS_SUFFIX_LEN`] lowercase letters or digits. Says nothing about
+/// whether such an agent exists.
+pub fn is_address_shape(s: &str) -> bool {
+    let Some((name, suffix)) = s.rsplit_once('-') else {
+        return false;
+    };
+    suffix.len() == usize::from(ADDRESS_SUFFIX_LEN)
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && validate_name(name).is_ok()
+}
+
 /// A new ULID string, strictly increasing within this process.
 pub fn new_message_id() -> String {
     let mut generator = ULIDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -75,6 +89,21 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn ids_address_shape() {
+        assert!(is_address_shape("frontend-zzzzzzzz"));
+        assert!(is_address_shape("orders-api-a1b2c3d4"));
+        assert!(is_address_shape(&new_address("backend")));
+        assert!(!is_address_shape("frontend"));
+        assert!(!is_address_shape("orders-api"));
+        assert!(!is_address_shape("frontend-zzzzzzz"));
+        assert!(!is_address_shape("frontend-zzzzzzzzz"));
+        assert!(!is_address_shape("frontend-ZZZZZZZZ"));
+        assert!(!is_address_shape("-zzzzzzzz"));
+        assert!(!is_address_shape("Front-zzzzzzzz"));
+        assert!(!is_address_shape("human"));
+    }
 
     #[test]
     fn ids_valid_names_are_accepted() {

@@ -4,7 +4,7 @@
 //! Every method here is synchronous and may block on the database; the
 //! connection loop runs it inside `spawn_blocking`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,11 +15,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::hub::Hub;
-use crate::ids::now_ms;
-use crate::model::{Agent, AgentView, HUMAN, Kind, Message};
+use crate::ids::{is_address_shape, now_ms, validate_name};
+use crate::model::{Agent, AgentView, HUMAN, Kind, Message, Presence};
 use crate::procinfo;
 use crate::protocol::{Caller, ClientError, ErrorCode, Event, Request};
-use crate::store::{NewMessage, RegisterReq, Store, StoreError, lexical};
+use crate::store::{NewMessage, RegisterReq, Store, StoreError, agent_repo_key, lexical};
 
 /// How stale an agent's `last_seen` may get before a request refreshes it.
 pub const TOUCH_INTERVAL_MS: i64 = 1000;
@@ -57,6 +57,80 @@ fn human_has_no(what: &str) -> ClientError {
     ClientError::new(
         ErrorCode::InvalidInput,
         format!("{HUMAN} has no {what}; only registered agents do"),
+    )
+}
+
+/// What a [`Caller::Procs`] caller is told when none of its processes is
+/// bound to an agent.
+pub const NOT_REGISTERED: &str =
+    "this session is not registered: run `agentmail register <name>` (or use --as human)";
+
+/// How many times a send resolves its recipients again when an agent
+/// registers under a held name between resolving and storing.
+const RESOLVE_ATTEMPTS: usize = 8;
+
+/// The recipients of a send, resolved from its `to` entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resolved {
+    /// Full addresses (or `human`) to deliver to now, without duplicates.
+    pub addresses: Vec<String>,
+    /// `(repo, name)` pairs to hold the mail for until an agent registers
+    /// under `name` in `repo`, without duplicates. Every repo is the
+    /// sender's.
+    pub held_names: Vec<(PathBuf, String)>,
+}
+
+/// Where a plain name is looked up.
+enum Scope<'a> {
+    /// Machine-wide, and nowhere to hold mail (the human).
+    Machine,
+    /// The sender's repo (its cwd when it has none), as a held-mail key;
+    /// `None` when it has no usable one, so nothing matches.
+    Repo(Option<&'a str>),
+}
+
+/// What one `to` entry resolved to.
+enum Target {
+    Address(String),
+    Held(String),
+}
+
+/// `name: working on ...` for each candidate, for an ambiguity message.
+fn describe(views: &[AgentView]) -> String {
+    views
+        .iter()
+        .map(|v| {
+            let repo = v.agent.repo.as_deref().unwrap_or(&v.agent.cwd);
+            match &v.agent.working_on {
+                Some(w) => format!(
+                    "{} in {} (working on: {w})",
+                    v.agent.address,
+                    repo.display()
+                ),
+                None => format!("{} in {}", v.agent.address, repo.display()),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn ambiguous(name: &str, views: Vec<AgentView>, among: &str) -> ClientError {
+    let mut err = ClientError::new(
+        ErrorCode::AmbiguousRecipient,
+        format!(
+            "{name:?} matches several {among}: {}. Pick one, add it as a contact \
+             (`agentmail contact add <address>`) and resend to its full address",
+            describe(&views)
+        ),
+    );
+    err.candidates = views;
+    err
+}
+
+fn self_send(entry: &str) -> ClientError {
+    ClientError::new(
+        ErrorCode::InvalidRecipient,
+        format!("{entry:?} is the sender itself; a message cannot be sent to its own sender"),
     )
 }
 
@@ -288,7 +362,11 @@ impl Handler {
                     )
                 })?
             }
-            Caller::Procs { .. } => return Err(unimplemented("process-ancestry callers")),
+            Caller::Procs { procs } => self
+                .store
+                .find_by_procs(procs)
+                .map_err(store_err)?
+                .ok_or_else(|| ClientError::new(ErrorCode::NoIdentity, NOT_REGISTERED))?,
         };
         let now = now_ms();
         if now.saturating_sub(agent.last_seen) >= TOUCH_INTERVAL_MS {
@@ -296,6 +374,213 @@ impl Handler {
             let _ = self.store.touch(&agent.address, now);
         }
         Ok(agent.address)
+    }
+
+    /// Resolve the `to` entries of a send from `sender` (an address or
+    /// [`HUMAN`]). Per entry, in order:
+    ///
+    /// 1. `human`, or the address of an existing agent: used as is.
+    /// 2. Anything else shaped like a full address (`<name>-<8 id chars>`):
+    ///    [`ErrorCode::UnknownRecipient`]. A plain name of that shape cannot
+    ///    be addressed by name.
+    /// 3. A plain name (anything else that is not a valid name is
+    ///    [`ErrorCode::UnknownRecipient`]): the sender's contact with that
+    ///    name, if exactly one, whatever its repo or presence; several are
+    ///    [`ErrorCode::AmbiguousRecipient`]. Otherwise the active agents
+    ///    with that name in the sender's repo (its cwd when it has none;
+    ///    machine-wide for `human`), other than the sender: one is used,
+    ///    several are [`ErrorCode::AmbiguousRecipient`] with the candidates
+    ///    and their working-on summaries. With none the mail is held for
+    ///    the name in the sender's repo; `human`, having no repo, gets
+    ///    [`ErrorCode::UnknownRecipient`].
+    /// 4. A recipient that is the sender: [`ErrorCode::InvalidRecipient`].
+    pub fn resolve_recipients(&self, sender: &str, to: &[String]) -> Result<Resolved, ClientError> {
+        if to.is_empty() {
+            return Err(ClientError::new(ErrorCode::InvalidInput, "no recipients"));
+        }
+        let agents = self.store.list_agents().map_err(store_err)?;
+        let by_address: HashMap<&str, &Agent> =
+            agents.iter().map(|a| (a.address.as_str(), a)).collect();
+        let contacts: Vec<&Agent> = self
+            .store
+            .contacts(sender)
+            .map_err(store_err)?
+            .iter()
+            .filter_map(|c| by_address.get(c.as_str()).copied())
+            .collect();
+        let home = if sender == HUMAN {
+            None
+        } else {
+            by_address.get(sender).copied().and_then(agent_repo_key)
+        };
+        let scope = if sender == HUMAN {
+            Scope::Machine
+        } else {
+            Scope::Repo(home.as_deref())
+        };
+
+        let mut out = Resolved::default();
+        for entry in to {
+            match self.resolve_one(sender, entry, &agents, &by_address, &contacts, &scope)? {
+                Target::Address(address) => {
+                    if address == sender {
+                        return Err(self_send(entry));
+                    }
+                    if !out.addresses.contains(&address) {
+                        out.addresses.push(address);
+                    }
+                }
+                Target::Held(name) => {
+                    let Scope::Repo(Some(repo)) = scope else {
+                        unreachable!("mail is only held in a repo");
+                    };
+                    let held = (PathBuf::from(repo), name);
+                    if !out.held_names.contains(&held) {
+                        out.held_names.push(held);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One step of [`Handler::resolve_recipients`].
+    fn resolve_one(
+        &self,
+        sender: &str,
+        entry: &str,
+        agents: &[Agent],
+        by_address: &HashMap<&str, &Agent>,
+        contacts: &[&Agent],
+        scope: &Scope,
+    ) -> Result<Target, ClientError> {
+        if entry == HUMAN || (entry.contains('-') && by_address.contains_key(entry)) {
+            return Ok(Target::Address(entry.to_string()));
+        }
+        if is_address_shape(entry) {
+            return Err(ClientError::new(
+                ErrorCode::UnknownRecipient,
+                format!(
+                    "unknown recipient {entry:?}: no agent has that address (see `agentmail agents --all`)"
+                ),
+            ));
+        }
+        if validate_name(entry).is_err() {
+            return Err(ClientError::new(
+                ErrorCode::UnknownRecipient,
+                format!(
+                    "unknown recipient {entry:?}: neither a full <name>-<id> address \
+                     nor a valid agent name"
+                ),
+            ));
+        }
+
+        let named: Vec<&Agent> = contacts
+            .iter()
+            .copied()
+            .filter(|a| a.name == entry)
+            .collect();
+        match named.as_slice() {
+            [one] => return Ok(Target::Address(one.address.clone())),
+            [] => {}
+            several => {
+                let views = several
+                    .iter()
+                    .map(|a| self.view((*a).clone(), true))
+                    .collect();
+                return Err(ambiguous(entry, views, "of your contacts"));
+            }
+        }
+
+        let in_scope = |a: &Agent| match scope {
+            Scope::Machine => true,
+            Scope::Repo(Some(home)) => agent_repo_key(a).as_deref() == Some(*home),
+            Scope::Repo(None) => false,
+        };
+        let mut is_sender = false;
+        let mut matches = Vec::new();
+        for a in agents.iter().filter(|a| a.name == entry && in_scope(a)) {
+            let view = self.view(a.clone(), false);
+            if view.presence != Presence::Active {
+                continue;
+            }
+            if a.address == sender {
+                is_sender = true;
+            } else {
+                matches.push(view);
+            }
+        }
+        match matches.len() {
+            1 => {
+                let view = matches.pop().expect("one match");
+                return Ok(Target::Address(view.agent.address));
+            }
+            0 => {}
+            _ => {
+                let among = match scope {
+                    Scope::Machine => "active agents",
+                    Scope::Repo(_) => "active agents in your repo",
+                };
+                return Err(ambiguous(entry, matches, among));
+            }
+        }
+        if is_sender {
+            return Err(self_send(entry));
+        }
+        match scope {
+            Scope::Repo(Some(_)) => Ok(Target::Held(entry.to_string())),
+            Scope::Machine | Scope::Repo(None) => Err(ClientError::new(
+                ErrorCode::UnknownRecipient,
+                format!(
+                    "unknown recipient {entry:?}: no active agent has that name \
+                     (see `agentmail agents --all`)"
+                ),
+            )),
+        }
+    }
+
+    /// Store a new message from `me` to the resolved `to` entries, holding it
+    /// for names nobody active has yet, and announce the delivery.
+    fn send(&self, me: String, to: &[String], mut new: NewMessage) -> Result<Value, ClientError> {
+        for _ in 0..RESOLVE_ATTEMPTS {
+            let resolved = self.resolve_recipients(&me, to)?;
+            let Some((repo, _)) = resolved.held_names.first() else {
+                new.to = resolved.addresses;
+                let msg = self
+                    .store
+                    .insert_message(new, now_ms())
+                    .map_err(store_err)?;
+                return self.sent(&msg, &[]);
+            };
+            debug_assert!(resolved.held_names.iter().all(|(r, _)| r == repo));
+            let names: Vec<String> = resolved.held_names.iter().map(|(_, n)| n.clone()).collect();
+            // Kept for a retry: on a conflict the store hands nothing back.
+            let mut m = new.clone();
+            m.to = resolved.addresses;
+            match self
+                .store
+                .insert_held(m, now_ms(), repo, &names, &procinfo::is_alive)
+            {
+                Ok(msg) => return self.sent(&msg, &names),
+                // An agent registered under a held name meanwhile: resolve
+                // again so it gets the mail directly.
+                Err(StoreError::RecipientRegistered(_)) => continue,
+                Err(e) => return Err(store_err(e)),
+            }
+        }
+        Err(ClientError::new(
+            ErrorCode::Internal,
+            "recipients kept registering while the message was being sent; try again",
+        ))
+    }
+
+    /// Announce a stored message and describe it to the sender, with the
+    /// names it is held for.
+    fn sent(&self, msg: &Message, held_for: &[String]) -> Result<Value, ClientError> {
+        self.publish_delivered(msg);
+        let mut out = to_json(msg)?;
+        out["held_for"] = to_json(&held_for)?;
+        Ok(out)
     }
 
     fn view(&self, agent: Agent, is_contact: bool) -> AgentView {
@@ -429,24 +714,17 @@ impl Handler {
                 refs,
             } => {
                 let me = self.resolve_caller(caller)?;
-                let msg = self
-                    .store
-                    .insert_message(
-                        NewMessage {
-                            from: me,
-                            to,
-                            subject: Some(subject),
-                            body,
-                            kind: Kind::Note,
-                            urgent,
-                            refs,
-                            in_reply_to: None,
-                        },
-                        now_ms(),
-                    )
-                    .map_err(store_err)?;
-                self.publish_delivered(&msg);
-                to_json(&msg)
+                let new = NewMessage {
+                    from: me.clone(),
+                    to: Vec::new(),
+                    subject: Some(subject),
+                    body,
+                    kind: Kind::Note,
+                    urgent,
+                    refs,
+                    in_reply_to: None,
+                };
+                self.send(me, &to, new)
             }
             Request::Inbox { all } => {
                 let me = self.resolve_caller(caller)?;

@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod identity;
 pub mod ids;
 pub mod model;
 pub mod paths;
