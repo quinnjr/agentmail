@@ -61,6 +61,17 @@ pub fn register_proc(explicit_pid: Option<u32>) -> Option<(ProcId, Harness)> {
 
 /// [`register_proc`] for process `me`.
 fn register_proc_for(me: u32, explicit_pid: Option<u32>) -> Option<(ProcId, Harness)> {
+    register_proc_with(me, explicit_pid, procinfo::find_harness_ancestor)
+}
+
+/// [`register_proc_for`] with the harness-ancestor lookup injected, so the
+/// grandparent fallback can be tested even when the tests themselves run
+/// under a harness.
+fn register_proc_with(
+    me: u32,
+    explicit_pid: Option<u32>,
+    find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+) -> Option<(ProcId, Harness)> {
     let usable = |p: &ProcId| p.pid > 1;
     if let Some(pid) = explicit_pid {
         let p = procinfo::proc_id(pid).filter(usable)?;
@@ -68,7 +79,7 @@ fn register_proc_for(me: u32, explicit_pid: Option<u32>) -> Option<(ProcId, Harn
         // Guard against the PID being reused between the two reads.
         return procinfo::is_alive(&p).then_some((p, harness));
     }
-    if let Some(found) = procinfo::find_harness_ancestor(me).filter(|(p, _)| usable(p)) {
+    if let Some(found) = find_harness(me).filter(|(p, _)| usable(p)) {
         return Some(found);
     }
     procinfo::ancestors(me)
@@ -187,15 +198,80 @@ mod tests {
         assert_eq!(p.pid, child.id());
     }
 
+    /// Spawn `sh -c 'sleep 5 & echo $!; wait'` and return the shell child
+    /// and the PID of its `sleep` grandchild.
+    fn spawn_grandchild() -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5 & echo $!; wait")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (child, line.trim().parse().unwrap())
+    }
+
+    fn reap(mut child: std::process::Child, grandchild: u32) {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(grandchild.to_string())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn identity_register_proc_falls_back_to_grandparent() {
+        // With no harness ancestor, the sleep binds to its grandparent: the
+        // test process itself (sleep -> sh -> test process).
+        let (child, grandchild) = spawn_grandchild();
+        let found = register_proc_with(grandchild, None, |_| None);
+        let shell_saw_us = procinfo::parent_pid(child.id());
+        reap(child, grandchild);
         let me = std::process::id();
-        if procinfo::find_harness_ancestor(me).is_some() {
-            // Run under a harness (e.g. from Claude Code): that wins.
-            return;
-        }
+        assert_eq!(shell_saw_us, Some(me));
+        assert_eq!(
+            found,
+            Some((procinfo::proc_id(me).unwrap(), Harness::Other))
+        );
+    }
+
+    #[test]
+    fn identity_register_proc_rejects_harness_at_pid_1() {
+        // A harness lookup that lands on init is ignored in favour of the
+        // grandparent.
+        let (child, grandchild) = spawn_grandchild();
+        let init = procinfo::proc_id(1);
+        let found =
+            register_proc_with(grandchild, None, |_| init.map(|p| (p, Harness::ClaudeCode)));
+        reap(child, grandchild);
+        let me = std::process::id();
+        assert_eq!(
+            found,
+            Some((procinfo::proc_id(me).unwrap(), Harness::Other))
+        );
+    }
+
+    #[test]
+    fn identity_register_proc_never_falls_back_to_pid_1() {
+        // A process whose grandparent is init gets no binding.
+        let me = std::process::id();
         let chain = procinfo::ancestors(me);
-        let expected = chain.get(1).copied().filter(|p| p.pid > 1);
-        assert_eq!(register_proc(None), expected.map(|p| (p, Harness::Other)));
+        assert_eq!(
+            chain.last().map(|p| p.pid),
+            Some(1),
+            "ancestry reaches init"
+        );
+        // `x`'s grandparent is the last entry of the chain, i.e. PID 1.
+        let x = match chain.len() {
+            n if n >= 3 => chain[n - 3].pid,
+            _ => me,
+        };
+        assert_eq!(procinfo::ancestors(x).get(1).map(|p| p.pid).unwrap_or(1), 1);
+        assert_eq!(register_proc_with(x, None, |_| None), None);
     }
 }
