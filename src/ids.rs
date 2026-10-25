@@ -105,9 +105,8 @@ mod tests {
         assert!(err.contains("reserved"), "{err}");
     }
 
-    #[test]
-    fn ids_new_address_has_name_and_8_char_cuid2() {
-        let a = new_address("backend");
+    /// Equivalent to matching `^backend-[a-z0-9]{8}$`.
+    fn assert_backend_address(a: &str) {
         let suffix = a.strip_prefix("backend-").expect("prefix");
         assert_eq!(suffix.len(), 8, "{a}");
         assert!(
@@ -119,8 +118,17 @@ mod tests {
     }
 
     #[test]
+    fn ids_new_address_has_name_and_8_char_cuid2() {
+        assert_backend_address(&new_address("backend"));
+    }
+
+    #[test]
     fn ids_new_address_is_unique() {
-        let set: HashSet<String> = (0..1000).map(|_| new_address("backend")).collect();
+        let addresses: Vec<String> = (0..1000).map(|_| new_address("backend")).collect();
+        for a in &addresses {
+            assert_backend_address(a);
+        }
+        let set: HashSet<&String> = addresses.iter().collect();
         assert_eq!(set.len(), 1000);
     }
 

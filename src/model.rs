@@ -45,8 +45,10 @@ pub struct Agent {
     /// Short summary of current work, at most [`MAX_WORKING_ON_CHARS`].
     pub working_on: Option<String>,
     pub harness: Harness,
+    /// Working directory. Must be valid UTF-8: serde_json cannot serialize a
+    /// non-UTF-8 path, so registration rejects one up front.
     pub cwd: PathBuf,
-    /// Git toplevel of `cwd`, if any.
+    /// Git toplevel of `cwd`, if any. Must be valid UTF-8, like `cwd`.
     pub repo: Option<PathBuf>,
     /// The harness process this address is bound to.
     pub proc_id: Option<ProcId>,
@@ -119,12 +121,50 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn assert_wire<T>(value: T, wire: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(json!(value), json!(wire), "{value:?}");
+        let back: T = serde_json::from_value(json!(wire)).unwrap();
+        assert_eq!(back, value, "{wire}");
+    }
+
     #[test]
     fn model_enums_serialize_as_specified() {
-        assert_eq!(json!(Harness::ClaudeCode), json!("claude-code"));
-        assert_eq!(json!(Harness::Opencode), json!("opencode"));
-        assert_eq!(json!(Presence::Active), json!("active"));
-        assert_eq!(json!(Kind::Question), json!("question"));
+        assert_wire(Harness::ClaudeCode, "claude-code");
+        assert_wire(Harness::Opencode, "opencode");
+        assert_wire(Harness::Kiro, "kiro");
+        assert_wire(Harness::Other, "other");
+        assert_wire(Presence::Active, "active");
+        assert_wire(Presence::Gone, "gone");
+        assert_wire(Kind::Note, "note");
+        assert_wire(Kind::Question, "question");
+        assert_wire(Kind::Answer, "answer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_agent_with_non_utf8_cwd_fails_to_serialize() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let agent = Agent {
+            address: "backend-abcd1234".into(),
+            name: "backend".into(),
+            role: None,
+            working_on: None,
+            harness: Harness::Other,
+            cwd: PathBuf::from(OsStr::from_bytes(b"/w/\xff")),
+            repo: None,
+            proc_id: None,
+            wake: false,
+            registered_at: 0,
+            last_seen: 0,
+            signed_off: false,
+        };
+        let err = serde_json::to_value(&agent).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
     }
 
     #[test]
