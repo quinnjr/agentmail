@@ -46,7 +46,10 @@ pub struct Agent {
     pub working_on: Option<String>,
     pub harness: Harness,
     /// Working directory. Must be valid UTF-8: serde_json cannot serialize a
-    /// non-UTF-8 path, so registration rejects one up front.
+    /// non-UTF-8 path (see `model_agent_with_non_utf8_cwd_fails_to_serialize`).
+    /// This type does not enforce that; the registration path is required to
+    /// check `cwd` and `repo` with `to_str()` and reject a non-UTF-8 path with
+    /// a clear error before storing the agent.
     pub cwd: PathBuf,
     /// Git toplevel of `cwd`, if any. Must be valid UTF-8, like `cwd`.
     pub repo: Option<PathBuf>,
