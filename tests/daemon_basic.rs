@@ -1251,6 +1251,20 @@ async fn client_accepts_another_spelling_of_the_same_data_dir() {
 }
 
 #[tokio::test]
+async fn client_accepts_a_symlink_to_the_same_data_dir() {
+    let d = TestDaemon::start().await;
+    let links = TempDir::new().unwrap();
+    let link = links.path().join("link");
+    std::os::unix::fs::symlink(&d.paths.data_dir, &link).unwrap();
+    let paths = Paths {
+        data_dir: link,
+        socket: d.paths.socket.clone(),
+        ..d.paths.clone()
+    };
+    Client::connect(&paths).await.unwrap();
+}
+
+#[tokio::test]
 async fn daemon_status_reports_a_daemon_for_another_data_dir() {
     let d = TestDaemon::start().await;
     let other = TempDir::new().unwrap();

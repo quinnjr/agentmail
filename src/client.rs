@@ -125,9 +125,23 @@ impl std::fmt::Display for DataDirMismatch {
 
 impl std::error::Error for DataDirMismatch {}
 
+/// Whether `a` and `b` name the same directory: first lexically, then, if
+/// the spellings differ, after resolving symlinks on both. When either path
+/// cannot be resolved the lexical answer stands.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a.to_string_lossy() == b.to_string_lossy() {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Check that the daemon that answered `Hello` with `hello` serves the data
 /// directory of `paths`. Both sides are compared after lexical
-/// normalization, so different spellings of one directory match.
+/// normalization, so different spellings of one directory match; if they
+/// still differ, symlinks are resolved before reporting a mismatch.
 fn check_data_dir(paths: &Paths, hello: &Value) -> Result<(), DataDirMismatch> {
     let ours = lexical(&paths.data_dir);
     let theirs = hello
@@ -135,7 +149,7 @@ fn check_data_dir(paths: &Paths, hello: &Value) -> Result<(), DataDirMismatch> {
         .and_then(Value::as_str)
         .map(|d| lexical(Path::new(d)));
     match theirs {
-        Some(t) if t.to_string_lossy() == ours.to_string_lossy() => Ok(()),
+        Some(t) if same_dir(&t, &ours) => Ok(()),
         theirs => Err(DataDirMismatch {
             socket: paths.socket.clone(),
             ours,
@@ -486,5 +500,31 @@ mod tests {
         let err = check_data_dir(&paths, &serde_json::json!({ "version": 1 })).unwrap_err();
         assert_eq!(err.theirs, None);
         assert!(err.to_string().contains("did not report"), "{err}");
+    }
+
+    #[test]
+    fn check_data_dir_resolves_symlinks_when_spellings_differ() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let hello = |d: &Path| serde_json::json!({ "version": 1, "pid": 1, "data_dir": d.to_str().unwrap() });
+
+        // Either side may be the symlink.
+        assert_eq!(check_data_dir(&Paths::in_dir(&link), &hello(&real)), Ok(()));
+        assert_eq!(check_data_dir(&Paths::in_dir(&real), &hello(&link)), Ok(()));
+
+        // A different real directory still mismatches.
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = check_data_dir(&Paths::in_dir(&link), &hello(&other)).unwrap_err();
+        assert_eq!(err.theirs, Some(other.clone()));
+        assert_eq!(err.ours, link.clone());
+
+        // An unresolvable path falls back to the lexical answer.
+        let missing = tmp.path().join("missing");
+        let err = check_data_dir(&Paths::in_dir(&missing), &hello(&real)).unwrap_err();
+        assert_eq!(err.ours, missing);
     }
 }
