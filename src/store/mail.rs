@@ -41,7 +41,7 @@ pub struct ThreadFilter {
     /// Threads this address (an agent or `human`) sent or received in.
     pub agent: Option<String>,
     /// Threads with a participant whose repo (or cwd) is this path or
-    /// inside it.
+    /// inside it. Must be absolute; compared after lexical normalization.
     pub repo: Option<PathBuf>,
     /// Only threads with at least one open question.
     pub open_questions: bool,
@@ -65,21 +65,13 @@ fn missing_message(id: &str) -> StoreError {
     StoreError::NotFound(format!("no message with id {id:?}"))
 }
 
-/// The held-mail key for a repo path: it must be absolute, and is rebuilt
-/// from its components so `/repo`, `/repo/` and `/repo/.` are one key.
-fn repo_key(repo: &Path) -> Result<String, StoreError> {
-    if !repo.is_absolute() {
-        return Err(StoreError::InvalidInput(format!(
-            "repo {} is not an absolute path",
-            repo.display()
-        )));
-    }
-    // Lexical normalization only (never touches the filesystem): drop `.`,
-    // repeated and trailing slashes, and resolve `..` against the previous
-    // component, so every spelling of one repo maps to one HELD key. `..`
-    // at the root stays at the root, as the OS does.
+/// Lexical normalization only (never touches the filesystem): drop `.`,
+/// repeated and trailing slashes, and resolve `..` against the previous
+/// component, so every spelling of one path compares equal. `..` at the
+/// root stays at the root, as the OS does.
+fn lexical(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
-    for c in repo.components() {
+    for c in path.components() {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -88,9 +80,30 @@ fn repo_key(repo: &Path) -> Result<String, StoreError> {
             other => normalized.push(other),
         }
     }
-    normalized.to_str().map(str::to_string).ok_or_else(|| {
-        StoreError::InvalidInput(format!("repo {} is not valid UTF-8", repo.display()))
-    })
+    normalized
+}
+
+/// A caller-supplied repo path, lexically normalized: it must be absolute
+/// ([`StoreError::InvalidInput`] otherwise), so `/repo`, `/repo/`,
+/// `/repo/.` and `/x/../repo` are one path.
+fn normalize(repo: &Path) -> Result<PathBuf, StoreError> {
+    if !repo.is_absolute() {
+        return Err(StoreError::InvalidInput(format!(
+            "repo {} is not an absolute path",
+            repo.display()
+        )));
+    }
+    Ok(lexical(repo))
+}
+
+/// The held-mail key for a repo path: [`normalize`]d, as UTF-8.
+fn repo_key(repo: &Path) -> Result<String, StoreError> {
+    normalize(repo)?
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            StoreError::InvalidInput(format!("repo {} is not valid UTF-8", repo.display()))
+        })
 }
 
 /// `Re: <subject>`, without stacking a second `Re:`.
@@ -282,7 +295,8 @@ impl Store {
     }
 
     /// Hook for the questions table (Task 5): called inside the prune
-    /// transaction with the ids of the deleted messages.
+    /// transaction with the ids of the deleted messages, after every other
+    /// table handle is closed, so it may open any table.
     fn on_messages_pruned(
         &self,
         _txn: &WriteTransaction,
@@ -294,7 +308,9 @@ impl Store {
     /// Store a message and deliver it to each recipient's mailbox.
     ///
     /// A reply (`in_reply_to` set) joins the parent's thread and takes
-    /// `Re: <root subject>`; a new thread needs a non-blank subject. `to`
+    /// `Re: <root subject>`; a new thread needs a non-blank subject. An
+    /// [`Kind::Answer`] must be a reply ([`StoreError::InvalidInput`]
+    /// otherwise), since only a reply can close a question. `to`
     /// must not be empty (mail for unregistered names goes through
     /// [`Store::insert_held`]). The sender must be `human` or a registered
     /// agent ([`StoreError::NotFound`] otherwise), every recipient too
@@ -357,6 +373,11 @@ impl Store {
     ) -> Result<Message, StoreError> {
         if m.body.len() > MAX_BODY {
             return Err(StoreError::TooLarge);
+        }
+        if m.kind == Kind::Answer && m.in_reply_to.is_none() {
+            return Err(StoreError::InvalidInput(
+                "an answer must reply to a message".into(),
+            ));
         }
         let mut to: Vec<String> = Vec::with_capacity(m.to.len());
         for addr in &m.to {
@@ -631,13 +652,16 @@ impl Store {
         let repo_members: Option<HashSet<String>> = match &f.repo {
             None => None,
             Some(repo) => {
+                let repo = normalize(repo)?;
                 let agents: Vec<Agent> = all_json(&txn.open_table(AGENTS)?)?;
                 Some(
                     agents
                         .into_iter()
                         .filter(|a| {
-                            a.repo.as_deref().is_some_and(|r| r.starts_with(repo))
-                                || a.cwd.starts_with(repo)
+                            a.repo
+                                .as_deref()
+                                .is_some_and(|r| lexical(r).starts_with(&repo))
+                                || lexical(&a.cwd).starts_with(&repo)
                         })
                         .map(|a| a.address)
                         .collect(),
@@ -719,7 +743,9 @@ impl Store {
     /// were deleted.
     pub fn prune(&self, before: i64) -> Result<usize, StoreError> {
         let txn = self.db.begin_write()?;
-        let pruned = {
+        // Every table handle is dropped before the hook runs, so it may open
+        // any table itself (redb refuses to open one table twice).
+        let (doomed, pruned) = {
             let mut threads = txn.open_table(THREADS)?;
             let mut messages = txn.open_table(MESSAGES)?;
             let mut doomed: HashSet<String> = HashSet::new();
@@ -746,9 +772,9 @@ impl Store {
                 .retain(|(_, id), _| !doomed.contains(id))?;
             txn.open_table(HELD)?
                 .retain(|(_, _, id), _| !doomed.contains(id))?;
-            self.on_messages_pruned(&txn, &doomed)?;
-            doomed_threads.len()
+            (doomed, doomed_threads.len())
         };
+        self.on_messages_pruned(&txn, &doomed)?;
         txn.commit()?;
         Ok(pruned)
     }

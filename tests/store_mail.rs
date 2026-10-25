@@ -799,3 +799,96 @@ fn released_held_question_is_open_to_its_new_recipient() {
     assert_eq!(s.unread_counts(&d).unwrap(), (1, 0));
     assert_eq!(open_question_threads(&s), 0);
 }
+
+#[test]
+fn answer_without_parent_is_refused() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let err = s
+        .insert_message(
+            NewMessage {
+                kind: Kind::Answer,
+                ..note(&a, &[&b], "Orphan", "!")
+            },
+            1,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::InvalidInput("an answer must reply to a message".into())
+    );
+    assert!(s.inbox(&b, true).unwrap().is_empty());
+    assert!(s.threads(&ThreadFilter::default()).unwrap().is_empty());
+    assert!(s.search("Orphan").unwrap().is_empty());
+    // Held mail goes through the same check.
+    let err = s
+        .insert_held(
+            NewMessage {
+                kind: Kind::Answer,
+                ..note(&a, &[], "Orphan", "!")
+            },
+            1,
+            Path::new("/repo"),
+            &names(&["docs"]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::InvalidInput("an answer must reply to a message".into())
+    );
+    assert!(s.search("Orphan").unwrap().is_empty());
+}
+
+fn by_repo(s: &Store, repo: &str) -> Result<Vec<String>, StoreError> {
+    Ok(s.threads(&ThreadFilter {
+        repo: Some(PathBuf::from(repo)),
+        ..ThreadFilter::default()
+    })?
+    .into_iter()
+    .map(|t| t.thread_id)
+    .collect())
+}
+
+#[test]
+fn threads_repo_filter_is_normalized() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", Some("/other/../r1"));
+    let b = agent(&s, "frontend", Some("/r2"));
+    let t1 = s.insert_message(note(&a, &[HUMAN], "One", "1"), 1).unwrap();
+    s.insert_message(note(&b, &[HUMAN], "Two", "2"), 2).unwrap();
+    for filter in ["/r1", "/r1/", "/r1/./", "/x/../r1", "/r1/sub/.."] {
+        assert_eq!(
+            by_repo(&s, filter).unwrap(),
+            vec![t1.id.clone()],
+            "{filter}"
+        );
+    }
+    // A sibling whose name merely shares a prefix is not inside /r1.
+    assert!(by_repo(&s, "/r").unwrap().is_empty());
+    assert!(matches!(
+        by_repo(&s, "r1").unwrap_err(),
+        StoreError::InvalidInput(_)
+    ));
+}
+
+#[test]
+fn threads_repo_filter_matches_cwd_without_repo() {
+    let (_d, s) = store();
+    let req = agentmail::store::RegisterReq {
+        name: "scratch".into(),
+        role: None,
+        working_on: None,
+        harness: Harness::Other,
+        cwd: PathBuf::from("/r3/./sub"),
+        repo: None,
+        proc_id: None,
+        fresh: true,
+        wake: false,
+    };
+    let a = s.register(req, 1, &|_| false).unwrap().0.address;
+    let t = s.insert_message(note(&a, &[HUMAN], "Cwd", "1"), 1).unwrap();
+    assert_eq!(by_repo(&s, "/r3").unwrap(), vec![t.id.clone()]);
+    assert_eq!(by_repo(&s, "/r3/sub/").unwrap(), vec![t.id]);
+    assert!(by_repo(&s, "/r3/other").unwrap().is_empty());
+}
