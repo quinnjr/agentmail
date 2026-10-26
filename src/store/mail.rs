@@ -364,11 +364,8 @@ impl Store {
             self.refuse_deadlock(&txn, &m.from, &to)?;
         }
         let msg = self.insert_in_txn(&txn, m, now)?;
-        {
-            let mut held = txn.open_table(HELD)?;
-            for name in names {
-                held.insert((repo.as_str(), name.as_str(), msg.id.as_str()), ())?;
-            }
+        for name in names {
+            hold_in(&txn, &repo, name, &msg.id)?;
         }
         txn.commit()?;
         Ok(msg)
@@ -497,14 +494,10 @@ impl Store {
         let repo = repo_key(repo)?;
         validate_name(name).map_err(StoreError::InvalidName)?;
         let txn = self.db.begin_write()?;
-        {
-            let messages = txn.open_table(MESSAGES)?;
-            if messages.get(msg_id)?.is_none() {
-                return Err(missing_message(msg_id));
-            }
-            let mut held = txn.open_table(HELD)?;
-            held.insert((repo.as_str(), name, msg_id), ())?;
+        if txn.open_table(MESSAGES)?.get(msg_id)?.is_none() {
+            return Err(missing_message(msg_id));
         }
+        hold_in(&txn, &repo, name, msg_id)?;
         txn.commit()?;
         Ok(())
     }
@@ -905,6 +898,14 @@ impl Store {
         txn.commit()?;
         Ok(pruned)
     }
+}
+
+/// Hold message `msg_id` for `name` in `repo` (an already normalized repo
+/// key) inside the caller's write transaction: the one place a held row is
+/// written, shared by [`Store::hold_for_name`] and [`Store::insert_held`].
+fn hold_in(txn: &WriteTransaction, repo: &str, name: &str, msg_id: &str) -> Result<(), StoreError> {
+    txn.open_table(HELD)?.insert((repo, name, msg_id), ())?;
+    Ok(())
 }
 
 #[cfg(test)]
