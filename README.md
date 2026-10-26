@@ -125,9 +125,10 @@ user unit at `~/.config/systemd/user/agentmail.service`:
 ```ini
 [Unit]
 Description=agentmail local agent mail daemon
-# Restart however often the daemon is stopped, e.g. by several clients
-# upgrading at once; see below.
-StartLimitIntervalSec=0
+# Tolerate bursts of stops (e.g. several clients upgrading at once) but
+# still give up on a daemon that fails at every start; see below.
+StartLimitIntervalSec=60s
+StartLimitBurst=30
 
 [Service]
 ExecStart=%h/.cargo/bin/agentmail daemon run --wait-for-lock
@@ -181,11 +182,19 @@ again.
 
 `Restart=always` brings the daemon back whenever it exits, including on
 `agentmail daemon stop` and when a client of a newer version stops an older
-daemon after an upgrade. `StartLimitIntervalSec=0` lifts systemd's default
-start rate limit (5 starts in 10s), which would otherwise leave the unit
-`failed` after a burst of such stops; if you leave it out and that happens,
-`systemctl --user reset-failed agentmail` and start it again. So with the unit
-enabled:
+daemon after an upgrade. systemd's default start rate limit (5 starts in
+10s) would leave the unit `failed` after a burst of such stops, so the unit
+raises it to 30 starts in 60s. That still catches a daemon that fails at
+every start (say, its database cannot be opened, its data directory cannot be
+created, or its socket path is too long): restarted every 500ms, it uses up
+the 30 starts in about 15s and the unit goes to `failed`, which
+`systemctl --user status agentmail` shows, with the daemon's errors in
+`journalctl --user -u agentmail`. Fix the cause, then
+`systemctl --user reset-failed agentmail` and start it again; do the same if
+an unusually long burst of stops ever exhausts the limit. Avoid
+`StartLimitIntervalSec=0`, which removes the limit: a daemon that cannot
+start is then restarted twice a second forever, flooding the journal, and the
+unit never shows as failed. So with the unit enabled:
 
 - stop the daemon with `systemctl --user stop agentmail` (and `disable` it to
   keep it stopped across logins); `agentmail daemon stop` only restarts it;
@@ -198,15 +207,16 @@ while the unit is stopped. To avoid racing systemd, a daemon run with
 that finds no daemon answering first waits for one that is shutting down to
 finish its in-flight requests (up to 5s), then, if the last daemon was
 supervised or a supervised one is waiting for the lock, gives it up to 2s to
-take over before starting a daemon of its own. Without a supervisor neither
-wait applies beyond the shutdown, so on-demand start stays immediate. The
-first client after `systemctl --user stop` therefore takes about 2s longer to
-start its daemon. Only daemons whose `daemon run` takes `--wait-for-lock`
-write the lock file's record (with their process id); a daemon from an
-older build, without that flag, leaves whatever an earlier daemon wrote
-there. So right after upgrading from such a build, while its daemon still
-runs, a client may wait those 2s needlessly (if a unit daemon once recorded
-itself and has since been disabled), or not wait for a supervisor; restart the daemon once after upgrading
+take over before starting a daemon of its own. Without a supervisor the
+client waits only for a draining daemon, so on-demand start stays immediate.
+The first client after `systemctl --user stop` therefore takes about 2s
+longer to start its daemon. Every daemon from a build that has
+`--wait-for-lock` records itself in the lock file (supervised or on-demand,
+with its process id); a daemon from an older build leaves whatever an
+earlier daemon wrote there. So right after upgrading from such a build,
+while its daemon still runs, a client may wait those 2s needlessly (if a
+unit daemon once recorded itself and has since been disabled), or not wait
+for a supervisor; restart the daemon once after upgrading
 (`systemctl --user restart agentmail`, or `agentmail daemon stop`) to be
 done with it. If the daemon that takes over speaks another protocol
 version (the unit's `ExecStart` runs a different `agentmail` than the
