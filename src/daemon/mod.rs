@@ -136,11 +136,18 @@ async fn open_store<F: Future<Output = ()>>(
 /// Write `record` to the lock file we hold, for clients to read once we
 /// are gone (see [`LockRecord`]). Best effort: without it clients just do
 /// not wait for a supervisor.
+///
+/// The record is written over the old one before the file is cut to its
+/// length, so a client reading meanwhile never finds the file empty. Over
+/// a longer old record it may briefly find the new one followed by the
+/// old one's tail, which does not decode; clients read again in that case
+/// while the lock is held.
 fn write_lock_record(lock: &File, path: &Path, record: &LockRecord) {
     use std::os::unix::fs::FileExt;
+    let bytes = record.encode();
     let res = lock
-        .set_len(0)
-        .and_then(|()| lock.write_all_at(&record.encode(), 0));
+        .write_all_at(&bytes, 0)
+        .and_then(|()| lock.set_len(bytes.len() as u64));
     if let Err(e) = res {
         eprintln!("agentmail daemon: writing {}: {e}", path.display());
     }
@@ -842,6 +849,42 @@ mod tests {
     use crate::model::{Agent, AgentView, Harness, Presence};
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, duplex};
+
+    /// Rewriting the lock record never leaves the file empty or partial
+    /// for a client reading it meanwhile.
+    #[test]
+    fn rewriting_the_lock_record_never_shows_a_partial_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let rec = LockRecord {
+            supervised: false,
+            socket: paths.socket.clone(),
+        };
+        std::fs::write(&paths.lock, rec.encode()).unwrap();
+        let lock = OpenOptions::new().write(true).open(&paths.lock).unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let done = done.clone();
+            let path = paths.lock.clone();
+            let rec = rec.clone();
+            move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    write_lock_record(&lock, &path, &rec);
+                }
+            }
+        });
+        let until = Instant::now() + Duration::from_millis(300);
+        let mut bad = None;
+        while bad.is_none() && Instant::now() < until {
+            let seen = std::fs::read(&paths.lock).unwrap();
+            if LockRecord::decode(&seen).is_none() {
+                bad = Some(seen);
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(bad, None, "read a partial lock record");
+    }
 
     fn presence(address: &str) -> Event {
         Event::Presence {

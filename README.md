@@ -58,6 +58,8 @@ StartLimitIntervalSec=0
 ExecStart=%h/.cargo/bin/agentmail daemon run --wait-for-lock
 Restart=always
 RestartSec=500ms
+# Signal only the daemon on stop; see below.
+KillMode=mixed
 
 [Install]
 WantedBy=default.target
@@ -80,6 +82,14 @@ SIGINT: it removes its socket, drops open connections (blocked clients get
 finish. Every acknowledged write is already durable, so `systemctl stop` loses
 nothing. A second SIGTERM or SIGINT during that wait exits at once with
 status 1, first killing any `git` commands those requests still run.
+
+`KillMode=mixed` is what makes that drain work under systemd. With the
+default (`control-group`), `systemctl stop` and `restart` send SIGTERM to
+every process in the unit at once, including the `git` commands in-flight
+requests run to find an agent's repository. Those requests would then
+finish without one, and `register` would record the agent with no repo.
+With `mixed`, only the daemon gets SIGTERM, and whatever is left in the unit
+is killed only if the daemon has not exited by `TimeoutStopSec`.
 
 With `--wait-for-lock`, a unit started while another daemon (say, one an
 agent started on demand) holds the lock waits for that daemon to exit and

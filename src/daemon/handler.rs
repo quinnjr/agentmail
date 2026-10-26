@@ -216,32 +216,45 @@ fn output_within(cmd: Command, limit: Duration) -> Option<Vec<u8>> {
 }
 
 /// The process groups of commands running under [`output_within`], so a
-/// process exiting without waiting for them can kill them. A group is
-/// listed from spawn until just before its leader is reaped, so its id
-/// cannot have been reused by an unrelated process while listed.
+/// process exiting without waiting for them can kill them. A command is
+/// spawned and its group listed under the lock, so none runs unlisted. A
+/// group is taken off the list before its leader is reaped, or (when it
+/// cannot tell whether the leader is still unreaped) before anything else
+/// is done with it, so its id cannot have been reused by an unrelated
+/// process while listed.
 static RUNNING_GROUPS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
 /// Kill every command running under [`output_within`], with its whole
-/// process group. For a daemon about to exit without waiting for the
-/// requests that run them, which would otherwise orphan them.
+/// process group, and start no more. For a daemon about to exit without
+/// waiting for the requests that run them, which would otherwise orphan
+/// them.
+///
+/// Never gives the lock back: holding it keeps every listed leader
+/// unreaped (see [`RUNNING_GROUPS`]) until all the kills are sent, and
+/// then keeps any request from starting a command the kills missed
+/// before the process exits.
 pub fn kill_running_commands() {
-    // Holding the lock keeps every listed leader unreaped (see
-    // `RUNNING_GROUPS`) until all the kills are sent.
     let groups = RUNNING_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     for &pgid in groups.iter() {
         kill_group(pgid);
     }
+    std::mem::forget(groups);
+}
+
+/// Take group `pgid` off [`RUNNING_GROUPS`].
+fn unlist(pgid: u32) {
+    RUNNING_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&pgid);
 }
 
 /// Reap `child`, the leader of process group `pgid`, after taking the group
 /// off [`RUNNING_GROUPS`].
 fn reap(child: &mut std::process::Child, pgid: u32) {
-    RUNNING_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&pgid);
+    unlist(pgid);
     let _ = child.wait();
 }
 
@@ -281,19 +294,22 @@ fn output_within_with(
     use std::os::unix::process::CommandExt;
 
     let deadline = Instant::now() + limit;
-    let mut child = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|_| GiveUp::Spawn)?;
-    // With `process_group(0)` the group id is the child's pid.
+        .process_group(0);
+    // Spawn and list under one lock, so a daemon killing every listed
+    // group on its way out (`kill_running_commands`) cannot miss this one.
+    let mut child = {
+        let mut groups = RUNNING_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let child = cmd.spawn().map_err(|_| GiveUp::Spawn)?;
+        // With `process_group(0)` the group id is the child's pid.
+        groups.insert(child.id());
+        child
+    };
     let pgid = child.id();
-    RUNNING_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(pgid);
     let Some(mut stdout) = child.stdout.take() else {
         kill_group(pgid);
         reap(&mut child, pgid);
@@ -317,10 +333,12 @@ fn output_within_with(
             }
             Err(_) => {
                 // Cannot tell whether the leader is still ours to wait
-                // for, so the group id may already be free: do not signal
-                // the group, only the child std still tracks.
+                // for, so the group id may already be free: unlist it at
+                // once, so no exiting daemon signals it either, and do not
+                // signal the group, only the child std still tracks.
+                unlist(pgid);
                 let _ = child.kill();
-                reap(&mut child, pgid);
+                let _ = child.wait();
                 return Err(GiveUp::LeaderUnknown);
             }
         }
@@ -1318,6 +1336,34 @@ mod tests {
             output_within(cmd, Duration::from_secs(5)),
             Some(b"/repo\n".to_vec())
         );
+    }
+
+    /// A command cannot start while `RUNNING_GROUPS` is held, as it is by
+    /// a daemon killing them on its way out: one started in that window
+    /// would never be killed, and outlive the daemon.
+    #[test]
+    fn no_command_starts_while_the_running_groups_are_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("ran");
+        let held = RUNNING_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let run = std::thread::spawn({
+            let marker = marker.clone();
+            move || {
+                let mut cmd = Command::new("touch");
+                cmd.arg(&marker);
+                output_within(cmd, Duration::from_secs(10))
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "a command started while the groups were held"
+        );
+        drop(held);
+        assert_eq!(run.join().unwrap(), Some(Vec::new()));
+        assert!(marker.exists());
     }
 
     /// Limits to try, in turn, for a case that needs the command to get

@@ -38,6 +38,35 @@ const DRAIN_WAIT: Duration = Duration::from_secs(5);
 /// when another holds the lock, e.g. one that is still shutting down.
 const RESPAWN_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many times to read a lock record that does not decode while the
+/// lock is held, [`RECORD_REREAD_INTERVAL`] apart.
+const RECORD_READS: u32 = 10;
+/// The pause between those reads.
+const RECORD_REREAD_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The record in the lock file (see [`Paths::lock_record`]). A daemon that
+/// has just taken the lock may be caught rewriting it, the new record
+/// followed by the tail of a longer old one; so while the lock is held, a
+/// record that does not decode is read again a few times before it counts
+/// as none.
+async fn settled_lock_record(paths: &Paths) -> Option<LockRecord> {
+    for _ in 1..RECORD_READS {
+        if let Some(rec) = paths.lock_record() {
+            return Some(rec);
+        }
+        if !paths.lock_held() {
+            return None;
+        }
+        tokio::time::sleep(RECORD_REREAD_INTERVAL).await;
+    }
+    paths.lock_record()
+}
+
+/// Whether `rec` is the record of a daemon serving the socket of `paths`.
+fn serves_our_socket(paths: &Paths, rec: &LockRecord) -> bool {
+    lexical(&rec.socket) == lexical(&paths.socket) || same_dir(&rec.socket, &paths.socket)
+}
+
 /// A connection to the daemon that has completed the `Hello` handshake.
 pub struct Client {
     reader: BufReader<OwnedReadHalf>,
@@ -347,12 +376,12 @@ impl Client {
     /// return at once. A lock held for another socket is a misconfiguration
     /// that [`Client::spawn_and_connect`] reports, so it is not waited for.
     async fn await_successor(paths: &Paths) -> Result<Option<Client>> {
-        let ours = |rec: &LockRecord| {
-            lexical(&rec.socket) == lexical(&paths.socket) || same_dir(&rec.socket, &paths.socket)
-        };
         let drain_deadline = Instant::now() + DRAIN_WAIT;
         while paths.lock_held() {
-            if !paths.lock_record().is_some_and(|r| ours(&r)) {
+            if !settled_lock_record(paths)
+                .await
+                .is_some_and(|r| serves_our_socket(paths, &r))
+            {
                 return Ok(None);
             }
             let left = drain_deadline.saturating_duration_since(Instant::now());
@@ -364,9 +393,9 @@ impl Client {
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
-        if !paths
-            .lock_record()
-            .is_some_and(|r| r.supervised && ours(&r))
+        if !settled_lock_record(paths)
+            .await
+            .is_some_and(|r| r.supervised && serves_our_socket(paths, &r))
         {
             return Ok(None);
         }
@@ -410,9 +439,23 @@ impl Client {
                 Err(Handshake::WrongDataDir(e)) => return Err(e),
             }
             if Instant::now() >= deadline {
-                // A daemon that holds the lock but is not at our socket is
-                // serving another socket path for the same data directory.
-                let msg = if paths.lock_held() {
+                let held = paths.lock_held();
+                let ours = held
+                    && settled_lock_record(paths)
+                        .await
+                        .is_some_and(|r| serves_our_socket(paths, &r));
+                let msg = if ours {
+                    // It serves our socket but no longer listens: it is
+                    // still finishing in-flight requests.
+                    format!(
+                        "the daemon holding {} is still shutting down (finishing \
+                         in-flight requests); try again once it has exited",
+                        paths.lock.display()
+                    )
+                } else if held {
+                    // A daemon that holds the lock but is not at our socket
+                    // is serving another socket path for the same data
+                    // directory.
                     format!(
                         "a daemon holds {} but is not listening on {}; check \
                          AGENTMAIL_SOCKET/XDG_RUNTIME_DIR (every client sharing a \
@@ -557,6 +600,37 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record caught mid-rewrite (a shorter one written over a longer
+    /// one) is read again while the lock is held, rather than taken for a
+    /// daemon that is not ours.
+    #[tokio::test]
+    async fn a_record_caught_mid_rewrite_is_read_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let rec = LockRecord {
+            supervised: false,
+            socket: paths.socket.clone(),
+        };
+        let mut torn = rec.encode();
+        torn.extend_from_slice(b"k\n");
+        std::fs::write(&paths.lock, &torn).unwrap();
+        // Nobody holds the lock: what is there is all there will be.
+        assert_eq!(settled_lock_record(&paths).await, None);
+
+        let lock = std::fs::File::open(&paths.lock).unwrap();
+        lock.try_lock().unwrap();
+        let fix = std::thread::spawn({
+            let path = paths.lock.clone();
+            let rec = rec.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(5));
+                std::fs::write(path, rec.encode()).unwrap();
+            }
+        });
+        assert_eq!(settled_lock_record(&paths).await, Some(rec));
+        fix.join().unwrap();
+    }
 
     #[test]
     fn client_daemon_bin_prefers_env_override() {

@@ -11,7 +11,7 @@ use agentmail::client::Client;
 use agentmail::daemon::handler::TOUCH_INTERVAL_MS;
 use agentmail::daemon::{DaemonConfig, MAX_SOCKET_PATH_BYTES, serve};
 use agentmail::model::HUMAN;
-use agentmail::paths::Paths;
+use agentmail::paths::{LockRecord, Paths};
 use agentmail::protocol::{
     Caller, Envelope, ErrorCode, Event, MAX_REQUEST_BYTES, PROTOCOL_VERSION, Request, Response,
 };
@@ -1934,4 +1934,168 @@ async fn version_mismatch_uses_a_daemon_the_supervisor_restarts() {
         .expect("daemon did not stop")
         .unwrap()
         .unwrap();
+}
+
+/// The lock record a daemon writes for `paths`.
+fn record(paths: &Paths, supervised: bool) -> LockRecord {
+    LockRecord {
+        supervised,
+        socket: paths.socket.clone(),
+    }
+}
+
+/// A plain `daemon run` records that it is not supervised, and one run
+/// with `--wait-for-lock` (by a supervisor) that it is.
+#[tokio::test]
+async fn daemon_run_records_whether_it_is_supervised() {
+    for (args, supervised) in [
+        (&["daemon", "run"][..], false),
+        (&["daemon", "run", "--wait-for-lock"][..], true),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let mut child = Foreground::spawn(&paths, args, None);
+        drop(child.serving(&paths).await);
+        assert_eq!(
+            paths.lock_record(),
+            Some(record(&paths, supervised)),
+            "{args:?}"
+        );
+        child.terminate().await;
+    }
+}
+
+/// Without a supervisor (`daemon run` records `on-demand`), a client that
+/// finds the daemon draining after SIGTERM waits for it to finish, then
+/// starts its own daemon at once instead of waiting for a successor.
+#[tokio::test]
+async fn client_starts_a_daemon_once_an_unsupervised_one_has_drained() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let (path, started) = stalling_git(dir.path());
+    let mut old = Foreground::spawn(&paths, &["daemon", "run"], Some(&path));
+    let c = old.serving(&paths).await;
+    assert_eq!(paths.lock_record(), Some(record(&paths, false)));
+    let (slow, _git) = stall_in_git(c, dir.path(), &started).await;
+
+    old.signal(libc::SIGTERM);
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while paths.socket.exists() {
+        assert!(Instant::now() < deadline, "socket never removed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(old.running(), "the old daemon did not wait for git");
+    let client = tokio::spawn({
+        let paths = paths.clone();
+        async move {
+            let c = Client::connect_or_spawn_with(&paths, &bin()).await;
+            (c, Instant::now())
+        }
+    });
+    let (status, err) = old.exit_within(PROCESS_WAIT).await;
+    let exited = Instant::now();
+    assert!(status.success(), "{status:?}: {err}");
+    let (c, connected) = client.await.unwrap();
+    let mut c = c.expect("the client did not start a daemon");
+    assert_ne!(hello_pid(&mut c).await, u64::from(old.0.id()));
+    // A supervised record would make it wait 2s for a successor first.
+    let after = connected.saturating_duration_since(exited);
+    assert!(
+        after < Duration::from_secs(2),
+        "waited {after:?} after the old daemon exited"
+    );
+    drop(c);
+    let _ = slow.await;
+    stop_spawned(&paths).await;
+}
+
+/// A daemon for our socket that holds the lock but never stops draining is
+/// waited for only up to the drain limit (5s).
+#[tokio::test]
+async fn client_waits_for_a_draining_daemon_only_so_long() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    std::fs::write(&paths.lock, record(&paths, false).encode()).unwrap();
+    let lock = std::fs::File::open(&paths.lock).unwrap();
+    lock.try_lock().unwrap();
+
+    let began = Instant::now();
+    // Starting a daemon of its own fails at once: there is no such binary.
+    let err = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+        .await
+        .err()
+        .expect("connected without a daemon");
+    let waited = began.elapsed();
+    assert!(
+        (Duration::from_millis(4500)..Duration::from_secs(8)).contains(&waited),
+        "gave up after {waited:?}"
+    );
+    assert!(
+        format!("{err:#}").contains("/nonexistent/agentmail"),
+        "{err:#}"
+    );
+    drop(lock);
+}
+
+/// A lock held for another socket is a misconfiguration, not a daemon
+/// shutting down: the client does not wait for it.
+#[tokio::test]
+async fn client_does_not_wait_for_a_daemon_on_another_socket() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let other = LockRecord {
+        supervised: true,
+        socket: dir.path().join("elsewhere.sock"),
+    };
+    std::fs::write(&paths.lock, other.encode()).unwrap();
+    let lock = std::fs::File::open(&paths.lock).unwrap();
+    lock.try_lock().unwrap();
+
+    let began = Instant::now();
+    let err = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+        .await
+        .err()
+        .expect("connected without a daemon");
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "waited {:?} before starting a daemon",
+        began.elapsed()
+    );
+    assert!(
+        format!("{err:#}").contains("/nonexistent/agentmail"),
+        "{err:#}"
+    );
+    drop(lock);
+}
+
+/// When the daemon holding the lock serves our socket, the client that
+/// gives up says it is still shutting down, rather than blaming the
+/// socket configuration.
+#[tokio::test]
+async fn autostart_reports_a_daemon_still_shutting_down() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    std::fs::write(&paths.lock, record(&paths, false).encode()).unwrap();
+    let lock = std::fs::File::open(&paths.lock).unwrap();
+    lock.try_lock().unwrap();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        Client::connect_or_spawn_with(&paths, &bin()),
+    )
+    .await
+    .expect("connect_or_spawn_with hung")
+    .err()
+    .expect("connected without a daemon");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("still shutting down"), "{msg}");
+    assert!(!msg.contains("XDG_RUNTIME_DIR"), "{msg}");
+    // Let the daemons autostart spawned give up on the lock before
+    // releasing it, or one still retrying would take it and serve on.
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while !daemons_for(&paths.data_dir).is_empty() {
+        assert!(Instant::now() < deadline, "spawned daemons kept running");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(lock);
 }
