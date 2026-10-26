@@ -230,6 +230,42 @@ fn unsurfaced_urgent_in(
     Ok(out)
 }
 
+/// What a harness hook shows `addr`, read from one snapshot of `mailbox`,
+/// `messages` and `index` (see [`Store::hook_snapshot`]). Decodes only the
+/// unread urgent rows and the open questions in `addr`'s mailbox.
+fn hook_snapshot_in(
+    mailbox: &impl ReadableTable<(&'static str, &'static str), u8>,
+    messages: &impl ReadableTable<&'static str, &'static [u8]>,
+    index: &impl ReadableTable<&'static str, ()>,
+    addr: &str,
+) -> Result<HookSnapshot, StoreError> {
+    let unread = mailbox_rows(mailbox, addr)?
+        .iter()
+        .filter(|(_, flags)| flags & READ == 0)
+        .count();
+    let mut open_questions = Vec::new();
+    for row in index.iter()? {
+        let (id, _) = row?;
+        let id = id.value();
+        // A mailbox key lookup first: questions to others cost no decode.
+        if mailbox.get((addr, id))?.is_none() {
+            continue;
+        }
+        if let Some(msg) = get_json::<Message>(messages, id)?
+            && msg.kind == Kind::Question
+            && msg.to.iter().any(|a| a == addr)
+        {
+            open_questions.push(msg);
+        }
+    }
+    let urgent = unsurfaced_urgent_in(mailbox, messages, addr)?;
+    Ok(HookSnapshot {
+        unread,
+        open_questions,
+        urgent,
+    })
+}
+
 fn is_known(
     agents: &impl ReadableTable<&'static str, &'static [u8]>,
     addr: &str,
@@ -280,6 +316,18 @@ fn push_unique(list: &mut Vec<String>, addr: &str) -> bool {
 /// require one), so it can never match a held key.
 pub(crate) fn agent_repo_key(agent: &Agent) -> Option<String> {
     repo_key(agent.repo.as_deref().unwrap_or(&agent.cwd)).ok()
+}
+
+/// What a harness hook shows an agent, all from one store snapshot: so
+/// `unread` always counts every message in `urgent`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HookSnapshot {
+    /// Messages in the mailbox not yet read.
+    pub unread: usize,
+    /// Open questions addressed to the agent (read or not), in id order.
+    pub open_questions: Vec<Message>,
+    /// Unread urgent mail not yet surfaced, oldest first.
+    pub urgent: Vec<Message>,
 }
 
 /// A mailbox listing for `addr`: its messages paired with their mailbox
@@ -728,6 +776,43 @@ impl Store {
         };
         txn.commit()?;
         Ok(out)
+    }
+
+    /// `addr`'s [`HookSnapshot`], read in one transaction. With `surface`,
+    /// the urgent mail it returns is also marked surfaced in that same
+    /// (write) transaction, so of concurrent callers only one gets each
+    /// message; no write transaction is taken when there is none.
+    pub fn hook_snapshot(&self, addr: &str, surface: bool) -> Result<HookSnapshot, StoreError> {
+        let snap = {
+            let txn = self.read()?;
+            hook_snapshot_in(
+                &txn.open_table(MAILBOX)?,
+                &txn.open_table(MESSAGES)?,
+                &txn.open_table(OPEN_QUESTIONS)?,
+                addr,
+            )?
+        };
+        if !surface || snap.urgent.is_empty() {
+            return Ok(snap);
+        }
+        let txn = self.db.begin_write()?;
+        let snap = {
+            let mut mailbox = txn.open_table(MAILBOX)?;
+            let snap = hook_snapshot_in(
+                &mailbox,
+                &txn.open_table(MESSAGES)?,
+                &txn.open_table(OPEN_QUESTIONS)?,
+                addr,
+            )?;
+            for m in &snap.urgent {
+                let key = (addr, m.id.as_str());
+                let flags = mailbox.get(key)?.map_or(0, |f| f.value());
+                mailbox.insert(key, flags | SURFACED)?;
+            }
+            snap
+        };
+        txn.commit()?;
+        Ok(snap)
     }
 
     /// `(unread messages, open questions addressed to addr)`.

@@ -15,7 +15,7 @@ mod mail;
 mod questions;
 
 pub use agents::{Alive, RegisterReq, Registered};
-pub use mail::{MAX_BODY, NewMessage, ThreadFilter, ThreadSummary};
+pub use mail::{HookSnapshot, MAX_BODY, NewMessage, ThreadFilter, ThreadSummary};
 pub(crate) use mail::{agent_repo_key, lexical, questions_closed_by};
 
 /// Agents by address. Value: JSON [`crate::model::Agent`].

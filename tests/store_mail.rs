@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use agentmail::model::{HUMAN, Harness, Kind, Message, ProcId};
-use agentmail::store::{Alive, MAX_BODY, NewMessage, Store, StoreError, ThreadFilter};
+use agentmail::store::{
+    Alive, HookSnapshot, MAX_BODY, NewMessage, Store, StoreError, ThreadFilter,
+};
 use tempfile::TempDir;
 
 fn store() -> (TempDir, Store) {
@@ -1290,4 +1292,81 @@ fn surface_urgent_returns_each_message_once() {
     assert_eq!(s.unread(&b).unwrap().len(), 3);
     let u3 = s.insert_message(urgent(&a, &[&b], "three"), 4).unwrap();
     assert_eq!(ids(&s.surface_urgent(&b).unwrap()), vec![u3.id.as_str()]);
+}
+
+#[test]
+fn hook_snapshot_counts_unread_lists_questions_and_urgent() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let c = agent(&s, "infra", None);
+    let empty = s.hook_snapshot(&b, false).unwrap();
+    assert_eq!(empty, HookSnapshot::default());
+
+    let calm = s.insert_message(note(&a, &[&b], "calm", "x"), 1).unwrap();
+    let u1 = s.insert_message(urgent(&a, &[&b], "one"), 2).unwrap();
+    let q = s.insert_message(question(&a, &[&b], "why?"), 3).unwrap();
+    // A question to someone else is not b's.
+    s.insert_message(question(&a, &[&c], "other"), 4).unwrap();
+    // Read mail is counted out of unread, but a read open question stays.
+    s.mark_read(&b, &[calm.id.clone(), q.id.clone()]).unwrap();
+
+    let peek = s.hook_snapshot(&b, false).unwrap();
+    assert_eq!(peek.unread, 1);
+    assert_eq!(ids(&peek.open_questions), vec![q.id.as_str()]);
+    assert_eq!(ids(&peek.urgent), vec![u1.id.as_str()]);
+    // Peeking surfaces nothing.
+    assert_eq!(s.hook_snapshot(&b, false).unwrap(), peek);
+
+    let first = s.hook_snapshot(&b, true).unwrap();
+    assert_eq!(first, peek);
+    let second = s.hook_snapshot(&b, true).unwrap();
+    assert!(second.urgent.is_empty());
+    assert_eq!(second.unread, 1, "surfacing leaves read state alone");
+    assert_eq!(ids(&second.open_questions), vec![q.id.as_str()]);
+
+    // An answered question is no longer listed.
+    s.insert_message(answer(&b, &[&a], &q.id), 5).unwrap();
+    assert!(
+        s.hook_snapshot(&b, false)
+            .unwrap()
+            .open_questions
+            .is_empty()
+    );
+}
+
+#[test]
+fn hook_snapshot_is_one_consistent_view_under_concurrent_delivery() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let s = std::sync::Arc::new(s);
+    let writer = {
+        let (s, a, b) = (s.clone(), a.clone(), b.clone());
+        std::thread::spawn(move || {
+            for i in 0..50 {
+                s.insert_message(urgent(&a, &[&b], &format!("u{i}")), i)
+                    .unwrap();
+            }
+        })
+    };
+    let mut surfaced = 0;
+    while !writer.is_finished() {
+        for surface in [false, true] {
+            let snap = s.hook_snapshot(&b, surface).unwrap();
+            assert!(
+                snap.unread >= surfaced + snap.urgent.len(),
+                "unread {} < surfaced {surfaced} + urgent {}",
+                snap.unread,
+                snap.urgent.len()
+            );
+            if surface {
+                surfaced += snap.urgent.len();
+            }
+        }
+    }
+    writer.join().unwrap();
+    surfaced += s.hook_snapshot(&b, true).unwrap().urgent.len();
+    assert_eq!(surfaced, 50);
+    assert_eq!(s.hook_snapshot(&b, false).unwrap().unread, 50);
 }

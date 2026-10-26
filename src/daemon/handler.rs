@@ -1337,31 +1337,23 @@ impl Handler {
             .get_agent(&me)
             .map_err(store_err)?
             .ok_or_else(|| ClientError::new(ErrorCode::NotFound, format!("no agent {me:?}")))?;
-        let (unread, _) = self.store.unread_counts(&me).map_err(store_err)?;
-        let mut open_questions = Vec::new();
-        for q in self.store.open_questions_to(&me).map_err(store_err)? {
-            // A question whose message is gone (pruned) has nothing to show.
-            if let Some(m) = self.store.get_message(&q.id).map_err(store_err)? {
-                open_questions.push(json!({
-                    "id": m.id,
-                    "from": m.from,
-                    "subject": m.subject,
-                }));
-            }
-        }
-        let urgent = if surface_urgent {
-            self.store.surface_urgent(&me)
-        } else {
-            self.store.unsurfaced_urgent(&me)
-        }
-        .map_err(store_err)?;
+        // One store snapshot, so `unread` always counts every `urgent` one.
+        let snap = self
+            .store
+            .hook_snapshot(&me, surface_urgent)
+            .map_err(store_err)?;
+        let open_questions: Vec<Value> = snap
+            .open_questions
+            .iter()
+            .map(|m| json!({ "id": m.id, "from": m.from, "subject": m.subject }))
+            .collect();
         Ok(json!({
             "address": agent.address,
             "name": agent.name,
             "wake": agent.wake,
-            "unread": unread,
+            "unread": snap.unread,
             "open_questions": open_questions,
-            "urgent": to_json(&urgent)?,
+            "urgent": to_json(&snap.urgent)?,
         }))
     }
 
