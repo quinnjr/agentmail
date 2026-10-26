@@ -16,9 +16,10 @@
 //!   as the harness process it binds to (`Caller::Procs`), so a session that
 //!   registered before (or from a hook or shell) is found again. After a
 //!   `register` without a session it calls as the returned address (unless
-//!   `AGENTMAIL_ADDRESS` is set). A server
-//!   bound to a harness that shares its process between sessions (opencode)
-//!   refuses `register` without a session, so it never caches an address.
+//!   `AGENTMAIL_ADDRESS` is set).
+//! - A server bound to a harness that shares its process between sessions
+//!   (opencode) refuses `register` without a session, so it never caches an
+//!   address.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

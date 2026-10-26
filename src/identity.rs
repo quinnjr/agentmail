@@ -145,15 +145,18 @@ fn caller_from(
 /// The process a registration binds to, with its harness:
 ///
 /// 1. `explicit_pid` that is one of our own ancestors (the MCP server passes
-///    its parent) and is not itself a known harness process, under a kiro
-///    process: that kiro process. kiro V3 runs its MCP servers from a `node`
-///    helper, and binding the helper would record [`Harness::Other`]. Only
-///    kiro gets this: an unknown MCP client run from a Claude Code or
-///    opencode shell must bind itself, not the harness it happens to run
-///    under, or two agents would share one process binding.
+///    its parent) and is not itself a known harness process, whose own
+///    nearest harness ancestor is a kiro process: that kiro process. kiro V3
+///    runs its MCP servers from a `node` helper, and binding the helper
+///    would record [`Harness::Other`]. The kiro must sit above
+///    `explicit_pid`: a pid that names a process above kiro (say the
+///    terminal that launched it) is bound exactly. Only kiro gets this: an
+///    unknown MCP client run from a Claude Code or opencode shell must bind
+///    itself, not the harness it happens to run under, or two agents would
+///    share one process binding.
 /// 2. Any other `explicit_pid` (`register --pid`, or a parent that is a
-///    harness or has no kiro above it): exactly that process, with the
-///    harness its command name suggests.
+///    harness, has no kiro above it, or sits above kiro): exactly that
+///    process, with the harness its command name suggests.
 /// 3. Otherwise the nearest ancestor that is a known harness process.
 /// 4. Otherwise the grandparent, i.e. the parent of the shell running the
 ///    CLI, as [`Harness::Other`].
@@ -184,7 +187,7 @@ fn register_proc_with(
         let harness = procinfo::comm(pid).map_or(Harness::Other, |c| procinfo::detect_harness(&c));
         if harness == Harness::Other
             && procinfo::ancestors(me).contains(&p)
-            && let Some(found) = find_harness(me).filter(|(h, k)| usable(h) && *k == Harness::Kiro)
+            && let Some(found) = find_harness(pid).filter(|(h, k)| usable(h) && *k == Harness::Kiro)
         {
             return Some(found);
         }
@@ -502,6 +505,28 @@ mod tests {
         assert_eq!(via_parent, Some((me, Harness::Kiro)));
         assert_eq!(no_harness, shell_id.map(|p| (p, Harness::Other)));
         assert_eq!(not_ancestor, sleep_id.map(|p| (p, Harness::Other)));
+    }
+
+    #[test]
+    fn identity_register_proc_explicit_pid_above_kiro_binds_itself() {
+        // sleep -> sh -> test process, with the shell standing in for
+        // kiro-cli. The sleep names the test process, which sits above the
+        // kiro: it binds exactly that process, not the kiro below it.
+        let (child, grandchild) = spawn_grandchild();
+        let shell = child.id();
+        let kiro_above = |x: u32| {
+            procinfo::ancestors(x)
+                .into_iter()
+                .find(|p| p.pid == shell)
+                .map(|p| (p, Harness::Kiro))
+        };
+        let me = procinfo::proc_id(std::process::id()).unwrap();
+        let above = register_proc_with(grandchild, Some(me.pid), kiro_above);
+        // The lookup really does see the kiro from the sleep.
+        let seen = kiro_above(grandchild).map(|(p, _)| p.pid);
+        reap(child, grandchild);
+        assert_eq!(seen, Some(shell));
+        assert_eq!(above, Some((me, Harness::Other)));
     }
 
     #[test]
