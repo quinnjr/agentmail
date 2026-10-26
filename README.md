@@ -251,6 +251,31 @@ systemctl --user import-environment XDG_DATA_HOME AGENTMAIL_DATA_DIR AGENTMAIL_S
 systemctl --user restart agentmail
 ```
 
+### Upgrading the database
+
+A newer agentmail may change the database schema. The first daemon of the
+new version to open the database migrates it in place, in one transaction,
+and keeps all mail and read state. The migration is one-way: there is no
+downgrade, and an older agentmail refuses the migrated database.
+
+Schema 2 (harness integration) is such a change. An agentmail built before
+it, run against a schema-2 database, gives a clear reason only from
+`agentmail daemon run`:
+
+```
+.../agentmail.redb has schema version 2, this build supports 1
+```
+
+Its CLI commands, MCP server and hooks, which start the daemon on demand,
+instead report a misleading error such as `the daemon holding
+.../agentmail.lock is still shutting down (finishing in-flight requests); try
+again once it has exited: No such file or directory`, and never mention the
+schema. That older build cannot be fixed after the fact. If you see that
+error, run `agentmail daemon run` with the same binary to see the real
+reason, and use a single agentmail binary everywhere (the CLI, every
+harness's MCP and hook configuration, and the systemd unit) so that none of
+them is older than the database.
+
 ## The human
 
 You use the same CLI as the agents, acting as the reserved address `human`.

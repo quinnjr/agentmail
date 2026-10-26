@@ -25,8 +25,8 @@ pub(crate) const CONTACTS: TableDefinition<(&str, &str), ()> = TableDefinition::
 /// Messages by id (ULID). Value: JSON [`crate::model::Message`].
 pub(crate) const MESSAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("messages");
 /// Per-recipient delivery state: `(address, message id) -> flags`, a set
-/// of [`READ`] and [`SURFACED`]. A row with no flags is delivered, unread
-/// and not yet surfaced.
+/// of [`READ`], [`SURFACED`] and [`URGENT`]. A row with no flags is a
+/// delivered, unread, not yet surfaced, non-urgent message.
 ///
 /// Not named `mailbox`: a schema-1 build opens its bool `mailbox` table
 /// before checking the schema version, and redb refuses a table opened
@@ -38,6 +38,11 @@ pub(crate) const READ: u8 = 0b01;
 /// [`MAILBOX`] flag: an urgent message was pushed to the recipient mid-run
 /// (see [`Store::mark_surfaced`]). Independent of [`READ`].
 pub(crate) const SURFACED: u8 = 0b10;
+/// [`MAILBOX`] flag: the message is urgent. Set once, at delivery (and by
+/// the schema-1 migration), from [`crate::model::Message::urgent`], so the
+/// hooks can find unsurfaced urgent mail from the flags alone instead of
+/// decoding every unread message.
+pub(crate) const URGENT: u8 = 0b100;
 /// The mailbox as schema 1 stored it: `(address, message id) -> read`.
 /// Only the migration opens it, and deletes it.
 const MAILBOX_V1: TableDefinition<(&str, &str), bool> = TableDefinition::new("mailbox");
@@ -124,6 +129,12 @@ pub struct Store {
 impl Store {
     /// Open (or create) the database at `path`, creating its parent
     /// directory and every table, and checking the schema version.
+    ///
+    /// A schema-1 database is migrated in place to schema 2 inside the same
+    /// write transaction (the bool `mailbox` table becomes `mailbox_flags`;
+    /// see [`MAILBOX`]), so either the whole migration and the version bump
+    /// commit or nothing does. The migration is one-way: a schema-1 build
+    /// refuses the migrated database, and there is no downgrade.
     pub fn open(path: &Path) -> anyhow::Result<Store> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
@@ -169,7 +180,8 @@ impl Store {
 }
 
 /// Schema 1 to 2: move every row of the old bool mailbox into [`MAILBOX`]
-/// as flags (`true` becomes [`READ`], `false` no flags) and delete the old
+/// as flags (`true` becomes [`READ`], `false` no flags, plus [`URGENT`]
+/// when the stored message is urgent) and delete the old
 /// table, inside the caller's write transaction, so the version bump
 /// commits with it or not at all.
 fn migrate_mailbox_v1(txn: &redb::WriteTransaction) -> Result<(), StoreError> {
@@ -183,9 +195,11 @@ fn migrate_mailbox_v1(txn: &redb::WriteTransaction) -> Result<(), StoreError> {
         }
     }
     txn.delete_table(MAILBOX_V1)?;
+    let messages = txn.open_table(MESSAGES)?;
     let mut mailbox = txn.open_table(MAILBOX)?;
     for (addr, id, read) in rows {
-        let flags = if read { READ } else { 0 };
+        let urgent = get_json::<crate::model::Message>(&messages, &id)?.is_some_and(|m| m.urgent);
+        let flags = if read { READ } else { 0 } | if urgent { URGENT } else { 0 };
         mailbox.insert((addr.as_str(), id.as_str()), flags)?;
     }
     Ok(())
@@ -243,7 +257,7 @@ mod tests {
         assert!(err.to_string().contains("schema version 999"), "{err}");
     }
 
-    fn v1_message(id: &str, to: &str) -> crate::model::Message {
+    fn v1_message(id: &str, to: &str, urgent: bool) -> crate::model::Message {
         crate::model::Message {
             id: id.into(),
             thread_id: id.into(),
@@ -254,7 +268,7 @@ mod tests {
             subject: format!("subject {id}"),
             body: "body".into(),
             kind: crate::model::Kind::Note,
-            urgent: true,
+            urgent,
             refs: Vec::new(),
             created_at: 1,
         }
@@ -274,8 +288,12 @@ mod tests {
                 let mut messages = txn.open_table(MESSAGES).unwrap();
                 let mut threads = txn.open_table(THREADS).unwrap();
                 let mut mailbox = txn.open_table(MAILBOX_V1).unwrap();
-                for (id, read) in [("01AREAD", true), ("01BUNREAD", false)] {
-                    let m = v1_message(id, addr);
+                for (id, read, urgent) in [
+                    ("01AREAD", true, true),
+                    ("01BUNREAD", false, true),
+                    ("01CNOTE", false, false),
+                ] {
+                    let m = v1_message(id, addr, urgent);
                     messages.insert(id, encode(&m).unwrap().as_slice()).unwrap();
                     threads.insert((id, id), ()).unwrap();
                     mailbox.insert((addr, id), read).unwrap();
@@ -296,20 +314,24 @@ mod tests {
             let mailbox = txn.open_table(MAILBOX).unwrap();
             assert_eq!(
                 mailbox.get((addr, "01AREAD")).unwrap().unwrap().value(),
-                READ
+                READ | URGENT
             );
             assert_eq!(
                 mailbox.get((addr, "01BUNREAD")).unwrap().unwrap().value(),
-                0
+                URGENT
             );
+            assert_eq!(mailbox.get((addr, "01CNOTE")).unwrap().unwrap().value(), 0);
         }
         let ids = |msgs: Vec<crate::model::Message>| -> Vec<String> {
             msgs.into_iter().map(|m| m.id).collect()
         };
-        assert_eq!(ids(store.inbox(addr, false).unwrap()), vec!["01BUNREAD"]);
+        assert_eq!(
+            ids(store.inbox(addr, false).unwrap()),
+            vec!["01BUNREAD", "01CNOTE"]
+        );
         assert_eq!(
             ids(store.inbox(addr, true).unwrap()),
-            vec!["01AREAD", "01BUNREAD"]
+            vec!["01AREAD", "01BUNREAD", "01CNOTE"]
         );
         // Read state survives; surfaced starts clear.
         assert_eq!(
@@ -331,7 +353,10 @@ mod tests {
 
         // Opening the migrated database again changes nothing.
         let store = Store::open(&path).unwrap();
-        assert_eq!(ids(store.inbox(addr, false).unwrap()), vec!["01BUNREAD"]);
+        assert_eq!(
+            ids(store.inbox(addr, false).unwrap()),
+            vec!["01BUNREAD", "01CNOTE"]
+        );
         assert_eq!(
             ids(store.unsurfaced_urgent(addr).unwrap()),
             vec!["01BUNREAD"]

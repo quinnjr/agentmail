@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::questions::is_open;
 use super::{
     AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, READ, RegisterReq, Registered,
-    SURFACED, Store, StoreError, THREADS, all_json, encode, get_json,
+    SURFACED, Store, StoreError, THREADS, URGENT, all_json, encode, get_json,
 };
 use crate::ids::{new_message_id, validate_name};
 use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message, Presence};
@@ -210,7 +210,13 @@ fn mailbox_rows(
     Ok(out)
 }
 
+/// The [`URGENT`] mailbox flag for `msg`: set when it is urgent.
+fn urgent_flag(msg: &Message) -> u8 {
+    if msg.urgent { URGENT } else { 0 }
+}
+
 /// `addr`'s urgent mail that is neither read nor surfaced, in id order.
+/// Filters on the mailbox flags, so it decodes only the matching messages.
 fn unsurfaced_urgent_in(
     mailbox: &impl ReadableTable<(&'static str, &'static str), u8>,
     messages: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -218,12 +224,10 @@ fn unsurfaced_urgent_in(
 ) -> Result<Vec<Message>, StoreError> {
     let mut out = Vec::new();
     for (id, flags) in mailbox_rows(mailbox, addr)? {
-        if flags & (READ | SURFACED) != 0 {
+        if flags & (READ | SURFACED | URGENT) != URGENT {
             continue;
         }
-        if let Some(msg) = get_json::<Message>(messages, &id)?
-            && msg.urgent
-        {
+        if let Some(msg) = get_json::<Message>(messages, &id)? {
             out.push(msg);
         }
     }
@@ -232,7 +236,9 @@ fn unsurfaced_urgent_in(
 
 /// What a harness hook shows `addr`, read from one snapshot of `mailbox`,
 /// `messages` and `index` (see [`Store::hook_snapshot`]). Decodes only the
-/// unread urgent rows and the open questions in `addr`'s mailbox.
+/// unread, unsurfaced urgent messages (found from the [`URGENT`] mailbox
+/// flag, without decoding the rest) and the open questions in `addr`'s
+/// mailbox.
 fn hook_snapshot_in(
     mailbox: &impl ReadableTable<(&'static str, &'static str), u8>,
     messages: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -537,11 +543,12 @@ impl Store {
             };
             messages.insert(msg.id.as_str(), encode(&msg)?.as_slice())?;
             threads.insert((msg.thread_id.as_str(), msg.id.as_str()), ())?;
+            let urgent = urgent_flag(&msg);
             for addr in &msg.to {
-                mailbox.insert((addr.as_str(), msg.id.as_str()), 0)?;
+                mailbox.insert((addr.as_str(), msg.id.as_str()), urgent)?;
             }
             if human_joins {
-                mailbox.insert((HUMAN, msg.id.as_str()), READ)?;
+                mailbox.insert((HUMAN, msg.id.as_str()), READ | urgent)?;
             }
             msg
         };
@@ -680,7 +687,7 @@ impl Store {
                 }
                 let boxed = mailbox.get((addr, id.as_str()))?.is_none();
                 if boxed {
-                    mailbox.insert((addr, id.as_str()), 0)?;
+                    mailbox.insert((addr, id.as_str()), urgent_flag(&msg))?;
                 }
                 if appended || boxed {
                     released.push((msg, appended));
@@ -1060,6 +1067,73 @@ mod tests {
             session: None,
         };
         store.register(req, 1, &|_| false).unwrap().0.address
+    }
+
+    fn new_message(from: &str, to: &[&str], urgent: bool) -> NewMessage {
+        NewMessage {
+            from: from.into(),
+            to: to.iter().map(|t| t.to_string()).collect(),
+            subject: Some("s".into()),
+            body: "b".into(),
+            kind: Kind::Note,
+            urgent,
+            refs: Vec::new(),
+            in_reply_to: None,
+        }
+    }
+
+    fn flags(store: &Store, addr: &str, id: &str) -> Option<u8> {
+        let txn = store.read().unwrap();
+        let mailbox = txn.open_table(MAILBOX).unwrap();
+        mailbox.get((addr, id)).unwrap().map(|f| f.value())
+    }
+
+    /// Urgency is recorded as the [`URGENT`] mailbox flag at delivery, both
+    /// direct and on release of held mail, and [`Store::unsurfaced_urgent`]
+    /// goes by that flag alone.
+    #[test]
+    fn delivery_records_urgency_as_a_mailbox_flag() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Store::open(&dir.path().join("agentmail.redb")).unwrap();
+        let a = agent(&s, "backend");
+        let b = agent(&s, "frontend");
+        let u = s.insert_message(new_message(&a, &[&b], true), 1).unwrap();
+        let n = s.insert_message(new_message(&a, &[&b], false), 2).unwrap();
+        assert_eq!(flags(&s, &b, &u.id), Some(URGENT));
+        assert_eq!(flags(&s, &b, &n.id), Some(0));
+
+        // Held urgent mail gets the flag when it is released.
+        let held = s
+            .insert_held(
+                new_message(&a, &[], true),
+                3,
+                Path::new("/w"),
+                &["docs".to_string()],
+                &|_| false,
+            )
+            .unwrap();
+        let d = agent(&s, "docs");
+        let released = s.release_held(Path::new("/w"), "docs", &d).unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(flags(&s, &d, &held.id), Some(URGENT));
+        let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.unsurfaced_urgent(&d).unwrap()), vec![held.id.clone()]);
+
+        // Read and surfaced keep the flag.
+        s.mark_surfaced(&b, std::slice::from_ref(&u.id)).unwrap();
+        s.mark_read(&b, std::slice::from_ref(&u.id)).unwrap();
+        assert_eq!(flags(&s, &b, &u.id), Some(URGENT | SURFACED | READ));
+
+        // Only the flag is consulted: with it cleared, the urgent message
+        // is no longer listed.
+        let n2 = s.insert_message(new_message(&a, &[&b], true), 4).unwrap();
+        let txn = s.db.begin_write().unwrap();
+        txn.open_table(MAILBOX)
+            .unwrap()
+            .insert((b.as_str(), n2.id.as_str()), 0)
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(s.unsurfaced_urgent(&b).unwrap().is_empty());
     }
 
     /// Marking ids that are already read (or not in the caller's mailbox)
