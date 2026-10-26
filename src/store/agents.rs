@@ -40,8 +40,9 @@ pub struct Registered {
     pub agent: Agent,
     /// The address was taken back from a different or absent binding.
     pub reclaimed: bool,
-    /// The requesting session was already bound to this agent, which was
-    /// returned (updated) instead of registering anew.
+    /// A repeat registration of a live identity: the requesting session, or
+    /// the requesting process with the same session binding, was already
+    /// bound to this agent, which was returned (updated).
     pub existing: bool,
 }
 
@@ -71,22 +72,53 @@ fn unknown(addr: &str) -> StoreError {
     StoreError::NotFound(format!("no agent with address {addr:?}"))
 }
 
+/// Whether `agent` belongs to a session of a harness that runs several
+/// sessions in one process (opencode). Such an agent is identified by its
+/// session alone: another registration on its process never unbinds or
+/// adopts it, and process ancestry never resolves to it.
+fn shared_session(agent: &Agent) -> bool {
+    agent
+        .session
+        .as_ref()
+        .is_some_and(|k| k.harness.shares_process())
+}
+
 /// Whether `agent` may be rebound to `req`.
 ///
-/// An agent bound to a live process is only rebound by that same process
-/// and session (a repeat registration). Anything else bound to a live
-/// process, active or signed off, is never taken: in particular another
-/// session sharing the process (opencode runs every session in one).
+/// The requesting process's own agent always may (a repeat registration,
+/// see [`is_own`]). A non-signed-off agent bound to a session other than
+/// `req.session` never may, even when its process is dead: it belongs to
+/// that session until it signs off or the session registers again (an
+/// opencode session outlives a restart of the service process). Otherwise
+/// an agent bound to a live process, active or signed off, is never taken.
 fn reclaimable(agent: &Agent, req: &RegisterReq, alive: Alive) -> bool {
+    if is_own(agent, req) {
+        return true;
+    }
+    if !agent.signed_off && agent.session.is_some() && agent.session != req.session {
+        return false;
+    }
     match agent.proc_id {
         None => true,
-        Some(bound) => is_own(agent, req) || !alive(&bound),
+        Some(bound) => !alive(&bound),
     }
 }
 
-/// Whether `agent` is already bound to the requesting process and session.
+/// Whether `agent` is already the requesting process's own identity.
+///
+/// It must be bound to `req.proc_id`, with the same session or, when the
+/// session runs in its own process (every harness but opencode), with the
+/// session on one side only: kiro's MCP server registers without a session
+/// and its CLI with `KIRO_SESSION_ID`, from the same kiro-cli process.
 fn is_own(agent: &Agent, req: &RegisterReq) -> bool {
-    agent.proc_id.is_some() && agent.proc_id == req.proc_id && agent.session == req.session
+    if agent.proc_id.is_none() || agent.proc_id != req.proc_id {
+        return false;
+    }
+    match (&agent.session, &req.session) {
+        (a, r) if a == r => true,
+        (None, Some(k)) | (Some(k), None) => !k.harness.shares_process(),
+        _ => false,
+    }
 }
 
 /// Remove the binding of session `k` if it points at `addr`.
@@ -104,34 +136,80 @@ fn unbind_session(
     Ok(())
 }
 
+/// One process-level address per process: unbind (clear `proc_id` of)
+/// every other agent bound to `agent`'s process, except agents of shared
+/// sessions ([`shared_session`]), which belong to their session.
+///
+/// A session-less `agent` also takes over the session of the most recently
+/// seen non-signed-off agent it displaces: that session runs in this very
+/// process (kiro), so it now names `agent` too. Writes the displaced agents;
+/// the caller writes `agent`.
+fn claim_process(
+    table: &mut redb::Table<&'static str, &'static [u8]>,
+    sessions: &mut redb::Table<(&'static str, &'static str), &'static str>,
+    agents: &[Agent],
+    agent: &mut Agent,
+) -> Result<(), StoreError> {
+    let Some(bound) = agent.proc_id else {
+        return Ok(());
+    };
+    let mut displaced: Vec<Agent> = agents
+        .iter()
+        .filter(|o| o.address != agent.address && o.proc_id == Some(bound) && !shared_session(o))
+        .cloned()
+        .collect();
+    displaced.sort_by_key(|o| (o.last_seen, o.registered_at));
+    let heir = if agent.session.is_none() {
+        displaced
+            .iter()
+            .rposition(|o| !o.signed_off && o.session.is_some())
+    } else {
+        None
+    };
+    for (i, mut other) in displaced.into_iter().enumerate() {
+        other.proc_id = None;
+        if Some(i) == heir
+            && let Some(k) = other.session.take()
+        {
+            sessions.insert(session_key(&k), agent.address.as_str())?;
+            agent.session = Some(k);
+        }
+        table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Register an agent, reclaiming a gone agent's address when the spec's
     /// reclaim rule applies. Returns the agent and whether it was reclaimed.
     ///
     /// Reclaim: unless `fresh`, an agent with the same `name` and `cwd` that
-    /// is not bound to a live process (or is bound to the requesting process
-    /// itself) is rebound. With several, one already bound to the requesting
-    /// process wins (a re-registration keeps the caller's current address);
-    /// otherwise the most recently seen wins. The
-    /// address, `registered_at` and contacts are kept; `role`, `working_on`,
-    /// `harness`, `repo`, `wake`, `proc_id` and `last_seen` are replaced and
-    /// `signed_off` is cleared.
+    /// [`reclaimable`] allows is rebound: one not bound to a live process,
+    /// or the requesting process's own ([`is_own`]), and never one still
+    /// bound to another session. With several, the requesting process's own
+    /// wins (a re-registration keeps the caller's current address);
+    /// otherwise the most recently seen wins. The address, `registered_at`
+    /// and contacts are kept; `role`, `working_on`, `harness`, `repo`,
+    /// `wake`, `proc_id`, `session` and `last_seen` are replaced and
+    /// `signed_off` is cleared. A session-less re-registration of an agent
+    /// bound to its process's own session keeps that session.
     ///
     /// The returned flag is true only when the address was taken back from a
     /// different or absent process; a re-registration that keeps the address
     /// already bound to `proc_id` is not a reclaim and reports false.
     ///
-    /// One address per harness process and session: any other agent bound
-    /// to `proc_id` with the same session (typically none) is unbound (its
-    /// `proc_id` cleared, so it shows as gone). Agents of other sessions
-    /// sharing the process keep their binding.
+    /// One process-level address per harness process: any other agent bound
+    /// to `proc_id` is unbound (its `proc_id` cleared, so it shows as gone),
+    /// except agents of other opencode sessions sharing the process. See
+    /// `claim_process`.
     ///
     /// Sessions: with `session = Some(k)` and a non-signed-off agent bound
     /// to `k`, that agent is returned with `role`, `working_on`, `wake`,
-    /// `proc_id` and `last_seen` updated (not reclaimed, `existing`); its
-    /// name must match `req.name`, otherwise `InvalidInput`. Otherwise the
-    /// rules above apply and the result is bound to `k`, moving any earlier
-    /// session binding of a reclaimed agent off it.
+    /// `proc_id` (kept when `req.proc_id` is `None`) and `last_seen` updated
+    /// (not reclaimed, `existing`); its name must match `req.name`,
+    /// otherwise `InvalidInput`. Otherwise the rules above apply and the
+    /// result is bound to `k`, moving any earlier session binding of a
+    /// reclaimed agent off it.
     pub fn register(
         &self,
         req: RegisterReq,
@@ -167,6 +245,7 @@ impl Store {
 
         let mut table = txn.open_table(AGENTS)?;
         let mut sessions = txn.open_table(SESSIONS)?;
+        let agents: Vec<Agent> = all_json(&table)?;
         if let Some(k) = &req.session {
             let bound = sessions.get(session_key(k))?.map(|v| v.value().to_string());
             let bound: Option<Agent> = match bound {
@@ -183,8 +262,11 @@ impl Store {
                 a.role = req.role;
                 a.working_on = req.working_on;
                 a.wake = req.wake;
-                a.proc_id = req.proc_id;
+                if req.proc_id.is_some() {
+                    a.proc_id = req.proc_id;
+                }
                 a.last_seen = now;
+                claim_process(&mut table, &mut sessions, &agents, &mut a)?;
                 table.insert(a.address.as_str(), encode(&a)?.as_slice())?;
                 return Ok(Registered {
                     agent: a,
@@ -193,7 +275,6 @@ impl Store {
                 });
             }
         }
-        let agents: Vec<Agent> = all_json(&table)?;
         let reclaim = if req.fresh {
             None
         } else {
@@ -210,11 +291,11 @@ impl Store {
 
         let own = reclaim.as_ref().is_some_and(|a| is_own(a, &req));
         let reclaimed = reclaim.is_some() && !own;
-        // A plain re-registration from the bound process (no session) is
+        // A repeat registration of the requesting process's live identity:
         // the process-binding counterpart of a session's `existing`.
-        let existing = own && req.session.is_none();
+        let existing = own && reclaim.as_ref().is_some_and(|a| !a.signed_off);
         let mut old_session = None;
-        let agent = match reclaim {
+        let mut agent = match reclaim {
             Some(mut a) => {
                 old_session = a.session.take();
                 a.role = req.role;
@@ -222,7 +303,12 @@ impl Store {
                 a.harness = req.harness;
                 a.repo = req.repo;
                 a.proc_id = req.proc_id;
-                a.session = req.session;
+                // The process's own session stays bound when the process
+                // registers again without naming it.
+                a.session = match req.session {
+                    None if own => old_session.clone(),
+                    s => s,
+                };
                 a.wake = req.wake;
                 a.last_seen = now;
                 a.signed_off = false;
@@ -258,20 +344,10 @@ impl Store {
             }
         };
 
-        if let Some(bound) = agent.proc_id {
-            for mut other in agents {
-                if other.address != agent.address
-                    && other.proc_id == Some(bound)
-                    && other.session == agent.session
-                {
-                    other.proc_id = None;
-                    table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
-                }
-            }
-        }
         if let Some(old) = old_session.filter(|old| Some(old) != agent.session.as_ref()) {
             unbind_session(&mut sessions, &old, &agent.address)?;
         }
+        claim_process(&mut table, &mut sessions, &agents, &mut agent)?;
         if let Some(k) = &agent.session {
             sessions.insert(session_key(k), agent.address.as_str())?;
         }
@@ -304,9 +380,15 @@ impl Store {
         all_json(&table)
     }
 
-    /// The agent bound to the first of `procs` (in the given order, nearest
-    /// ancestor first) that has a non-signed-off agent. Matches on PID and
-    /// start time, so a reused PID never matches.
+    /// The agent identified by the nearest of `procs` (in the given order,
+    /// nearest ancestor first) that has a non-signed-off agent bound to it.
+    /// Matches on PID and start time, so a reused PID never matches.
+    ///
+    /// Agents of shared sessions (opencode) are never resolved this way:
+    /// every session of the process has the same ancestry. The nearest
+    /// process with any non-signed-off agent decides: its one process-level
+    /// agent, or `None` when it has none (only session agents) or, against
+    /// the one-address-per-process rule, several.
     pub fn find_by_procs(&self, procs: &[ProcId]) -> Result<Option<Agent>, StoreError> {
         if procs.is_empty() {
             return Ok(None);
@@ -317,13 +399,15 @@ impl Store {
             .filter(|a| !a.signed_off && a.proc_id.is_some())
             .collect();
         for p in procs {
-            let found = agents
-                .iter()
-                .filter(|a| a.proc_id == Some(*p))
-                .max_by_key(|a| (a.last_seen, a.registered_at));
-            if let Some(a) = found {
-                return Ok(Some(a.clone()));
+            let here: Vec<&Agent> = agents.iter().filter(|a| a.proc_id == Some(*p)).collect();
+            if here.is_empty() {
+                continue;
             }
+            let mut own = here.into_iter().filter(|a| !shared_session(a));
+            return Ok(match (own.next(), own.next()) {
+                (Some(a), None) => Some(a.clone()),
+                _ => None,
+            });
         }
         Ok(None)
     }

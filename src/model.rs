@@ -38,6 +38,13 @@ impl Harness {
             Harness::Other => "other",
         }
     }
+
+    /// Whether this harness runs several sessions in one process (opencode's
+    /// shared service). An agent bound to such a session belongs to that
+    /// session alone: process ancestry can never tell it apart.
+    pub fn shares_process(self) -> bool {
+        matches!(self, Harness::Opencode)
+    }
 }
 
 /// Longest harness session id, in characters.

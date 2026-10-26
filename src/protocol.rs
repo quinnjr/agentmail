@@ -79,8 +79,13 @@ pub enum Request {
         #[serde(default)]
         wake: bool,
         /// Bind the address to this harness session too. Registering again
-        /// from a session that is already bound returns its agent (data
-        /// `existing: true`), updated; a different name is `InvalidInput`.
+        /// from a session that is already bound returns its agent, updated;
+        /// a different name is `InvalidInput`.
+        ///
+        /// The response's `existing` is true for any repeat registration of
+        /// a live (not signed-off) identity, from its bound session or its
+        /// bound process (a plain re-registration without any session
+        /// included). It is false for a new or reclaimed address.
         #[serde(default)]
         session: Option<SessionKey>,
     },

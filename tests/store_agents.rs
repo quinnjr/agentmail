@@ -568,9 +568,16 @@ fn sessions_sharing_a_proc_keep_their_bindings() {
         session_req("frontend", "/w", Some(p(1)), "s2"),
         2,
     );
+    // Process ancestry never resolves to a session agent of the shared
+    // process: every session there has the same ancestry.
+    assert_eq!(s.find_by_procs(&[p(1)]).unwrap(), None);
     // A process-only registration from the same process does not unbind
     // the session agents either.
     let (c, _) = register(&s, &procs, req("docs", "/w", Some(p(1))), 3);
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        c.address
+    );
     for addr in [&a.address, &b.address, &c.address] {
         let agent = s.get_agent(addr).unwrap().unwrap();
         assert_eq!(agent.proc_id, Some(p(1)), "{addr}");
@@ -649,4 +656,199 @@ fn plain_reregistration_reports_existing() {
         .unwrap();
     assert_eq!(again.agent.address, first.agent.address);
     assert!(again.existing && !again.reclaimed);
+}
+
+fn kiro_req(name: &str, proc_id: Option<ProcId>, session: Option<&str>) -> RegisterReq {
+    let mut r = req(name, "/w", proc_id);
+    r.harness = Harness::Kiro;
+    r.session = session.map(|id| SessionKey {
+        harness: Harness::Kiro,
+        id: id.into(),
+    });
+    r
+}
+
+fn kiro_key(id: &str) -> SessionKey {
+    SessionKey {
+        harness: Harness::Kiro,
+        id: id.into(),
+    }
+}
+
+#[test]
+fn kiro_process_then_session_registration_keeps_one_address() {
+    // kiro's MCP server registers without a session, its CLI with
+    // KIRO_SESSION_ID, both from the same kiro-cli process.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = s
+        .register_and_release(kiro_req("backend", Some(p(1)), None), 1, &procs.alive())
+        .unwrap();
+    let (b, _) = s
+        .register_and_release(
+            kiro_req("backend", Some(p(1)), Some("k1")),
+            2,
+            &procs.alive(),
+        )
+        .unwrap();
+    assert_eq!(b.agent.address, a.agent.address);
+    assert!(b.existing && !b.reclaimed);
+    assert_eq!(s.list_agents().unwrap().len(), 1);
+    assert_eq!(
+        s.find_by_session(&kiro_key("k1")).unwrap().unwrap().address,
+        a.agent.address
+    );
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        a.agent.address
+    );
+}
+
+#[test]
+fn kiro_session_then_process_registration_keeps_one_address() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 1);
+    let (b, reclaimed) = register(&s, &procs, kiro_req("backend", Some(p(1)), None), 2);
+    assert_eq!(b.address, a.address);
+    assert!(!reclaimed);
+    // The process's own session stays bound.
+    assert_eq!(b.session, Some(kiro_key("k1")));
+    assert_eq!(s.list_agents().unwrap().len(), 1);
+    assert_eq!(
+        s.find_by_session(&kiro_key("k1")).unwrap().unwrap().address,
+        a.address
+    );
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        a.address
+    );
+}
+
+#[test]
+fn kiro_rename_from_process_takes_its_session() {
+    // A second name from the same kiro-cli process moves the process
+    // binding and, since that session runs in this process, the session.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 1);
+    let (b, _) = register(&s, &procs, kiro_req("frontend", Some(p(1)), None), 2);
+    assert_ne!(a.address, b.address);
+    assert_eq!(b.session, Some(kiro_key("k1")));
+    let old = s.get_agent(&a.address).unwrap().unwrap();
+    assert_eq!(old.proc_id, None);
+    assert_eq!(old.session, None);
+    assert_eq!(
+        s.find_by_session(&kiro_key("k1")).unwrap().unwrap().address,
+        b.address
+    );
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        b.address
+    );
+}
+
+#[test]
+fn session_registration_unbinds_process_level_agent() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, kiro_req("docs", Some(p(1)), None), 1);
+    let (b, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 2);
+    assert_ne!(a.address, b.address);
+    assert_eq!(s.get_agent(&a.address).unwrap().unwrap().proc_id, None);
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        b.address
+    );
+}
+
+#[test]
+fn existing_session_moving_process_claims_it() {
+    // The existing-session path applies the one-address-per-process rule
+    // on the new process too.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1), p(2)]);
+    let (a, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 1);
+    let (x, _) = register(&s, &procs, req("docs", "/w", Some(p(2))), 2);
+    let (b, _) = register(&s, &procs, kiro_req("backend", Some(p(2)), Some("k1")), 3);
+    assert_eq!(b.address, a.address);
+    assert_eq!(b.proc_id, Some(p(2)));
+    assert_eq!(s.get_agent(&x.address).unwrap().unwrap().proc_id, None);
+    assert_eq!(
+        s.find_by_procs(&[p(2)]).unwrap().unwrap().address,
+        a.address
+    );
+}
+
+#[test]
+fn existing_session_without_proc_keeps_binding() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s1"),
+        1,
+    );
+    let (b, _) = register(&s, &procs, session_req("backend", "/w", None, "s1"), 2);
+    assert_eq!(b.address, a.address);
+    assert_eq!(b.proc_id, Some(p(1)));
+    assert_eq!(Store::presence(&b, &procs.alive()), Presence::Active);
+}
+
+#[test]
+fn unsigned_session_agent_on_dead_process_is_not_reclaimed() {
+    let (_d, s) = store();
+    let mut procs = Procs::new(&[p(1), p(2)]);
+    let (a, _) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s1"),
+        1,
+    );
+    procs.kill(p(1));
+    // Neither another session nor a session-less registration takes it.
+    let (b, reclaimed) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(2)), "s2"),
+        2,
+    );
+    assert!(!reclaimed);
+    assert_ne!(b.address, a.address);
+    let (c, reclaimed) = register(&s, &procs, req("backend", "/w", Some(p(2))), 3);
+    assert!(!reclaimed);
+    assert_ne!(c.address, a.address);
+    let s1 = session_req("x", "/", None, "s1").session.unwrap();
+    assert_eq!(s.find_by_session(&s1).unwrap().unwrap().address, a.address);
+    // Once s1 signs off, the address is reclaimable again.
+    s.signoff(&a.address).unwrap();
+    let (d, reclaimed) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(2)), "s3"),
+        4,
+    );
+    assert!(reclaimed);
+    assert_eq!(d.address, a.address);
+}
+
+#[test]
+fn find_by_procs_stops_at_a_shared_process() {
+    // A caller under the opencode service never falls through to an outer
+    // ancestor's agent: the service's sessions are the nearer identities.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1), p(2)]);
+    register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s1"),
+        1,
+    );
+    let (outer, _) = register(&s, &procs, req("outer", "/w", Some(p(2))), 2);
+    assert_eq!(s.find_by_procs(&[p(1), p(2)]).unwrap(), None);
+    assert_eq!(
+        s.find_by_procs(&[p(2)]).unwrap().unwrap().address,
+        outer.address
+    );
 }

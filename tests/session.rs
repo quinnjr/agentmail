@@ -248,9 +248,9 @@ async fn signoff_then_same_name_reregisters_via_normal_rules() {
 }
 
 #[tokio::test]
-async fn session_moves_off_a_reclaimed_agent() {
-    // s1's agent goes gone (its process died); s2 reclaims the address by
-    // the normal rules, and s1 no longer resolves to it.
+async fn dead_session_agent_is_not_taken_by_another_session() {
+    // s1's agent is bound to a dead process but s1 never signed off: it
+    // still belongs to s1, so s2 gets a fresh address of its own.
     let d = TestDaemon::start().await;
     let mut c = d.client().await;
     let cwd = d.dir.path();
@@ -261,11 +261,78 @@ async fn session_moves_off_a_reclaimed_agent() {
     let a = address(&register(&mut c, "backend", cwd, Some(dead), "s1", "api").await);
     let h = FakeHarness::spawn();
     let b = register(&mut c, "backend", cwd, Some(h.id), "s2", "api").await;
-    assert_eq!(address(&b), a);
-    assert_eq!(b["reclaimed"], true);
-    assert_eq!(whoami(&mut c, &session("s2")).await, a);
-    let err = c.call(&session("s1"), Request::Whoami).await.unwrap_err();
+    assert_ne!(address(&b), a);
+    assert_eq!(b["reclaimed"], false);
+    assert_eq!(whoami(&mut c, &session("s2")).await, address(&b));
+    assert_eq!(whoami(&mut c, &session("s1")).await, a);
+}
+
+#[tokio::test]
+async fn opencode_restart_keeps_sessions_apart() {
+    // opencode restarts (new service process); s2 registers before s1 does.
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let cwd = d.dir.path();
+    let p1 = FakeHarness::spawn();
+    let a = address(&register(&mut c, "backend", cwd, Some(p1.id), "s1", "api").await);
+    c.call(&Caller::Human, send_req(&[&a], "for s1", "hi"))
+        .await
+        .unwrap();
+    drop(p1);
+    let p2 = FakeHarness::spawn();
+    let b = register(&mut c, "backend", cwd, Some(p2.id), "s2", "api").await;
+    assert_ne!(address(&b), a);
+    assert_eq!(b["reclaimed"], false);
+    assert_eq!(b["existing"], false);
+    let again = register(&mut c, "backend", cwd, Some(p2.id), "s1", "api").await;
+    assert_eq!(address(&again), a);
+    assert_eq!(again["existing"], true);
+    for (s, addr) in [("s1", a.clone()), ("s2", address(&b))] {
+        let who = c.call(&session(s), Request::Whoami).await.unwrap();
+        assert_eq!(who["address"], addr.as_str());
+        assert_eq!(who["agent"]["presence"], "active", "{s}");
+    }
+    // s1's mail stayed with s1.
+    let mine = c
+        .call(&session("s1"), Request::Inbox { all: true })
+        .await
+        .unwrap();
+    assert_eq!(mine.as_array().unwrap().len(), 1);
+    let theirs = c
+        .call(&session("s2"), Request::Inbox { all: true })
+        .await
+        .unwrap();
+    assert!(theirs.as_array().unwrap().is_empty(), "{theirs}");
+}
+
+#[tokio::test]
+async fn procs_caller_never_resolves_to_a_shared_session_agent() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let h = FakeHarness::spawn();
+    let cwd = d.dir.path();
+    let procs = Caller::Procs { procs: vec![h.id] };
+    register(&mut c, "backend", cwd, Some(h.id), "s1", "api").await;
+    let err = c.call(&procs, Request::Whoami).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::NoIdentity);
+    register(&mut c, "frontend", cwd, Some(h.id), "s2", "ui").await;
+    let err = c.call(&procs, Request::Whoami).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NoIdentity);
+}
+
+#[tokio::test]
+async fn session_reregistration_without_proc_keeps_binding() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let h = FakeHarness::spawn();
+    let cwd = d.dir.path();
+    let a = address(&register(&mut c, "backend", cwd, Some(h.id), "s1", "api").await);
+    let again = register(&mut c, "backend", cwd, None, "s1", "orders").await;
+    assert_eq!(address(&again), a);
+    assert_eq!(again["existing"], true);
+    let who = c.call(&session("s1"), Request::Whoami).await.unwrap();
+    assert_eq!(who["agent"]["presence"], "active");
+    assert_eq!(who["agent"]["role"], "orders");
 }
 
 #[tokio::test]
