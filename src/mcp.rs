@@ -1,5 +1,6 @@
-//! `agentmail mcp`: a stdio MCP server, one per agent session, that the
-//! harness spawns. Each tool forwards one request to the daemon (started
+//! `agentmail mcp`: a stdio MCP server that the harness spawns: one per
+//! session under Claude Code and kiro, and one per working directory under
+//! opencode, shared by every opencode session there. Each tool forwards one request to the daemon (started
 //! on demand) and returns the daemon's JSON `data` as text; a daemon error
 //! becomes a tool error carrying `{"error":{code,message,candidates}}`.
 //!
@@ -19,7 +20,8 @@
 //!   `AGENTMAIL_ADDRESS` is set).
 //! - A server bound to a harness that shares its process between sessions
 //!   (opencode) refuses `register` without a session, so it never caches an
-//!   address.
+//!   address, and tells any other sessionless call that it carried no
+//!   session id instead of suggesting a `register` it would refuse.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -98,7 +100,8 @@ pub struct RegisterParams {
     #[serde(default)]
     pub working_on: Option<String>,
     /// Override the detected harness: `claude-code`, `opencode`, `kiro` or
-    /// `other`.
+    /// `other`. A call made in an opencode session has its harness fixed by
+    /// the session: any value other than `opencode` is refused.
     #[serde(default)]
     pub harness: Option<String>,
     /// Always take a new address instead of reclaiming a gone one.
@@ -238,7 +241,8 @@ pub struct SearchParams {
     pub query: String,
 }
 
-/// The MCP server for one agent session.
+/// The MCP server: one per agent session under Claude Code and kiro, one
+/// per working directory, shared by all its sessions, under opencode.
 #[derive(Clone)]
 pub struct AgentMailServer {
     paths: Paths,
@@ -308,6 +312,16 @@ fn error_result(e: &ClientError) -> CallToolResult {
     json_result(&json!({ "error": e }), true)
 }
 
+/// Why a sessionless call on a server shared by `shared`'s sessions
+/// cannot `what`.
+fn no_session_message(shared: Harness, what: &str) -> String {
+    format!(
+        "this {h} MCP server is shared between sessions and the call carried \
+         no {h} session id, so it cannot {what}",
+        h = shared.as_str()
+    )
+}
+
 fn invalid(message: impl Into<String>) -> CallToolResult {
     error_result(&ClientError::new(ErrorCode::InvalidInput, message))
 }
@@ -375,7 +389,25 @@ impl AgentMailServer {
     }
 
     async fn request(&self, s: &CallSession, req: Request) -> Result<Value, ClientError> {
-        self.client().await?.call(&self.caller(s), req).await
+        let r = self.client().await?.call(&self.caller(s), req).await;
+        r.map_err(|e| self.sessionless_error(s, e))
+    }
+
+    /// `e`, reworded when a sessionless call on a shared server has no
+    /// identity: the daemon's advice to `register` cannot be followed
+    /// there, since such a server refuses a sessionless `register`.
+    fn sessionless_error(&self, s: &CallSession, e: ClientError) -> ClientError {
+        match self.shared {
+            Some(shared)
+                if s.0.is_none() && !self.address_env && e.code == ErrorCode::NoIdentity =>
+            {
+                ClientError::new(
+                    ErrorCode::NoIdentity,
+                    no_session_message(shared, "act as an agent"),
+                )
+            }
+            _ => e,
+        }
     }
 
     /// Run `req` and turn its outcome into a tool result.
@@ -458,17 +490,24 @@ impl AgentMailServer {
         // its own: a call made outside any session cannot register, or the
         // process-level caller would act as that agent for every session.
         if let (None, Some(shared)) = (&s.0, self.shared) {
-            return Ok(invalid(format!(
-                "this {} MCP server is shared between sessions and the call \
-                 carried no session id, so it cannot register",
-                shared.as_str()
-            )));
+            return Ok(invalid(no_session_message(shared, "register")));
         }
-        // A session names its harness, whatever process the server found.
+        // A session names its harness, whatever process the server found,
+        // and an override cannot change it.
         let harness = match p.harness {
             None => s.0.as_ref().map_or(detected, |k| k.harness),
             Some(h) => match serde_json::from_value::<Harness>(Value::String(h.clone())) {
-                Ok(h) => h,
+                Ok(h) => match &s.0 {
+                    Some(k) if k.harness != h => {
+                        return Ok(invalid(format!(
+                            "harness {:?} conflicts with this call's session: the \
+                             harness is fixed by the {} session",
+                            h.as_str(),
+                            k.harness.as_str()
+                        )));
+                    }
+                    _ => h,
+                },
                 Err(_) => return Ok(invalid(format!("unknown harness {h:?}"))),
             },
         };

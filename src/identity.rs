@@ -157,11 +157,19 @@ fn caller_from(
 ///    (`sh -c`), and a session-bound opencode agent's process is the
 ///    opencode process itself, whichever path registered it. The harness
 ///    must sit above `explicit_pid`: a pid that names a process above it
-///    (say the terminal that launched it) is bound exactly. Claude Code
-///    does not get this: an unknown MCP client run from a Claude Code shell
-///    must bind itself, not the harness it happens to run under, or two
-///    agents would share one process binding. opencode is safe, as its
-///    sessionless registrations are refused (the server is shared).
+///    (say the terminal that launched it) is bound exactly.
+///
+///    This narrows the plan's rule (prefer the harness ancestor for every
+///    explicit pid) on purpose, for Claude Code: an unknown MCP client run
+///    from a Claude Code shell must bind itself, not the Claude Code it
+///    happens to run under, or it would take over the binding of the agent
+///    Claude Code itself registered. The cost: a Claude Code MCP server
+///    started through a wrapper that does not exec (`sh -c 'agentmail
+///    mcp'`) binds the wrapper, so CLI calls and hooks from Claude Code's
+///    shell (which find the agent through Claude Code's process) do not
+///    find it. Claude Code configs should run `agentmail mcp` directly, or
+///    `exec` it from a wrapper. opencode is safe, as its sessionless
+///    registrations are refused (the server is shared).
 /// 2. Any other `explicit_pid` (`register --pid`, or a parent that is a
 ///    harness, has no kiro or opencode above it, or sits above it): exactly
 ///    that process, with the harness its command name suggests.

@@ -88,7 +88,8 @@ pub enum Command {
         /// What you are working on (at most 280 characters).
         #[arg(long, allow_hyphen_values = true)]
         working_on: Option<String>,
-        /// Override the detected harness.
+        /// Override the detected harness. In an opencode or kiro session the
+        /// harness is fixed by the session: any other value is refused.
         #[arg(long, value_parser = ["claude-code", "opencode", "kiro", "other"])]
         harness: Option<String>,
         /// Always take a new address instead of reclaiming a gone one.
@@ -97,7 +98,11 @@ pub enum Command {
         /// Do not wake this agent for new mail.
         #[arg(long)]
         no_wake: bool,
-        /// Bind to this process instead of the detected harness process.
+        /// Bind to this process instead of the detected harness process. A
+        /// harness process, or a process that is not an ancestor of this
+        /// command, is bound exactly; an ancestor that is not a harness
+        /// process (say the shell, `$$`) under a kiro or opencode process is
+        /// replaced by that kiro or opencode process.
         #[arg(long)]
         pid: Option<u32>,
     },
@@ -488,6 +493,25 @@ fn unbound_hint(proc_id: Option<ProcId>, session: Option<&SessionKey>) -> bool {
     proc_id.is_none() && !session.is_some_and(|k| k.harness.shares_process())
 }
 
+/// The harness of a registration in session `k` given an explicit
+/// `--harness` of `h`: a session fixes its harness, so any other value is
+/// refused here, before the daemon sees it.
+fn session_harness(h: Harness, k: &SessionKey) -> Result<Harness> {
+    if h != k.harness {
+        return Err(ClientError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "--harness {} conflicts with this {k} session: the harness is \
+                 fixed by the session",
+                h.as_str(),
+                k = k.harness.as_str()
+            ),
+        )
+        .into());
+    }
+    Ok(h)
+}
+
 fn harness_from(s: &str) -> Result<Harness> {
     serde_json::from_value(Value::String(s.to_string()))
         .map_err(|_| anyhow!("unknown harness {s:?}"))
@@ -781,23 +805,26 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             // has no identity of its own: binding its process without a
             // session would make the agent the caller of every session's
             // sessionless calls. `--harness` does not change the binding,
-            // so only `--pid` naming another process gets past this.
+            // and `--pid` naming a non-harness ancestor (the shell) is
+            // redirected to the opencode process, so only `--pid` naming a
+            // process outside this opencode gets past this.
             if session.is_none() && detected.shares_process() {
                 return Err(ClientError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "this {} process is shared between sessions and \
+                        "this {h} process is shared between sessions and \
                          OPENCODE_SESSION_ID is not set, so it cannot register; \
-                         run register from an opencode session's shell, or bind \
-                         another process with --pid",
-                        detected.as_str()
+                         run register from an {h} session's shell, or bind a \
+                         process outside this {h} with --pid",
+                        h = detected.as_str()
                     ),
                 )
                 .into());
             }
             let hint = unbound_hint(proc_id, session.as_ref());
             let harness = match (harness, &session) {
-                (Some(h), _) => harness_from(&h)?,
+                (Some(h), Some(k)) => session_harness(harness_from(&h)?, k)?,
+                (Some(h), None) => harness_from(&h)?,
                 (None, Some(k)) => k.harness,
                 (None, None) => detected,
             };

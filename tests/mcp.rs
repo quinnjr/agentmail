@@ -568,11 +568,45 @@ async fn opencode_meta_session_isolates_callers() {
     // leaves no identity behind for other sessionless calls.
     let r = call(&client, "register", json!({"name": "nosession"})).await;
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
-    assert!(text(&r).contains("no session id"), "{}", text(&r));
+    assert!(text(&r).contains("no opencode session id"), "{}", text(&r));
+    // Other sessionless calls say why they have no identity, rather than
+    // suggesting a `register` this server would refuse.
     let r = call(&client, "whoami", json!({})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
     assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+    assert!(text(&r).contains("no opencode session id"), "{}", text(&r));
+    assert!(!text(&r).contains("agentmail register"), "{}", text(&r));
+    // A session's call that is not registered keeps the daemon's advice.
+    let r = call_in_session(&client, "s0", "whoami", json!({})).await;
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+    assert!(!text(&r).contains("no opencode session id"), "{}", text(&r));
 
-    let r1 = ok(&call_in_session(&client, "s1", "register", json!({"name": "backend"})).await);
+    // A session fixes the harness: an override naming another is refused
+    // up front, and naming opencode itself is accepted.
+    for other in ["other", "claude-code"] {
+        let r = call_in_session(
+            &client,
+            "s1",
+            "register",
+            json!({"name": "backend", "harness": other}),
+        )
+        .await;
+        assert_eq!(r.is_error, Some(true), "{}", text(&r));
+        assert!(text(&r).contains("InvalidInput"), "{}", text(&r));
+        assert!(
+            text(&r).contains("fixed by the opencode session"),
+            "{}",
+            text(&r)
+        );
+    }
+
+    let r1 = ok(&call_in_session(
+        &client,
+        "s1",
+        "register",
+        json!({"name": "backend", "harness": "opencode"}),
+    )
+    .await);
     let backend = r1["address"].as_str().unwrap().to_string();
     let r2 = ok(&call_in_session(&client, "s2", "register", json!({"name": "frontend"})).await);
     let frontend = r2["address"].as_str().unwrap().to_string();
@@ -644,7 +678,7 @@ async fn opencode_via_wrapper_refuses_sessionless_register() {
 
     let r = call(&client, "register", json!({"name": "nosession"})).await;
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
-    assert!(text(&r).contains("no session id"), "{}", text(&r));
+    assert!(text(&r).contains("no opencode session id"), "{}", text(&r));
     assert!(text(&r).contains("opencode"), "{}", text(&r));
     let r = call(&client, "whoami", json!({})).await;
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
@@ -662,6 +696,33 @@ async fn opencode_via_wrapper_refuses_sessionless_register() {
     assert_eq!(me["agent"]["proc_id"]["pid"], opencode, "{me}");
     let r = call(&client, "whoami", json!({})).await;
     assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+
+    client.cancel().await.unwrap();
+}
+
+/// Claude Code gets no harness redirect (see docs/harness-notes.md): a
+/// server it starts through a wrapper that stays its parent (claude -> sh
+/// -> agentmail mcp) binds the wrapper, not Claude Code.
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_code_wrapper_binds_the_wrapper() {
+    let env = Env::new();
+    let wrapper_pid = env.dir.path().join("wrapper.pid");
+    let script = format!(
+        "/bin/sh -c \"echo \\$\\$ > {}; $MCP; true\"; true",
+        wrapper_pid.display()
+    );
+    let (client, claude) = env.mcp_under("claude", &script).await;
+    let wrapper: u32 = std::fs::read_to_string(&wrapper_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(wrapper, claude);
+
+    ok(&call(&client, "register", json!({"name": "wrapped"})).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["proc_id"]["pid"], wrapper, "{me}");
+    assert_eq!(me["agent"]["harness"], "other", "{me}");
 
     client.cancel().await.unwrap();
 }

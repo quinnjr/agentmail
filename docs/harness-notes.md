@@ -66,8 +66,8 @@ model credentials that an isolated config does not have).
   omits it when the call has no session) cannot `register` on a server
   bound to opencode, so the shared server never caches an address.
   Likewise `agentmail register` under an opencode process without
-  `OPENCODE_SESSION_ID` is refused (only `--pid` naming another process gets
-  past it), so no agent becomes the identity of the shared opencode process.
+  `OPENCODE_SESSION_ID` is refused (only `--pid` naming a process outside
+  that opencode gets past it), so no agent becomes the identity of the shared opencode process.
 - **opencode MCP server behind a wrapper.** When opencode starts the
   server through a wrapper (opencode -> `sh -c` -> agentmail mcp), the
   server's parent is the wrapper, but a session `register` over MCP binds
@@ -76,8 +76,26 @@ model credentials that an isolated config does not have).
   would flip between the wrapper and opencode depending on which path
   registered last, and presence would follow the wrapper's lifetime. This
   cannot leak an identity: sessionless registration on the shared server
-  is refused. Claude Code gets no such rule, so an unknown MCP client run
-  from a Claude Code shell does not take over Claude's binding.
+  is refused.
+- **Claude Code: no harness redirect (a deliberate trade-off).** The plan
+  says an explicit pid (the MCP server's parent) should prefer the nearest
+  harness ancestor. agentmail applies that only for kiro and opencode.
+  Under Claude Code the parent is bound exactly. This was not driven by a
+  spike: it guards a case that follows from the process model, an unknown
+  MCP client (an inspector, another agent tool) run from Claude Code's bash
+  tool, whose `agentmail mcp` would otherwise bind Claude Code itself and
+  take over the agent Claude Code registered. The cost is the wrapper case:
+  a Claude Code config that starts the server through a wrapper that stays
+  its parent (`sh -c 'agentmail mcp'`, no `exec`) binds the wrapper, so
+  Claude Code's shell commands and hooks, which resolve by ancestry (bash ->
+  claude), do not find that agent. Claude Code runs a configured stdio
+  command directly, so a plain `agentmail mcp` config (or a wrapper that
+  `exec`s it) is unaffected. Pinned by the test
+  `claude_code_wrapper_binds_the_wrapper`.
+- **`register --pid` under opencode.** A `--pid` naming a non-harness
+  ancestor (the shell, `$$`) is redirected to the opencode process above it,
+  and so refused without a session like any other sessionless opencode
+  registration. Only a process outside that opencode gets past it.
 - **Resolution order** in the CLI: `--as human`, `AGENTMAIL_ADDRESS`,
   `AGENTMAIL_HUMAN=1`, `OPENCODE_SESSION_ID` (checked as above), then
   process ancestry.
