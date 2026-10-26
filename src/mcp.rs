@@ -249,6 +249,11 @@ pub struct AgentMailServer {
     /// The harness process `register` binds to (the parent, or the nearest
     /// harness above it), if usable.
     bind: Option<(ProcId, Harness)>,
+    /// The harness whose sessions share this server, if any: the bound
+    /// process's harness or any harness above the server (opencode may
+    /// start it through a wrapper such as `sh -c`). A call made outside
+    /// any session then has no identity of its own.
+    shared: Option<Harness>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -316,11 +321,17 @@ impl AgentMailServer {
         let address = std::env::var(ENV_ADDRESS).ok();
         let address_env = address.as_deref().is_some_and(|a| !a.is_empty());
         let caller = initial_caller(address, bind.map(|(p, _)| p));
+        let shared = bind
+            .map(|(_, h)| h)
+            .into_iter()
+            .chain(procinfo::find_harness_ancestor(std::process::id()).map(|(_, h)| h))
+            .find(|h| h.shares_process());
         AgentMailServer {
             paths,
             address_env,
             caller: Arc::new(Mutex::new(caller)),
             bind,
+            shared,
             tool_router: Self::tool_router(),
         }
     }
@@ -344,7 +355,7 @@ impl AgentMailServer {
     /// resolve through the daemon by session: the server is shared, so
     /// caching its address would hand it to every other session.
     fn remember_registered(&self, session: &CallSession, data: &Value) {
-        if self.address_env {
+        if self.address_env || self.shared.is_some() {
             return;
         }
         if let (None, Some(address)) = (&session.0, data["address"].as_str()) {
@@ -446,11 +457,11 @@ impl AgentMailServer {
         // A server shared between sessions (opencode's) has no identity of
         // its own: a call made outside any session cannot register, or the
         // process-level caller would act as that agent for every session.
-        if s.0.is_none() && detected.shares_process() {
+        if let (None, Some(shared)) = (&s.0, self.shared) {
             return Ok(invalid(format!(
                 "this {} MCP server is shared between sessions and the call \
                  carried no session id, so it cannot register",
-                detected.as_str()
+                shared.as_str()
             )));
         }
         // A session names its harness, whatever process the server found.
@@ -785,6 +796,7 @@ mod tests {
             address_env,
             caller: Arc::new(Mutex::new(caller)),
             bind: None,
+            shared: None,
             tool_router: AgentMailServer::tool_router(),
         };
         let key = SessionKey {
@@ -814,6 +826,7 @@ mod tests {
             address_env,
             caller: Arc::new(Mutex::new(caller)),
             bind: None,
+            shared: None,
             tool_router: AgentMailServer::tool_router(),
         };
         let registered = json!({"address": "new-87654321"});
@@ -840,6 +853,13 @@ mod tests {
         let s = server(true, env.clone());
         s.remember_registered(&none, &registered);
         assert_eq!(s.caller(&none), env);
+        // A server shared between sessions caches nothing either.
+        let s = AgentMailServer {
+            shared: Some(Harness::Opencode),
+            ..server(false, Caller::Procs { procs: vec![] })
+        };
+        s.remember_registered(&none, &registered);
+        assert_eq!(s.caller(&none), Caller::Procs { procs: vec![] });
     }
 
     #[test]

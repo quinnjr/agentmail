@@ -1007,14 +1007,17 @@ fn opencode_env_session_register_and_whoami() {
     let again = ok_json(in_session_of(&env, "s1").args(["register", "backend", "--json"]));
     assert_eq!(again["address"], backend.as_str(), "{again}");
 
-    // Without the session the shared process tree resolves to neither.
-    let out = env.cmd().args(["whoami", "--json"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
-    assert!(
-        text(&out.stderr).contains("not registered"),
-        "{}",
-        text(&out.stderr)
-    );
+    // Without the session, a call under opencode resolves to neither
+    // agent through its process tree, and neither does one outside it.
+    for mut c in [env.under("opencode"), env.cmd()] {
+        let out = c.args(["whoami", "--json"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        assert!(
+            text(&out.stderr).contains("not registered"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
 
     // Mail to s1's agent is in s1's inbox only.
     let sender = env.agent("sender");

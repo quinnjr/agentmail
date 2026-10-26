@@ -630,6 +630,37 @@ async fn opencode_meta_session_isolates_callers() {
     client.cancel().await.unwrap();
 }
 
+/// opencode may start the server through a wrapper (`sh -c`): the server
+/// binds the wrapper, yet is still shared between opencode's sessions, so
+/// a sessionless `register` is refused and leaves no identity behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_via_wrapper_refuses_sessionless_register() {
+    let env = Env::new();
+    // opencode -> sh (the wrapper) -> agentmail mcp.
+    let (client, _) = env
+        .mcp_under("opencode", "/bin/sh -c '$MCP; true'; true")
+        .await;
+
+    let r = call(&client, "register", json!({"name": "nosession"})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).contains("no session id"), "{}", text(&r));
+    assert!(text(&r).contains("opencode"), "{}", text(&r));
+    let r = call(&client, "whoami", json!({})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+
+    // A session still registers.
+    let r = ok(&call_in_session(&client, "s1", "register", json!({"name": "backend"})).await);
+    assert!(
+        r["address"].as_str().unwrap().starts_with("backend-"),
+        "{r}"
+    );
+    let r = call(&client, "whoami", json!({})).await;
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+
+    client.cancel().await.unwrap();
+}
+
 /// Under kiro V3 the MCP server's parent is a helper (`node`), not
 /// `kiro-cli`: `register` binds the nearest harness ancestor instead.
 #[tokio::test(flavor = "multi_thread")]
