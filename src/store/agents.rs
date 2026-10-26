@@ -27,7 +27,8 @@ pub struct RegisterReq {
     pub repo: Option<PathBuf>,
     /// The harness process to bind the address to.
     pub proc_id: Option<ProcId>,
-    /// Always take a new address; never reclaim.
+    /// Always take a new address; never reclaim. `InvalidInput` when
+    /// `session` is already bound to a non-signed-off agent.
     pub fresh: bool,
     pub wake: bool,
     /// The harness session to bind the address to, if any.
@@ -179,6 +180,11 @@ fn claim_process(
     agents: &[Agent],
     agent: &mut Agent,
 ) -> Result<(), StoreError> {
+    // A session agent of a shared process (opencode) is not process-level:
+    // it claims nothing, so process-level agents there keep their binding.
+    if shared_session(agent) {
+        return Ok(());
+    }
     let Some(bound) = agent.proc_id else {
         return Ok(());
     };
@@ -189,9 +195,14 @@ fn claim_process(
         .collect();
     displaced.sort_by_key(|o| (o.last_seen, o.registered_at));
     let heir = if agent.session.is_none() {
-        displaced
-            .iter()
-            .rposition(|o| !o.signed_off && o.session.is_some())
+        displaced.iter().rposition(|o| {
+            // Only a session of the claiming agent's own harness: a
+            // `--harness` override must not inherit another harness's.
+            !o.signed_off
+                && o.session
+                    .as_ref()
+                    .is_some_and(|k| k.harness == agent.harness)
+        })
     } else {
         None
     };
@@ -236,14 +247,17 @@ impl Store {
     ///
     /// One process-level address per harness process: any other agent bound
     /// to `proc_id` is unbound (its `proc_id` cleared, so it shows as gone),
-    /// except agents of other opencode sessions sharing the process. See
-    /// `claim_process`.
+    /// except agents of other opencode sessions sharing the process. An
+    /// opencode session agent is not process-level and unbinds nothing.
+    /// A session-less claimant inherits a displaced agent's session only
+    /// when it is of the claimant's own harness. See `claim_process`.
     ///
     /// Sessions: with `session = Some(k)` and a non-signed-off agent bound
     /// to `k`, that agent is returned with `role`, `working_on`, `wake`,
     /// `proc_id` (kept when `req.proc_id` is `None`) and `last_seen` updated
-    /// (not reclaimed, `existing`); its name must match `req.name`,
-    /// otherwise `InvalidInput`. Otherwise the rules above apply and the
+    /// (not reclaimed, `existing`); its name must match `req.name` and
+    /// `req.fresh` must be false (a bound session cannot take a new
+    /// address until it signs off), otherwise `InvalidInput`. Otherwise the rules above apply and the
     /// result is bound to `k`, moving any earlier session binding of a
     /// reclaimed agent off it.
     pub fn register(
@@ -299,6 +313,12 @@ impl Store {
                 if a.name != req.name {
                     return Err(StoreError::InvalidInput(format!(
                         "session already registered as {}",
+                        a.address
+                    )));
+                }
+                if req.fresh {
+                    return Err(StoreError::InvalidInput(format!(
+                        "session already registered as {}; sign off first",
                         a.address
                     )));
                 }

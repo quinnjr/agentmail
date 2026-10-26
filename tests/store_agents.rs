@@ -1028,3 +1028,86 @@ fn signed_off_claude_reregistration_does_not_revive_its_old_session() {
     assert_eq!(c.session, None);
     assert_eq!(s.find_by_session(&key).unwrap().unwrap().address, b.address);
 }
+
+#[test]
+fn opencode_session_registration_keeps_process_level_agent() {
+    // A session agent of the shared opencode process is not process-level:
+    // registering (or repeating the registration of) one never unbinds a
+    // process-level agent on that process.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let mut docs = req("docs", "/w", Some(p(1)));
+    docs.harness = Harness::Opencode;
+    let (d, _) = register(&s, &procs, docs, 1);
+    let (a, _) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s3"),
+        2,
+    );
+    let (b, _) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s3"),
+        3,
+    );
+    assert_eq!(b.address, a.address);
+    assert_eq!(
+        s.get_agent(&d.address).unwrap().unwrap().proc_id,
+        Some(p(1))
+    );
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        d.address
+    );
+    let s3 = session_req("x", "/", None, "s3").session.unwrap();
+    assert_eq!(s.find_by_session(&s3).unwrap().unwrap().address, a.address);
+}
+
+#[test]
+fn fresh_from_bound_session_is_rejected_until_signoff() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 1);
+    let mut r = kiro_req("backend", Some(p(1)), Some("k1"));
+    r.fresh = true;
+    let err = s.register(r.clone(), 2, &procs.alive()).unwrap_err();
+    match err {
+        StoreError::InvalidInput(m) => {
+            assert!(m.contains(&a.address) && m.contains("sign off"), "{m}")
+        }
+        e => panic!("unexpected {e:?}"),
+    }
+    assert_eq!(s.get_agent(&a.address).unwrap().unwrap(), a);
+    // After signoff the session is free and `fresh` mints a new address.
+    s.signoff(&a.address).unwrap();
+    let (b, reclaimed) = register(&s, &procs, r, 3);
+    assert!(!reclaimed);
+    assert_ne!(b.address, a.address);
+    assert_eq!(
+        s.find_by_session(&kiro_key("k1")).unwrap().unwrap().address,
+        b.address
+    );
+}
+
+#[test]
+fn harness_override_does_not_inherit_other_harness_session() {
+    // `--harness other` from a kiro-cli process takes the process binding
+    // but not the kiro session, which is unbound.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 1);
+    let mut r = req("docs", "/w", Some(p(1)));
+    r.harness = Harness::Other;
+    let (b, _) = register(&s, &procs, r, 2);
+    assert_ne!(b.address, a.address);
+    assert_eq!(b.session, None);
+    let old = s.get_agent(&a.address).unwrap().unwrap();
+    assert_eq!(old.proc_id, None);
+    assert_eq!(old.session, None);
+    assert_eq!(s.find_by_session(&kiro_key("k1")).unwrap(), None);
+    assert_eq!(
+        s.find_by_procs(&[p(1)]).unwrap().unwrap().address,
+        b.address
+    );
+}

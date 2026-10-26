@@ -74,13 +74,16 @@ pub enum Request {
         cwd: PathBuf,
         #[serde(default)]
         proc_id: Option<ProcId>,
+        /// Always take a new address; never reclaim. Rejected from a
+        /// session that is already bound (see `session`).
         #[serde(default)]
         fresh: bool,
         #[serde(default)]
         wake: bool,
         /// Bind the address to this harness session too. Registering again
         /// from a session that is already bound returns its agent, updated;
-        /// a different name is `InvalidInput`.
+        /// a different name, or `fresh` set, is `InvalidInput` (sign off
+        /// first to take a new address for a bound session).
         ///
         /// The response's `existing` is true for any repeat registration of
         /// a live (not signed-off) identity, from its bound session or its
