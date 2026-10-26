@@ -109,6 +109,45 @@ impl Env {
     }
 }
 
+impl Env {
+    /// `agentmail mcp` run by a fake harness process named `harness` (a
+    /// copy of `/bin/sh`) through `script`, a shell snippet in which `$MCP`
+    /// starts the server. The harness writes its pid to a file; returns the
+    /// client and that pid.
+    async fn mcp_under(
+        &self,
+        harness: &str,
+        script: &str,
+    ) -> (RunningService<RoleClient, ClientConfig>, u32) {
+        let fake = self.dir.path().join(harness);
+        std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+        let pid_file = self.dir.path().join(format!("{harness}.pid"));
+        let script = format!(
+            "echo $$ > '{}'; {}",
+            pid_file.display(),
+            script.replace("$MCP", &format!("{BIN} mcp"))
+        );
+        let transport =
+            TokioChildProcess::new(tokio::process::Command::new(&fake).configure(|c| {
+                c.arg("-c")
+                    .arg(&script)
+                    .env("AGENTMAIL_DATA_DIR", self.data_dir())
+                    .env("AGENTMAIL_SOCKET", self.socket())
+                    .env_remove("AGENTMAIL_ADDRESS")
+                    .env_remove("AGENTMAIL_HUMAN")
+                    .env_remove("AGENTMAIL_BIN")
+                    .env_remove("OPENCODE_SESSION_ID")
+                    .env_remove("KIRO_SESSION_ID")
+                    .current_dir(&self.work);
+            }))
+            .unwrap();
+        let client = ClientConfig::default().serve(transport).await.unwrap();
+        // The server answered, so the harness wrote its pid before starting it.
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        (client, pid.trim().parse().unwrap())
+    }
+}
+
 impl Drop for Env {
     fn drop(&mut self) {
         let _ = self
@@ -521,7 +560,17 @@ async fn mcp_blocking_tools_do_not_block_others() {
 #[tokio::test(flavor = "multi_thread")]
 async fn opencode_meta_session_isolates_callers() {
     let mut env = Env::new();
-    let client = env.mcp().await;
+    // opencode -> agentmail mcp; the trailing `true` stops the shell from
+    // exec'ing the server.
+    let (client, opencode) = env.mcp_under("opencode", "$MCP; true").await;
+
+    // A call without a session cannot register on the shared server, and
+    // leaves no identity behind for other sessionless calls.
+    let r = call(&client, "register", json!({"name": "nosession"})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).contains("no session id"), "{}", text(&r));
+    let r = call(&client, "whoami", json!({})).await;
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
 
     let r1 = ok(&call_in_session(&client, "s1", "register", json!({"name": "backend"})).await);
     let backend = r1["address"].as_str().unwrap().to_string();
@@ -535,6 +584,7 @@ async fn opencode_meta_session_isolates_callers() {
         assert_eq!(me["address"], backend.as_str(), "{me}");
         assert_eq!(me["agent"]["harness"], "opencode", "{me}");
         assert_eq!(me["agent"]["session"]["id"], "s1", "{me}");
+        assert_eq!(me["agent"]["proc_id"]["pid"], opencode, "{me}");
         let me = ok(&call_in_session(&client, "s2", "whoami", json!({})).await);
         assert_eq!(me["address"], frontend.as_str(), "{me}");
     }
@@ -585,29 +635,17 @@ async fn opencode_meta_session_isolates_callers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bind_prefers_harness_ancestor() {
     let env = Env::new();
-    let fake = env.dir.path().join("kiro-cli");
-    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
     // kiro-cli -> sh (the intermediate) -> agentmail mcp. The trailing
     // `true`s stop either shell from exec'ing its last command.
-    let script = format!("/bin/sh -c '{BIN} mcp; true'; true");
-    let transport = TokioChildProcess::new(tokio::process::Command::new(&fake).configure(|c| {
-        c.arg("-c")
-            .arg(&script)
-            .env("AGENTMAIL_DATA_DIR", env.data_dir())
-            .env("AGENTMAIL_SOCKET", env.socket())
-            .env_remove("AGENTMAIL_ADDRESS")
-            .env_remove("AGENTMAIL_HUMAN")
-            .env_remove("AGENTMAIL_BIN")
-            .env_remove("OPENCODE_SESSION_ID")
-            .env_remove("KIRO_SESSION_ID")
-            .current_dir(&env.work);
-    }))
-    .unwrap();
-    let client = ClientConfig::default().serve(transport).await.unwrap();
+    let (client, kiro) = env
+        .mcp_under("kiro-cli", "/bin/sh -c '$MCP; true'; true")
+        .await;
 
     ok(&call(&client, "register", json!({"name": "kiroagent"})).await);
     let me = ok(&call(&client, "whoami", json!({})).await);
     assert_eq!(me["agent"]["harness"], "kiro", "{me}");
+    // Bound to the kiro-cli process itself, not the intermediate shell.
+    assert_eq!(me["agent"]["proc_id"]["pid"], kiro, "{me}");
 
     client.cancel().await.unwrap();
 }

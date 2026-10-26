@@ -765,7 +765,9 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             };
             // A session from the environment names its harness: the
             // process found may be another harness further up the tree.
-            let session = identity::session_from_env(|k| std::env::var_os(k));
+            // Only the session of the harness this process runs under
+            // counts, not one inherited from an outer harness.
+            let session = identity::env_session();
             let has_session = session.is_some();
             let harness = match (harness, &session) {
                 (Some(h), _) => harness_from(&h)?,

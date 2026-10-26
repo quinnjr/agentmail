@@ -60,6 +60,29 @@ impl Env {
         c
     }
 
+    /// `agentmail` run by a fake harness process named `harness` (a copy of
+    /// `/bin/sh`, which stays the CLI's parent), with this environment and
+    /// no identity. Arguments added to it go to `agentmail`.
+    fn under(&self, harness: &str) -> Command {
+        let fake = self.dir.path().join(harness);
+        if !fake.exists() {
+            std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+        }
+        let mut c = Command::new(&fake);
+        // The trailing `exit` stops the shell from exec'ing the CLI.
+        c.args(["-c", r#""$0" "$@"; exit $?"#, BIN])
+            .env("AGENTMAIL_DATA_DIR", self.data_dir())
+            .env("AGENTMAIL_SOCKET", self.socket())
+            .env_remove("AGENTMAIL_ADDRESS")
+            .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_BIN")
+            .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("KIRO_SESSION_ID")
+            .current_dir(&self.work)
+            .timeout(Duration::from_secs(30));
+        c
+    }
+
     /// `agentmail` acting as agent `addr`.
     fn as_agent(&self, addr: &str) -> Command {
         let mut c = self.cmd();
@@ -960,8 +983,10 @@ fn closed_stdout_does_not_panic() {
 #[test]
 fn opencode_env_session_register_and_whoami() {
     let mut env = Env::new();
+    // Each command runs as opencode runs its shell commands: under the
+    // opencode process, with the session in the environment.
     fn in_session_of(env: &Env, id: &str) -> Command {
-        let mut c = env.cmd();
+        let mut c = env.under("opencode");
         c.env("OPENCODE_SESSION_ID", id);
         c
     }
@@ -1006,4 +1031,99 @@ fn opencode_env_session_register_and_whoami() {
     assert!(inbox.to_string().contains("for s1"), "{inbox}");
     let inbox = ok_json(in_session_of(&env, "s2").args(["inbox", "--json"]));
     assert!(!inbox.to_string().contains("for s1"), "{inbox}");
+}
+
+/// A session variable inherited from an outer harness does not count: a
+/// harness started from an opencode shell is not that opencode session.
+#[test]
+fn inherited_opencode_session_is_ignored() {
+    let env = Env::new();
+    let r = ok_json(
+        env.under("opencode")
+            .env("OPENCODE_SESSION_ID", "s1")
+            .args(["register", "backend", "--json"]),
+    );
+    let backend = r["address"].as_str().unwrap().to_string();
+    // `claude` run from that opencode's shell: its commands inherit
+    // OPENCODE_SESSION_ID, but run under the claude process.
+    let out = env
+        .under("claude")
+        .env("OPENCODE_SESSION_ID", "s1")
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("not registered"),
+        "{}",
+        text(&out.stderr)
+    );
+    // Registering there binds the claude process, not the opencode session.
+    let inner = ok_json(
+        env.under("claude")
+            .env("OPENCODE_SESSION_ID", "s1")
+            .args(["register", "inner", "--json"]),
+    );
+    assert_ne!(inner["address"], backend.as_str(), "{inner}");
+    let me = ok_json(
+        env.under("opencode")
+            .env("OPENCODE_SESSION_ID", "s1")
+            .args(["whoami", "--json"]),
+    );
+    assert_eq!(me["address"], backend.as_str(), "{me}");
+}
+
+/// kiro's MCP server registers by process alone (kiro passes it no session
+/// id), while kiro's shell commands carry KIRO_SESSION_ID. The CLI in that
+/// shell still resolves to the agent the MCP server registered.
+#[test]
+fn kiro_cli_after_mcp_register_resolves_by_process() {
+    let env = Env::new();
+    let fake = env.dir.path().join("kiro-cli");
+    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+    // One kiro-cli process: register as its MCP server does (bound to
+    // kiro-cli, no session), then run `whoami` and `register` as its shell
+    // commands do, with KIRO_SESSION_ID set. One JSON document per line.
+    let script = r#"
+        "$0" register kiroagent --json --pid $$ || exit 1
+        KIRO_SESSION_ID=k1 "$0" whoami --json || exit 2
+        KIRO_SESSION_ID=k1 "$0" register kiroagent --json || exit 3
+        echo $$
+    "#;
+    let out = Command::new(&fake)
+        .args(["-c", script, BIN])
+        .env("AGENTMAIL_DATA_DIR", env.data_dir())
+        .env("AGENTMAIL_SOCKET", env.socket())
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_BIN")
+        .env_remove("OPENCODE_SESSION_ID")
+        .env_remove("KIRO_SESSION_ID")
+        .current_dir(&env.work)
+        .timeout(Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "exit {:?}: {}",
+        out.status.code(),
+        text(&out.stderr)
+    );
+    let stdout = text(&out.stdout);
+    let docs: Vec<Value> = serde_json::Deserializer::from_str(&stdout)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| panic!("bad json ({e}): {stdout}"));
+    let [registered, me, again, pid] = &docs[..] else {
+        panic!("expected 4 documents: {stdout}");
+    };
+    let address = registered["address"].as_str().unwrap();
+    assert_eq!(me["address"], address, "{me}");
+    assert_eq!(me["agent"]["harness"], "kiro", "{me}");
+    assert_eq!(me["agent"]["proc_id"]["pid"], *pid, "{me}");
+    // The shell's register is the same agent, now with kiro's session.
+    assert_eq!(again["address"], address, "{again}");
+    let me = ok_json(env.as_agent(address).args(["whoami", "--json"]));
+    assert_eq!(me["agent"]["session"]["harness"], "kiro", "{me}");
+    assert_eq!(me["agent"]["session"]["id"], "k1", "{me}");
 }

@@ -14,7 +14,9 @@
 //! - Otherwise (Claude Code, kiro: one server per session) the server calls
 //!   as the harness process it binds to (`Caller::Procs`), so a session that
 //!   registered before (or from a hook or shell) is found again. After a
-//!   `register` without a session it calls as the returned address.
+//!   `register` without a session it calls as the returned address. A server
+//!   bound to a harness that shares its process between sessions (opencode)
+//!   refuses `register` without a session, so it never caches an address.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -422,6 +424,16 @@ impl AgentMailServer {
             Some((p, h)) => (Some(p), h),
             None => (None, Harness::Other),
         };
+        // A server shared between sessions (opencode's) has no identity of
+        // its own: a call made outside any session cannot register, or the
+        // process-level caller would act as that agent for every session.
+        if s.0.is_none() && detected.shares_process() {
+            return Ok(invalid(format!(
+                "this {} MCP server is shared between sessions and the call \
+                 carried no session id, so it cannot register",
+                detected.as_str()
+            )));
+        }
         // A session names its harness, whatever process the server found.
         let harness = match p.harness {
             None => s.0.as_ref().map_or(detected, |k| k.harness),
