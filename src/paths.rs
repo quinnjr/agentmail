@@ -225,6 +225,9 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn lock_record_round_trips_and_rejects_anything_else() {
@@ -278,9 +281,6 @@ mod tests {
         std::fs::write(&paths.lock, rec.encode()).unwrap();
         assert_eq!(paths.lock_record(), Some(rec));
     }
-    use std::collections::HashMap;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs

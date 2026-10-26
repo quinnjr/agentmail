@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -212,17 +212,110 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// keeps the pipe open then dies with it, so neither we nor the reader
 /// thread are held past the deadline.
 fn output_within(cmd: Command, limit: Duration) -> Option<Vec<u8>> {
-    output_within_with(cmd, limit, kill_group).ok()
+    output_within_with(&COMMANDS, cmd, limit, kill_group).ok()
 }
 
-/// The process groups of commands running under [`output_within`], so a
-/// process exiting without waiting for them can kill them. A command is
-/// spawned and its group listed under the lock, so none runs unlisted. A
-/// group is taken off the list before its leader is reaped, or (when it
+/// The commands running under [`output_within`], so a process exiting
+/// without waiting for them can kill them.
+///
+/// A command is spawned outside the lock, so spawns (fork and exec) in
+/// concurrent requests do not wait for each other, and neither does
+/// anything else that takes the lock; but it is counted as starting first,
+/// and [`Commands::stop`] waits for every command that is starting to be
+/// listed (or killed by its own request, once stopping has begun). So none
+/// runs unseen by a stop.
+///
+/// A group is taken off the list before its leader is reaped, or (when it
 /// cannot tell whether the leader is still unreaped) before anything else
 /// is done with it, so its id cannot have been reused by an unrelated
 /// process while listed.
-static RUNNING_GROUPS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+struct Commands {
+    state: Mutex<Running>,
+    /// Notified whenever a command that was starting is listed or given up.
+    settled: Condvar,
+}
+
+/// What [`Commands`] guards.
+struct Running {
+    /// The process groups of running commands.
+    groups: BTreeSet<u32>,
+    /// How many commands are being spawned and not yet listed.
+    starting: usize,
+    /// Set by [`Commands::stop`]: no command may start from then on.
+    stopping: bool,
+}
+
+impl Commands {
+    const fn new() -> Commands {
+        Commands {
+            state: Mutex::new(Running {
+                groups: BTreeSet::new(),
+                starting: 0,
+                stopping: false,
+            }),
+            settled: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Running> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Count a command as starting, before it is spawned. False once
+    /// stopping has begun: it must not start.
+    fn begin(&self) -> bool {
+        let mut state = self.lock();
+        if state.stopping {
+            return false;
+        }
+        state.starting += 1;
+        true
+    }
+
+    /// A command counted by [`Commands::begin`] could not be spawned.
+    fn abandon(&self) {
+        self.lock().starting -= 1;
+        self.settled.notify_all();
+    }
+
+    /// List the group `pgid` of a command counted by [`Commands::begin`],
+    /// now spawned. False when stopping began meanwhile and it was not
+    /// listed: the caller must kill it at once.
+    fn started(&self, pgid: u32) -> bool {
+        let mut state = self.lock();
+        state.starting -= 1;
+        let listed = !state.stopping;
+        if listed {
+            state.groups.insert(pgid);
+        }
+        drop(state);
+        self.settled.notify_all();
+        listed
+    }
+
+    /// Take group `pgid` off the list.
+    fn unlist(&self, pgid: u32) {
+        self.lock().groups.remove(&pgid);
+    }
+
+    /// Kill every listed group with `kill_group` and let no more commands
+    /// start; then wait for those being spawned, which their requests kill
+    /// as they find stopping begun. Returns the lock, which keeps every
+    /// group still listed unreaped (and its id reserved) while held.
+    fn stop(&self, kill_group: impl Fn(u32)) -> MutexGuard<'_, Running> {
+        let mut state = self.lock();
+        state.stopping = true;
+        for &pgid in &state.groups {
+            kill_group(pgid);
+        }
+        self.settled
+            .wait_while(state, |state| state.starting > 0)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The commands running under [`output_within`].
+static COMMANDS: Commands = Commands::new();
 
 /// Kill every command running under [`output_within`], with its whole
 /// process group, and start no more. For a daemon about to exit without
@@ -230,31 +323,16 @@ static RUNNING_GROUPS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 /// them.
 ///
 /// Never gives the lock back: holding it keeps every listed leader
-/// unreaped (see [`RUNNING_GROUPS`]) until all the kills are sent, and
-/// then keeps any request from starting a command the kills missed
-/// before the process exits.
+/// unreaped (see [`Commands`]) until the process exits. A command being
+/// spawned when this is called is waited for, and killed by its request.
 pub fn kill_running_commands() {
-    let groups = RUNNING_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    for &pgid in groups.iter() {
-        kill_group(pgid);
-    }
-    std::mem::forget(groups);
-}
-
-/// Take group `pgid` off [`RUNNING_GROUPS`].
-fn unlist(pgid: u32) {
-    RUNNING_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&pgid);
+    std::mem::forget(COMMANDS.stop(kill_group));
 }
 
 /// Reap `child`, the leader of process group `pgid`, after taking the group
-/// off [`RUNNING_GROUPS`].
-fn reap(child: &mut std::process::Child, pgid: u32) {
-    unlist(pgid);
+/// off `commands`.
+fn reap(commands: &Commands, child: &mut std::process::Child, pgid: u32) {
+    commands.unlist(pgid);
     let _ = child.wait();
 }
 
@@ -263,6 +341,9 @@ fn reap(child: &mut std::process::Child, pgid: u32) {
 enum GiveUp {
     /// The command could not be started.
     Spawn,
+    /// The commands are being stopped (the daemon is exiting), so it was
+    /// not started, or was killed as soon as it was.
+    Stopping,
     /// The command was still running at the deadline.
     TimedOut,
     /// The command exited unsuccessfully.
@@ -276,8 +357,9 @@ enum GiveUp {
     LeaderUnknown,
 }
 
-/// [`output_within`] with the group kill injectable, so tests can observe
-/// when it happens, and the reason for giving up reported.
+/// [`output_within`] with the registry and the group kill injectable, so
+/// tests can observe when it happens, and the reason for giving up
+/// reported.
 ///
 /// The group id is the leader's pid, and a pid (hence the group id) stays
 /// reserved for exactly as long as the leader is unreaped, alive or a
@@ -287,6 +369,7 @@ enum GiveUp {
 /// possible group kill. Signalling `-pgid` therefore can never reach an
 /// unrelated process that reused the id.
 fn output_within_with(
+    commands: &Commands,
     mut cmd: Command,
     limit: Duration,
     kill_group: impl Fn(u32),
@@ -298,21 +381,29 @@ fn output_within_with(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
-    // Spawn and list under one lock, so a daemon killing every listed
-    // group on its way out (`kill_running_commands`) cannot miss this one.
-    let mut child = {
-        let mut groups = RUNNING_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let child = cmd.spawn().map_err(|_| GiveUp::Spawn)?;
-        // With `process_group(0)` the group id is the child's pid.
-        groups.insert(child.id());
-        child
+    // Counted as starting while it is spawned, so a daemon killing every
+    // listed group on its way out (`kill_running_commands`) waits for it.
+    if !commands.begin() {
+        return Err(GiveUp::Stopping);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            commands.abandon();
+            return Err(GiveUp::Spawn);
+        }
     };
+    // With `process_group(0)` the group id is the child's pid.
     let pgid = child.id();
+    if !commands.started(pgid) {
+        // Unlisted and unreaped: the group id is still ours to signal.
+        kill_group(pgid);
+        let _ = child.wait();
+        return Err(GiveUp::Stopping);
+    }
     let Some(mut stdout) = child.stdout.take() else {
         kill_group(pgid);
-        reap(&mut child, pgid);
+        reap(commands, &mut child, pgid);
         return Err(GiveUp::Read);
     };
     let (tx, rx) = mpsc::channel();
@@ -328,7 +419,7 @@ fn output_within_with(
             Ok(None) => {
                 // Timed out: the leader is still running, so unreaped.
                 kill_group(pgid);
-                reap(&mut child, pgid);
+                reap(commands, &mut child, pgid);
                 return Err(GiveUp::TimedOut);
             }
             Err(_) => {
@@ -336,7 +427,7 @@ fn output_within_with(
                 // for, so the group id may already be free: unlist it at
                 // once, so no exiting daemon signals it either, and do not
                 // signal the group, only the child std still tracks.
-                unlist(pgid);
+                commands.unlist(pgid);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(GiveUp::LeaderUnknown);
@@ -362,7 +453,7 @@ fn output_within_with(
     if out.is_err() {
         kill_group(pgid);
     }
-    reap(&mut child, pgid);
+    reap(commands, &mut child, pgid);
     out
 }
 
@@ -1338,16 +1429,14 @@ mod tests {
         );
     }
 
-    /// A command cannot start while `RUNNING_GROUPS` is held, as it is by
-    /// a daemon killing them on its way out: one started in that window
-    /// would never be killed, and outlive the daemon.
+    /// A command cannot start while the lock on `COMMANDS` is held, as it
+    /// is by a daemon killing them on its way out: one started in that
+    /// window would never be killed, and outlive the daemon.
     #[test]
     fn no_command_starts_while_the_running_groups_are_held() {
         let dir = tempfile::TempDir::new().unwrap();
         let marker = dir.path().join("ran");
-        let held = RUNNING_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let held = COMMANDS.lock();
         let run = std::thread::spawn({
             let marker = marker.clone();
             move || {
@@ -1364,6 +1453,53 @@ mod tests {
         drop(held);
         assert_eq!(run.join().unwrap(), Some(Vec::new()));
         assert!(marker.exists());
+    }
+
+    /// A stop kills every listed group, then waits for commands still being
+    /// spawned: each is killed by its own request rather than listed. Once
+    /// stopping has begun, no command starts at all.
+    #[test]
+    fn stopping_kills_listed_commands_and_those_being_spawned() {
+        use std::os::unix::process::CommandExt;
+        let commands = Arc::new(Commands::new());
+        assert!(commands.begin());
+        assert!(commands.started(1_000_001));
+        // A command being spawned when the stop begins.
+        assert!(commands.begin());
+        let stopper = std::thread::spawn({
+            let commands = Arc::clone(&commands);
+            move || {
+                let killed = Mutex::new(Vec::new());
+                drop(commands.stop(|pgid| killed.lock().unwrap().push(pgid)));
+                killed.into_inner().unwrap()
+            }
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !stopper.is_finished(),
+            "the stop did not wait for a command being spawned"
+        );
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert!(
+            !commands.started(child.id()),
+            "a command spawned during a stop was listed"
+        );
+        assert_eq!(stopper.join().unwrap(), vec![1_000_001]);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!commands.begin(), "a command began after the stop");
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("ran");
+        let mut cmd = Command::new("touch");
+        cmd.arg(&marker);
+        let out = output_within_with(&commands, cmd, Duration::from_secs(5), |_| {});
+        assert_eq!(out, Err(GiveUp::Stopping));
+        assert!(!marker.exists(), "a command ran after the stop");
     }
 
     /// Limits to try, in turn, for a case that needs the command to get
@@ -1419,7 +1555,7 @@ mod tests {
             cmd.arg("-c").arg(script).arg("sh").arg(&pidfile);
             let started = Instant::now();
             let kills = std::sync::Mutex::new(Vec::new());
-            let out = output_within_with(cmd, limit, |pgid| {
+            let out = output_within_with(&COMMANDS, cmd, limit, |pgid| {
                 kills.lock().unwrap().push(pgid);
                 kill_group(pgid);
             });
@@ -1470,7 +1606,7 @@ mod tests {
     /// records.
     fn run_with_kill_probe(cmd: Command, limit: Duration) -> (Result<Vec<u8>, GiveUp>, Vec<bool>) {
         let seen = std::sync::Mutex::new(Vec::new());
-        let out = output_within_with(cmd, limit, |pgid| {
+        let out = output_within_with(&COMMANDS, cmd, limit, |pgid| {
             let pid = libc::pid_t::try_from(pgid).unwrap();
             // SAFETY: kill(2) with signal 0 only checks that `pid` exists;
             // an exited but unreaped child still does.
@@ -1537,7 +1673,7 @@ mod tests {
             let leader = std::sync::Mutex::new(None);
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(script);
-            let out = output_within_with(cmd, limit, |pgid| {
+            let out = output_within_with(&COMMANDS, cmd, limit, |pgid| {
                 *leader.lock().unwrap() = Some(pgid);
                 kill_group(pgid);
             });
@@ -1549,7 +1685,7 @@ mod tests {
         let script = "echo $$";
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(script);
-        let out = output_within_with(cmd, Duration::from_secs(5), |_| {
+        let out = output_within_with(&COMMANDS, cmd, Duration::from_secs(5), |_| {
             panic!("a clean success killed its group")
         })
         .unwrap();

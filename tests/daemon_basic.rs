@@ -1460,10 +1460,85 @@ async fn shutdown_closed_without_reply_counts_as_acknowledged() {
     assert_eq!(fake.await.unwrap(), vec!["hello", "shutdown"]);
 }
 
+/// A daemon that has acknowledged `Shutdown` never serves a connection
+/// made after the acknowledgement, so a client looking for its successor
+/// never reaches the daemon that is going away. Several daemons stop at
+/// once, as the window this guards is widest on a loaded machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_connection_is_served_after_shutdown_is_acknowledged() {
+    let mut rounds = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        rounds.spawn(async {
+            for _ in 0..5 {
+                let dir = TempDir::new().unwrap();
+                let paths = Paths::in_dir(dir.path());
+                let (mut child, c) = foreground_daemon(&paths).await;
+                drop(c);
+                assert!(Client::shutdown(&paths).await.unwrap());
+                // Every handshake from now on must fail, until the socket
+                // is gone.
+                let deadline = Instant::now() + PROCESS_WAIT;
+                while paths.socket.exists() {
+                    assert!(
+                        Client::connect(&paths).await.is_err(),
+                        "the daemon answered Hello after acknowledging Shutdown"
+                    );
+                    assert!(Instant::now() < deadline, "the socket stayed in place");
+                }
+                let (status, err) = child.exit_within(PROCESS_WAIT).await;
+                assert!(status.success(), "{status:?}: {err}");
+            }
+        });
+    }
+    while let Some(res) = rounds.join_next().await {
+        res.unwrap();
+    }
+}
+
 /// A `daemon run` child process, killed and reaped on drop so a failing
-/// test never leaves a daemon behind. Its stderr is piped, to be read once
-/// it has exited.
-struct Foreground(std::process::Child);
+/// test never leaves a daemon behind. Its stderr is collected as it is
+/// written, to be looked at while it runs and once it has exited.
+struct Foreground(std::process::Child, Stderr);
+
+/// A child's stderr, read by a thread of its own.
+struct Stderr {
+    text: std::sync::Arc<std::sync::Mutex<String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stderr {
+    fn capture(pipe: std::process::ChildStderr) -> Stderr {
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let reader = std::thread::spawn({
+            let text = std::sync::Arc::clone(&text);
+            move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(pipe).lines() {
+                    let Ok(line) = line else { return };
+                    let mut text = text.lock().unwrap();
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+            }
+        });
+        Stderr {
+            text,
+            reader: Some(reader),
+        }
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.text.lock().unwrap().contains(needle)
+    }
+
+    /// Everything written, once the pipe has closed.
+    fn finish(&mut self) -> String {
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+        self.text.lock().unwrap().clone()
+    }
+}
 
 impl Foreground {
     /// Start `agentmail <args>` for `paths` the way a systemd unit does,
@@ -1479,7 +1554,9 @@ impl Foreground {
         if let Some(path) = path_env {
             cmd.env("PATH", path);
         }
-        Foreground(cmd.spawn().unwrap())
+        let mut child = cmd.spawn().unwrap();
+        let stderr = Stderr::capture(child.stderr.take().unwrap());
+        Foreground(child, stderr)
     }
 
     fn signal(&self, signal: libc::c_int) {
@@ -1501,12 +1578,27 @@ impl Foreground {
             assert!(Instant::now() < deadline, "daemon did not exit");
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
-        let mut err = String::new();
-        if let Some(mut stderr) = self.0.stderr.take() {
-            use std::io::Read;
-            stderr.read_to_string(&mut err).unwrap();
+        (status, self.1.finish())
+    }
+
+    /// Wait until this daemon (run with `--wait-for-lock`) says it waits
+    /// for the lock, which it does only once it is past the point where a
+    /// daemon without the flag gives up; then check it is still running.
+    async fn waiting_for_lock(&mut self) {
+        let deadline = Instant::now() + PROCESS_WAIT;
+        while !self.1.contains("waiting for it to exit") {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                let (_, err) = self.exit_within(Duration::ZERO).await;
+                panic!("daemon exited instead of waiting for the lock: {status:?}: {err}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon never said it waits for the lock"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        (status, err)
+        // Past the give-up point, a daemon without the flag would exit.
+        assert!(self.running(), "gave up on the held lock");
     }
 
     /// Wait until this daemon answers at `paths`, failing at once if it
@@ -1862,18 +1954,13 @@ async fn signal_while_opening_a_busy_store_exits_cleanly() {
     drop(store);
 }
 
-/// How long a daemon without `--wait-for-lock` takes at most to give up on
-/// a held lock, with room to spare.
-const GIVE_UP_WINDOW: Duration = Duration::from_millis(1500);
-
 /// `daemon run --wait-for-lock` (what the systemd unit runs) waits while
 /// another daemon holds the lock, then serves once that one stops.
 #[tokio::test]
 async fn wait_for_lock_takes_over_when_the_holder_stops() {
     let mut d = TestDaemon::start().await;
     let mut child = Foreground::spawn(&d.paths, &["daemon", "run", "--wait-for-lock"], None);
-    tokio::time::sleep(GIVE_UP_WINDOW).await;
-    assert!(child.running(), "gave up on the held lock");
+    child.waiting_for_lock().await;
     let mut c = d.client().await;
     assert_eq!(hello_pid(&mut c).await, u64::from(std::process::id()));
     drop(c);
@@ -1890,8 +1977,7 @@ async fn wait_for_lock_takes_over_when_the_holder_stops() {
 async fn signal_while_waiting_for_the_lock_exits_cleanly() {
     let d = TestDaemon::start().await;
     let mut child = Foreground::spawn(&d.paths, &["daemon", "run", "--wait-for-lock"], None);
-    tokio::time::sleep(GIVE_UP_WINDOW).await;
-    assert!(child.running(), "gave up on the held lock");
+    child.waiting_for_lock().await;
     child.terminate().await;
     d.client()
         .await
@@ -2111,8 +2197,11 @@ async fn client_waits_for_a_unit_daemon_waiting_behind_an_on_demand_one() {
     let mut on_demand = Foreground::spawn(&paths, &["daemon", "run"], None);
     drop(on_demand.serving(&paths).await);
     let mut unit = Foreground::spawn(&paths, &["daemon", "run", "--wait-for-lock"], None);
-    tokio::time::sleep(GIVE_UP_WINDOW).await;
-    assert!(unit.running(), "gave up on the held lock");
+    unit.waiting_for_lock().await;
+    assert!(
+        paths.waiter_held(),
+        "the unit's daemon does not announce itself"
+    );
     assert_eq!(paths.lock_record(), Some(record(&paths, false)));
 
     assert!(Client::shutdown(&paths).await.unwrap());

@@ -157,6 +157,16 @@ enum Handshake {
     WrongDataDir(anyhow::Error),
 }
 
+/// What one attempt to reach a successor found.
+enum Successor {
+    /// A daemon of our protocol, connected.
+    Reached(Client),
+    /// Nothing answered, or only a daemon going away did.
+    Absent,
+    /// A daemon of another protocol version answered `Hello` with this.
+    OtherVersion(ClientError),
+}
+
 /// The daemon at the socket serves another data directory than the
 /// client's (or did not say which one it serves).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,8 +311,10 @@ impl Client {
     ///
     /// Returns false when no daemon is listening (no socket file, or a stale
     /// one nobody accepts on), true once the daemon has acknowledged or has
-    /// closed the connection in answer to `Shutdown`. The daemon may still
-    /// be releasing its lock when this returns. A peer that does neither
+    /// closed the connection in answer to `Shutdown`. A daemon of this
+    /// version acknowledges only once it has stopped listening, so a
+    /// connection made after this returns never reaches it; it may still be
+    /// releasing its lock, though. A peer that does neither
     /// within a few seconds is an error.
     pub async fn shutdown(paths: &Paths) -> Result<bool> {
         let attempt = async {
@@ -371,13 +383,13 @@ impl Client {
                     tokio::time::timeout(ANSWER_WAIT, c.call(&Caller::Human, Request::Shutdown))
                         .await;
                 drop(c);
-                if let Some(c) = Client::await_successor(paths).await? {
+                if let Some(c) = Client::await_successor(paths, true).await? {
                     return Ok(c);
                 }
             }
             // The daemon is going away; wait for a successor below.
             Err(Handshake::Refused(_, e)) if e.code == ErrorCode::ConnectionLost => {
-                if let Some(c) = Client::await_successor(paths).await? {
+                if let Some(c) = Client::await_successor(paths, false).await? {
                     return Ok(c);
                 }
             }
@@ -385,7 +397,7 @@ impl Client {
             Err(Handshake::TimedOut(e) | Handshake::WrongDataDir(e)) => return Err(e),
             // Nothing listening, but a daemon may be on its way.
             Err(Handshake::Open(_)) => {
-                if let Some(c) = Client::await_successor(paths).await? {
+                if let Some(c) = Client::await_successor(paths, false).await? {
                     return Ok(c);
                 }
             }
@@ -406,9 +418,16 @@ impl Client {
     /// same holds when a supervised daemon for our socket is waiting for the
     /// lock (see [`Paths::waiter`]): it takes over from an on-demand daemon.
     /// Without a supervisor (the record says `on-demand`, or there is none,
-    /// and no supervised daemon waits) return at once. A lock held for another socket is a misconfiguration
-    /// that [`Client::spawn_and_connect`] reports, so it is not waited for.
-    async fn await_successor(paths: &Paths) -> Result<Option<Client>> {
+    /// and no supervised daemon waits), return at once. A lock held for
+    /// another socket is a misconfiguration that
+    /// [`Client::spawn_and_connect`] reports, so it is not waited for.
+    ///
+    /// `stopped_other` says the client has just stopped a daemon of another
+    /// protocol version. That daemon may answer for a while as it drains
+    /// (an older one keeps accepting until it notices), so while the lock
+    /// is held its `VersionMismatch` is waited out, up to [`DRAIN_WAIT`],
+    /// rather than taken for a successor's.
+    async fn await_successor(paths: &Paths, stopped_other: bool) -> Result<Option<Client>> {
         let drain_deadline = Instant::now() + DRAIN_WAIT;
         while paths.lock_held() {
             if !settled_lock_record(paths)
@@ -418,11 +437,20 @@ impl Client {
                 return Ok(None);
             }
             let left = drain_deadline.saturating_duration_since(Instant::now());
-            if let Some(c) = Client::try_successor(paths, left.max(RETRY_INTERVAL)).await? {
-                return Ok(Some(c));
-            }
+            let other = match Client::try_successor(paths, left.max(RETRY_INTERVAL)).await? {
+                Successor::Reached(c) => return Ok(Some(c)),
+                Successor::OtherVersion(e) if !stopped_other => {
+                    return Err(Client::other_version_error(paths, e));
+                }
+                Successor::OtherVersion(e) => Some(e),
+                Successor::Absent => None,
+            };
             if Instant::now() >= drain_deadline {
-                return Ok(None);
+                return match other {
+                    // It never went away: it is no daemon we stopped.
+                    Some(e) => Err(Client::other_version_error(paths, e)),
+                    None => Ok(None),
+                };
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
@@ -439,11 +467,15 @@ impl Client {
         {
             return Ok(None);
         }
+        // The daemon we stopped, if any, has released the lock and with it
+        // its socket: a daemon of another version now is a successor.
         let deadline = Instant::now() + SUCCESSOR_WAIT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            if let Some(c) = Client::try_successor(paths, left.max(RETRY_INTERVAL)).await? {
-                return Ok(Some(c));
+            match Client::try_successor(paths, left.max(RETRY_INTERVAL)).await? {
+                Successor::Reached(c) => return Ok(Some(c)),
+                Successor::OtherVersion(e) => return Err(Client::other_version_error(paths, e)),
+                Successor::Absent => {}
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -452,19 +484,25 @@ impl Client {
         }
     }
 
-    /// One attempt to reach a daemon of our protocol within `limit`. `None`
-    /// when nothing answered it, or only a daemon going away did. A daemon
-    /// of another protocol version is an error: it serves, and waiting
-    /// longer will not change its version.
-    async fn try_successor(paths: &Paths, limit: Duration) -> Result<Option<Client>> {
+    /// One attempt to reach a daemon within `limit`. A daemon serving
+    /// another data directory is an error.
+    async fn try_successor(paths: &Paths, limit: Duration) -> Result<Successor> {
         match Client::open_and_hello(paths, limit).await {
-            Ok(c) => Ok(Some(c)),
+            Ok(c) => Ok(Successor::Reached(c)),
             Err(Handshake::WrongDataDir(e)) => Err(e),
             Err(Handshake::Refused(_, e)) if e.code == ErrorCode::VersionMismatch => {
-                Err(anyhow::Error::new(e).context(Client::other_version(paths)))
+                Ok(Successor::OtherVersion(e))
             }
-            Err(Handshake::Open(_) | Handshake::Refused(..) | Handshake::TimedOut(_)) => Ok(None),
+            Err(Handshake::Open(_) | Handshake::Refused(..) | Handshake::TimedOut(_)) => {
+                Ok(Successor::Absent)
+            }
         }
+    }
+
+    /// The error for a daemon at our socket that answered `Hello` with `e`
+    /// (`VersionMismatch`) and stays.
+    fn other_version_error(paths: &Paths, e: ClientError) -> anyhow::Error {
+        anyhow::Error::new(e).context(Client::other_version(paths))
     }
 
     /// The message for a daemon at our socket that speaks another protocol
@@ -485,8 +523,10 @@ impl Client {
         spawn_daemon(paths, bin)?;
         let mut last_err = anyhow!("no daemon answered");
         loop {
+            // Never an attempt too short to be answered: its time-out would
+            // hide what the daemon there said before.
             let left = deadline.saturating_duration_since(Instant::now());
-            match Client::open_and_hello(paths, left).await {
+            match Client::open_and_hello(paths, left.max(RETRY_INTERVAL)).await {
                 Ok(c) => return Ok(c),
                 // An old daemon still shutting down, or a new one dying.
                 Err(Handshake::Refused(_, e)) => last_err = e.into(),
@@ -790,7 +830,7 @@ mod tests {
         std::fs::write(&paths.lock, rec.encode()).unwrap();
         let fake = other_version_daemon(&paths);
         let began = Instant::now();
-        let err = Client::await_successor(&paths)
+        let err = Client::await_successor(&paths, false)
             .await
             .err()
             .expect("a successor of another version is not ours");
@@ -802,6 +842,89 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("another protocol version"), "{msg}");
         fake.abort();
+    }
+
+    /// Answer every request line on `stream` with `reply`, until the peer
+    /// hangs up or sends `Shutdown`; whether it sent `Shutdown`.
+    async fn answer_until_shutdown(stream: UnixStream, reply: impl Fn() -> Response) -> bool {
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            let env: Envelope = serde_json::from_str(&l).unwrap();
+            let resp = match env.req {
+                Request::Shutdown => Response::Ok { data: Value::Null },
+                _ => reply(),
+            };
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            if w.write_all(&out).await.is_err() || matches!(env.req, Request::Shutdown) {
+                return matches!(env.req, Request::Shutdown);
+            }
+        }
+        false
+    }
+
+    /// A daemon of another protocol version that the client stops may
+    /// still answer for a moment while it drains (an older daemon keeps
+    /// accepting until it notices). Its answers are not taken for a
+    /// successor of another version: the client waits for the real one.
+    #[tokio::test]
+    async fn a_stopped_daemon_of_another_version_is_waited_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(tmp.path());
+        let rec = LockRecord {
+            supervised: true,
+            socket: paths.socket.clone(),
+        };
+        std::fs::write(&paths.lock, rec.encode()).unwrap();
+        let lock = std::fs::File::open(&paths.lock).unwrap();
+        crate::test_util::eventually(|| lock.try_lock()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+        let old = |_: ()| Response::Err {
+            code: ErrorCode::VersionMismatch,
+            message: "other version".into(),
+            candidates: Vec::new(),
+        };
+        let old_and_new = tokio::spawn({
+            let paths = paths.clone();
+            async move {
+                // The old daemon: serve until stopped, then keep answering
+                // for a while before going away.
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    if answer_until_shutdown(stream, || old(())).await {
+                        break;
+                    }
+                }
+                let lingering = Instant::now() + Duration::from_millis(300);
+                while let Ok(Ok((stream, _))) =
+                    tokio::time::timeout_at(lingering.into(), listener.accept()).await
+                {
+                    tokio::spawn(answer_until_shutdown(stream, move || old(())));
+                }
+                drop(listener);
+                std::fs::remove_file(&paths.socket).unwrap();
+                drop(lock);
+                // Its successor, of our protocol.
+                let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let hello = serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "pid": 1,
+                    "data_dir": paths.data_dir,
+                });
+                answer_until_shutdown(stream, move || Response::Ok {
+                    data: hello.clone(),
+                })
+                .await;
+            }
+        });
+        // Starting a daemon would fail: there is no such binary.
+        let c = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+            .await
+            .expect("took the stopped daemon for a successor of another version");
+        drop(c);
+        old_and_new.await.unwrap();
     }
 
     #[test]

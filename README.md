@@ -98,9 +98,10 @@ then takes over, instead of exiting. While it waits it holds a lock on
 `agentmail.waiter` in the data directory, so a client that stops the other
 daemon (`agentmail daemon stop`, or a newer client replacing an older daemon)
 waits for the unit's daemon to take over rather than starting another
-on-demand daemon it would have to wait behind. Without the flag `daemon run` exits 0 at
-once and leaves the other daemon serving, and a unit doing that shows as
-`inactive (dead)`: systemd supervises nothing until it is started again.
+on-demand daemon it would have to wait behind. Without the flag, `daemon run`
+exits 0 at once and leaves the other daemon serving, and a unit doing that
+shows as `inactive (dead)`: systemd supervises nothing until it is started
+again.
 
 `Restart=always` brings the daemon back whenever it exits, including on
 `agentmail daemon stop` and when a client of a newer version stops an older

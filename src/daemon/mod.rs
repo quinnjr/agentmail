@@ -21,7 +21,7 @@ use tokio::io::{
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 
 use self::handler::{Begun, Handler};
@@ -51,6 +51,9 @@ const LOCK_WAIT_POLL: Duration = Duration::from_millis(100);
 const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
 /// How often to log while shutdown waits for in-flight database work.
 const STORE_RELEASE_WARN: Duration = Duration::from_secs(5);
+/// How long the daemon tries to deliver a `Shutdown` acknowledgement to a
+/// client that does not read it before it goes on shutting down.
+const SHUTDOWN_ACK_WAIT: Duration = Duration::from_secs(1);
 
 /// The longest path a Unix socket can be bound at: `sun_path` holds 108
 /// bytes, including the terminating NUL.
@@ -423,14 +426,28 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     let handler = Arc::new(Handler::new(store, Hub::new()));
     let data_dir: Arc<Path> = Arc::from(paths.data_dir.as_path());
 
-    let (stop_tx, mut stop_rx) = watch::channel(false);
+    // Connections that were asked to `Shutdown` hand over the writer for
+    // the acknowledgement, which is sent only once the daemon has stopped
+    // listening: a client that connects after it reaches a successor.
+    let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<OwnedWriteHalf>();
+    let mut acks = Vec::new();
     // Whether `stop` has resolved, after which it must not be polled again.
     let mut stopped = false;
     let mut conns = JoinSet::new();
     let mut check = tokio::time::interval(SOCKET_CHECK_INTERVAL);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // Stops come first, so no connection is accepted once one is due.
         tokio::select! {
+            biased;
+            Some(w) = stop_rx.recv() => {
+                acks.push(w);
+                break;
+            }
+            () = &mut stop => {
+                stopped = true;
+                break;
+            }
             res = listener.accept() => match res {
                 Ok((stream, _)) => {
                     conns.spawn(connection(
@@ -445,11 +462,6 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            _ = stop_rx.changed() => break,
-            () = &mut stop => {
-                stopped = true;
-                break;
-            }
             _ = check.tick() => {
                 if file_id(&paths.socket) != Some(socket_id) {
                     break;
@@ -460,10 +472,22 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     }
 
     // Stop taking connections first, so new clients start a successor.
+    // Connections still in the listen backlog are reset with the listener.
     if file_id(&paths.socket) == Some(socket_id) {
         let _ = std::fs::remove_file(&paths.socket);
     }
     drop(listener);
+    // Now acknowledge every `Shutdown` asked for so far. Later ones are
+    // answered by the connection closing at once, which clients count as
+    // the same.
+    while let Ok(w) = stop_rx.try_recv() {
+        acks.push(w);
+    }
+    drop(stop_rx);
+    for mut w in acks {
+        let ok = Response::Ok { data: Value::Null };
+        let _ = tokio::time::timeout(SHUTDOWN_ACK_WAIT, write_response(&mut w, &ok)).await;
+    }
     let mut drain = std::pin::pin!(async move {
         conns.shutdown().await;
         drop(handler);
@@ -549,7 +573,7 @@ async fn connection(
     stream: UnixStream,
     handler: Arc<Handler>,
     data_dir: Arc<Path>,
-    stop: watch::Sender<bool>,
+    stop: mpsc::UnboundedSender<OwnedWriteHalf>,
 ) {
     let (r, mut w) = stream.into_split();
     let mut reader = Input::new(BufReader::new(r));
@@ -598,8 +622,8 @@ async fn connection(
                 ))
             }
             Request::Shutdown => {
-                let _ = write_response(&mut w, &Response::Ok { data: Value::Null }).await;
-                let _ = stop.send(true);
+                // The serve loop acknowledges once it has stopped listening.
+                let _ = stop.send(w);
                 return;
             }
             _ if !greeted => Err(ClientError::new(
