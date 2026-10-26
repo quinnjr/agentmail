@@ -169,6 +169,14 @@ async fn invalid_session_id_rejected() {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput, "{id:?}");
     }
+    // The session's harness must match the registration's.
+    let mut mismatched = register_req("backend", d.dir.path(), None, "s1", "api");
+    if let Request::Register { harness, .. } = &mut mismatched {
+        *harness = Harness::Kiro;
+    }
+    let err = c.call(&Caller::Human, mismatched).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("does not match"), "{}", err.message);
     let ok = register(
         &mut c,
         "backend",

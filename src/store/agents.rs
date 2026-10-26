@@ -41,7 +41,7 @@ pub struct Registered {
     /// The address was taken back from a different or absent binding.
     pub reclaimed: bool,
     /// A repeat registration of a live identity: the requesting session, or
-    /// the requesting process with the same session binding, was already
+    /// the requesting process as its own identity (`is_own`), was already
     /// bound to this agent, which was returned (updated).
     pub existing: bool,
 }
@@ -86,16 +86,18 @@ fn shared_session(agent: &Agent) -> bool {
 /// Whether `agent` may be rebound to `req`.
 ///
 /// The requesting process's own agent always may (a repeat registration,
-/// see [`is_own`]). A non-signed-off agent bound to a session other than
-/// `req.session` never may, even when its process is dead: it belongs to
-/// that session until it signs off or the session registers again (an
-/// opencode session outlives a restart of the service process). Otherwise
+/// see [`is_own`]). A non-signed-off agent of a shared session
+/// ([`shared_session`]) other than `req.session` never may, even when its
+/// process is dead: it belongs to that session until it signs off or the
+/// session registers again (an opencode session outlives a restart of the
+/// service process). A session running in its own process (Claude Code,
+/// kiro) ends with that process, so its agent follows the process rule:
 /// an agent bound to a live process, active or signed off, is never taken.
 fn reclaimable(agent: &Agent, req: &RegisterReq, alive: Alive) -> bool {
     if is_own(agent, req) {
         return true;
     }
-    if !agent.signed_off && agent.session.is_some() && agent.session != req.session {
+    if !agent.signed_off && shared_session(agent) && agent.session != req.session {
         return false;
     }
     match agent.proc_id {
@@ -107,18 +109,18 @@ fn reclaimable(agent: &Agent, req: &RegisterReq, alive: Alive) -> bool {
 /// Whether `agent` is already the requesting process's own identity.
 ///
 /// It must be bound to `req.proc_id`, with the same session or, when the
-/// session runs in its own process (every harness but opencode), with the
-/// session on one side only: kiro's MCP server registers without a session
-/// and its CLI with `KIRO_SESSION_ID`, from the same kiro-cli process.
+/// sessions run in their own process (every harness but opencode), with
+/// any session on either side: kiro's MCP server registers without a
+/// session and its CLI with `KIRO_SESSION_ID`, from the same kiro-cli
+/// process, and that process may move on to a new session (the agent is
+/// then rebound to it and the old session unbound).
 fn is_own(agent: &Agent, req: &RegisterReq) -> bool {
     if agent.proc_id.is_none() || agent.proc_id != req.proc_id {
         return false;
     }
-    match (&agent.session, &req.session) {
-        (a, r) if a == r => true,
-        (None, Some(k)) | (Some(k), None) => !k.harness.shares_process(),
-        _ => false,
-    }
+    let own_process =
+        |k: &Option<SessionKey>| k.as_ref().is_none_or(|k| !k.harness.shares_process());
+    agent.session == req.session || (own_process(&agent.session) && own_process(&req.session))
 }
 
 /// Remove the binding of session `k` if it points at `addr`.
@@ -142,8 +144,9 @@ fn unbind_session(
 ///
 /// A session-less `agent` also takes over the session of the most recently
 /// seen non-signed-off agent it displaces: that session runs in this very
-/// process (kiro), so it now names `agent` too. Writes the displaced agents;
-/// the caller writes `agent`.
+/// process (kiro), so it now names `agent` too. Every other displaced agent
+/// loses its session binding: the session ran in this process, which no
+/// longer names it. Writes the displaced agents; the caller writes `agent`.
 fn claim_process(
     table: &mut redb::Table<&'static str, &'static [u8]>,
     sessions: &mut redb::Table<(&'static str, &'static str), &'static str>,
@@ -168,11 +171,13 @@ fn claim_process(
     };
     for (i, mut other) in displaced.into_iter().enumerate() {
         other.proc_id = None;
-        if Some(i) == heir
-            && let Some(k) = other.session.take()
-        {
-            sessions.insert(session_key(&k), agent.address.as_str())?;
-            agent.session = Some(k);
+        if let Some(k) = other.session.take() {
+            if Some(i) == heir {
+                sessions.insert(session_key(&k), agent.address.as_str())?;
+                agent.session = Some(k);
+            } else {
+                unbind_session(sessions, &k, &other.address)?;
+            }
         }
         table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
     }
@@ -186,7 +191,7 @@ impl Store {
     /// Reclaim: unless `fresh`, an agent with the same `name` and `cwd` that
     /// [`reclaimable`] allows is rebound: one not bound to a live process,
     /// or the requesting process's own ([`is_own`]), and never one still
-    /// bound to another session. With several, the requesting process's own
+    /// bound to another opencode session. With several, the requesting process's own
     /// wins (a re-registration keeps the caller's current address);
     /// otherwise the most recently seen wins. The address, `registered_at`
     /// and contacts are kept; `role`, `working_on`, `harness`, `repo`,
@@ -234,6 +239,13 @@ impl Store {
         validate_name(&req.name).map_err(StoreError::InvalidName)?;
         if let Some(k) = &req.session {
             k.validate().map_err(StoreError::InvalidInput)?;
+            if k.harness != req.harness {
+                return Err(StoreError::InvalidInput(format!(
+                    "session harness {} does not match registration harness {}",
+                    k.harness.as_str(),
+                    req.harness.as_str()
+                )));
+            }
         }
         check_utf8("cwd", &req.cwd)?;
         if let Some(repo) = &req.repo {
