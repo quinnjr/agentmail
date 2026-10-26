@@ -992,6 +992,7 @@ async fn unopenable_store_fails_without_leaving_a_socket() {
         Duration::from_secs(10),
         serve(DaemonConfig {
             paths: paths.clone(),
+            wait_for_lock: false,
         }),
     )
     .await
@@ -1159,7 +1160,13 @@ async fn longest_socket_path_that_fits_is_served() {
     let paths = paths_with_socket_len(dir.path(), MAX_SOCKET_PATH_BYTES);
     let task = tokio::spawn({
         let paths = paths.clone();
-        async move { serve(DaemonConfig { paths }).await }
+        async move {
+            serve(DaemonConfig {
+                paths,
+                wait_for_lock: false,
+            })
+            .await
+        }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut c = loop {
@@ -1186,6 +1193,7 @@ async fn too_long_socket_path_is_refused_by_name() {
         Duration::from_secs(10),
         serve(DaemonConfig {
             paths: paths.clone(),
+            wait_for_lock: false,
         }),
     )
     .await
@@ -1355,6 +1363,7 @@ async fn daemon_starts_despite_a_momentary_lock_probe() {
     probe.try_lock().unwrap();
     let handle = tokio::spawn(serve(DaemonConfig {
         paths: paths.clone(),
+        wait_for_lock: false,
     }));
     tokio::time::sleep(Duration::from_millis(30)).await;
     // A child another test thread forks right now shares the probe's lock
@@ -1452,13 +1461,81 @@ async fn shutdown_closed_without_reply_counts_as_acknowledged() {
 }
 
 /// A `daemon run` child process, killed and reaped on drop so a failing
-/// test never leaves a daemon behind.
+/// test never leaves a daemon behind. Its stderr is piped, to be read once
+/// it has exited.
 struct Foreground(std::process::Child);
 
 impl Foreground {
+    /// Start `agentmail <args>` for `paths` the way a systemd unit does,
+    /// with `path_env` as its `PATH` when given.
+    fn spawn(paths: &Paths, args: &[&str], path_env: Option<&std::ffi::OsStr>) -> Foreground {
+        let mut cmd = std::process::Command::new(bin());
+        cmd.args(args)
+            .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
+            .env("AGENTMAIL_SOCKET", &paths.socket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if let Some(path) = path_env {
+            cmd.env("PATH", path);
+        }
+        Foreground(cmd.spawn().unwrap())
+    }
+
     fn signal(&self, signal: libc::c_int) {
         // SAFETY: kill(2) on our own child's pid, which is not yet reaped.
         assert_eq!(unsafe { libc::kill(self.0.id() as libc::pid_t, signal) }, 0);
+    }
+
+    fn running(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
+
+    /// Wait up to `limit` for the daemon to exit; its status and stderr.
+    async fn exit_within(&mut self, limit: Duration) -> (std::process::ExitStatus, String) {
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "daemon did not exit");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let mut err = String::new();
+        if let Some(mut stderr) = self.0.stderr.take() {
+            use std::io::Read;
+            stderr.read_to_string(&mut err).unwrap();
+        }
+        (status, err)
+    }
+
+    /// Wait until this daemon answers at `paths`, failing at once if it
+    /// exits first, and return a client connected to it.
+    async fn serving(&mut self, paths: &Paths) -> Client {
+        let deadline = Instant::now() + PROCESS_WAIT;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                let (_, err) = self.exit_within(Duration::ZERO).await;
+                panic!("foreground daemon exited before serving: {status:?}: {err}");
+            }
+            if let Ok(mut c) = Client::connect(paths).await {
+                let pid = hello_pid(&mut c).await;
+                assert_eq!(pid, u64::from(self.0.id()), "another daemon answered");
+                return c;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "foreground daemon never answered"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Stop it with SIGTERM and wait for a clean exit.
+    async fn terminate(mut self) {
+        self.signal(libc::SIGTERM);
+        let (status, err) = self.exit_within(Duration::from_secs(10)).await;
+        assert!(status.success(), "SIGTERM exit: {status:?}: {err}");
     }
 }
 
@@ -1472,27 +1549,9 @@ impl Drop for Foreground {
 /// Run `daemon run` in the foreground the way a systemd unit does, and wait
 /// until it answers.
 async fn foreground_daemon(paths: &Paths) -> (Foreground, Client) {
-    let child = Foreground(
-        std::process::Command::new(bin())
-            .args(["daemon", "run"])
-            .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
-            .env("AGENTMAIL_SOCKET", &paths.socket)
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(mut c) = Client::connect(paths).await {
-            hello_pid(&mut c).await;
-            return (child, c);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "foreground daemon never answered"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let mut child = Foreground::spawn(paths, &["daemon", "run"], None);
+    let c = child.serving(paths).await;
+    (child, c)
 }
 
 async fn exits_cleanly_on(signal: libc::c_int) {
@@ -1510,21 +1569,44 @@ async fn exits_cleanly_on(signal: libc::c_int) {
     let mut waiter = Client::connect(&paths).await.unwrap();
     let wait = tokio::spawn(async move {
         waiter
-            .call(&agent(&a), Request::WaitForMail { timeout_secs: 60 })
+            .call(
+                &agent(&a),
+                Request::Ask {
+                    to: vec![HUMAN.to_string()],
+                    subject: "blocked".to_string(),
+                    body: "?".to_string(),
+                    refs: Vec::new(),
+                    urgent: false,
+                    timeout_secs: 60,
+                },
+            )
             .await
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The question reaches the inbox only once the daemon has run the ask's
+    // immediate part; from then on it waits for an answer.
+    let deadline = Instant::now() + PROCESS_WAIT;
+    loop {
+        let inbox = c
+            .call(&Caller::Human, Request::Inbox { all: true })
+            .await
+            .unwrap();
+        if inbox
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["subject"] == "blocked")
+        {
+            break;
+        }
+        assert!(!wait.is_finished(), "ask ended early: {:?}", wait.await);
+        assert!(Instant::now() < deadline, "the question never arrived");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!wait.is_finished(), "ask did not block: {:?}", wait.await);
 
     child.signal(signal);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "daemon ignored signal {signal}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    assert!(status.success(), "signal {signal} exit: {status:?}");
+    let (status, err) = child.exit_within(Duration::from_secs(5)).await;
+    assert!(status.success(), "signal {signal} exit: {status:?}: {err}");
     assert!(
         !paths.socket.exists(),
         "signal {signal} leaves the socket behind"
@@ -1543,7 +1625,7 @@ async fn exits_cleanly_on(signal: libc::c_int) {
         .await
         .unwrap();
     assert_eq!(ids(&inbox), vec![sent["id"].as_str().unwrap().to_string()]);
-    child.signal(libc::SIGTERM);
+    child.terminate().await;
 }
 
 #[tokio::test]
@@ -1554,4 +1636,128 @@ async fn sigterm_shuts_down_cleanly() {
 #[tokio::test]
 async fn sigint_shuts_down_cleanly() {
     exits_cleanly_on(libc::SIGINT).await;
+}
+
+/// A second signal while shutdown waits for an in-flight request exits at
+/// once with status 1, so a stuck shutdown never needs `kill -9`.
+#[tokio::test]
+async fn second_signal_exits_without_waiting() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    // A `git` that stalls, so registering holds the store past shutdown
+    // (until the daemon gives up on git, after 2s).
+    let fake = dir.path().join("fakebin");
+    std::fs::create_dir(&fake).unwrap();
+    let started = dir.path().join("git-started");
+    let git = fake.join("git");
+    std::fs::write(
+        &git,
+        format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", started.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(&fake);
+    if let Some(orig) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(orig);
+    }
+
+    let mut child = Foreground::spawn(&paths, &["daemon", "run"], Some(&path));
+    let mut c = child.serving(&paths).await;
+    let cwd = dir.path().to_path_buf();
+    let slow = tokio::spawn(async move {
+        c.call(&Caller::Human, common::register_req("slow", &cwd))
+            .await
+    });
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while !started.exists() {
+        assert!(!slow.is_finished(), "register ended: {:?}", slow.await);
+        assert!(Instant::now() < deadline, "git never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    child.signal(libc::SIGTERM);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        child.running(),
+        "shutdown did not wait for the in-flight request"
+    );
+    child.signal(libc::SIGTERM);
+    let (status, err) = child.exit_within(Duration::from_secs(1)).await;
+    assert_eq!(status.code(), Some(1), "{status:?}: {err}");
+    assert!(err.contains("second signal"), "{err}");
+    let _ = slow.await;
+}
+
+/// How long a daemon without `--wait-for-lock` takes at most to give up on
+/// a held lock, with room to spare.
+const GIVE_UP_WINDOW: Duration = Duration::from_millis(1500);
+
+/// `daemon run --wait-for-lock` (what the systemd unit runs) waits while
+/// another daemon holds the lock, then serves once that one stops.
+#[tokio::test]
+async fn wait_for_lock_takes_over_when_the_holder_stops() {
+    let mut d = TestDaemon::start().await;
+    let mut child = Foreground::spawn(&d.paths, &["daemon", "run", "--wait-for-lock"], None);
+    tokio::time::sleep(GIVE_UP_WINDOW).await;
+    assert!(child.running(), "gave up on the held lock");
+    let mut c = d.client().await;
+    assert_eq!(hello_pid(&mut c).await, u64::from(std::process::id()));
+    drop(c);
+
+    d.shutdown().await;
+    let mut c = child.serving(&d.paths).await;
+    c.call(&Caller::Human, Request::Counts).await.unwrap();
+    child.terminate().await;
+}
+
+/// A signal while `--wait-for-lock` waits ends it cleanly, without ever
+/// touching the serving daemon's socket.
+#[tokio::test]
+async fn signal_while_waiting_for_the_lock_exits_cleanly() {
+    let d = TestDaemon::start().await;
+    let mut child = Foreground::spawn(&d.paths, &["daemon", "run", "--wait-for-lock"], None);
+    tokio::time::sleep(GIVE_UP_WINDOW).await;
+    assert!(child.running(), "gave up on the held lock");
+    child.terminate().await;
+    d.client()
+        .await
+        .call(&Caller::Human, Request::Counts)
+        .await
+        .unwrap();
+}
+
+/// A supervisor (systemd with `Restart=always`) starts a new daemon shortly
+/// after the old one stops. A client that stopped an old-protocol daemon
+/// uses that one instead of starting a daemon of its own.
+#[tokio::test]
+async fn version_mismatch_uses_a_daemon_the_supervisor_restarts() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let old = spawn_old_daemon(&paths);
+    let supervisor = tokio::spawn({
+        let paths = paths.clone();
+        async move {
+            let conns = old.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let daemon = tokio::spawn(serve(DaemonConfig {
+                paths,
+                wait_for_lock: false,
+            }));
+            (conns, daemon)
+        }
+    });
+    // Starting a daemon of its own would fail: there is no such binary.
+    let mut c = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+        .await
+        .unwrap();
+    assert_eq!(hello_pid(&mut c).await, u64::from(std::process::id()));
+    let (conns, daemon) = supervisor.await.unwrap();
+    assert_eq!(conns, vec![vec!["hello", "shutdown"]]);
+    c.call(&Caller::Human, Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), daemon)
+        .await
+        .expect("daemon did not stop")
+        .unwrap()
+        .unwrap();
 }

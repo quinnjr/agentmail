@@ -43,6 +43,9 @@ const SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const LOCK_ATTEMPTS: u32 = 25;
 /// The pause between those tries.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+/// How often a daemon run with `wait_for_lock` checks whether the lock it
+/// waits for is free.
+const LOCK_WAIT_POLL: Duration = Duration::from_millis(100);
 /// How long to keep retrying to open the database (a previous daemon in
 /// this process may still be releasing it).
 const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
@@ -77,6 +80,11 @@ pub fn check_socket_path(socket: &Path) -> Result<()> {
 
 pub struct DaemonConfig {
     pub paths: Paths,
+    /// When another daemon holds the lock, wait for it to be released and
+    /// then serve, instead of returning at once. For a supervised daemon
+    /// (`daemon run --wait-for-lock`), which must not exit just because an
+    /// on-demand daemon was already running.
+    pub wait_for_lock: bool,
 }
 
 /// Create `dir` (and missing parents) with mode 0700. An existing
@@ -193,6 +201,36 @@ async fn take_lock(lock: &File, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Like [`take_lock`], but when another daemon keeps the lock, wait (polling
+/// every [`LOCK_WAIT_POLL`]) until it is free instead of giving up. Notes
+/// once that it waits.
+async fn wait_for_lock(lock: &File, path: &Path) -> Result<bool> {
+    if take_lock(lock, path).await? {
+        return Ok(true);
+    }
+    eprintln!(
+        "agentmail daemon: another daemon holds {}; waiting for it to exit",
+        path.display()
+    );
+    loop {
+        tokio::time::sleep(LOCK_WAIT_POLL).await;
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
+}
+
+/// Whether `stop` has already resolved. Polls it once; only call it again
+/// while it returned false.
+fn fired<F: Future<Output = ()>>(stop: Pin<&mut F>) -> bool {
+    use futures_util::FutureExt;
+    stop.now_or_never().is_some()
+}
+
 /// Run the daemon until a client sends `Shutdown` or the socket file is
 /// removed or replaced. See [`serve_until`].
 pub async fn serve(cfg: DaemonConfig) -> Result<()> {
@@ -202,6 +240,11 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
 /// Resolve on the first SIGTERM or SIGINT. Both handlers are installed
 /// before this returns, so a signal sent once it has returned is never
 /// missed.
+///
+/// Once it has resolved, a second SIGTERM or SIGINT exits the process at
+/// once with status 1, without waiting for in-flight requests: the way out
+/// of a shutdown that is stuck. Acknowledged writes are durable either way,
+/// and the lock goes with the process.
 pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
@@ -211,6 +254,17 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
             _ = term.recv() => {}
             _ = int.recv() => {}
         }
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            eprintln!(
+                "agentmail daemon: second signal; exiting without waiting for \
+                 in-flight requests"
+            );
+            std::process::exit(1);
+        });
     })
 }
 
@@ -220,14 +274,17 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 /// Startup: create the data directory (mode 0700) and take an exclusive
 /// lock on `paths.lock`, retrying briefly so a momentary probe of the lock
 /// cannot make the daemon give up. If another daemon keeps holding it,
-/// return `Ok` without touching anything: that daemon serves. Otherwise open the store
+/// return `Ok` without touching anything: that daemon serves (with
+/// `wait_for_lock`, wait until it is free instead). Otherwise open the store
 /// (so a database that cannot be opened never leaves a socket behind),
 /// then put a mode-0600 socket in place of any leftover one (no live daemon
 /// can own it while we hold the lock) and accept. Every fallible startup
 /// step runs before the socket appears, so a daemon that fails to start
-/// never leaves a socket without a listener behind.
+/// never leaves a socket without a listener behind. A `stop` that resolves
+/// during startup ends it before the socket is bound.
 pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> Result<()> {
     let paths = cfg.paths;
+    let mut stop = std::pin::pin!(stop);
     create_private_dir(&paths.data_dir)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -236,11 +293,31 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         .truncate(false)
         .open(&paths.lock)
         .with_context(|| format!("opening {}", paths.lock.display()))?;
-    if !take_lock(&lock, &paths.lock).await? {
+    let locked = async {
+        if cfg.wait_for_lock {
+            wait_for_lock(&lock, &paths.lock).await
+        } else {
+            take_lock(&lock, &paths.lock).await
+        }
+    };
+    let locked = tokio::select! {
+        biased;
+        () = &mut stop => return Ok(()),
+        locked = locked => locked?,
+    };
+    if !locked {
         return Ok(());
     }
 
-    let store = Arc::new(open_store(&paths.db).await?);
+    let store = open_store(&paths.db).await?;
+    // Stopped while starting: leave before publishing a socket that would
+    // only close again. The store is ours alone, so the lock can go with it.
+    if fired(stop.as_mut()) {
+        drop(store);
+        drop(lock);
+        return Ok(());
+    }
+    let store = Arc::new(store);
 
     if let Some(parent) = paths.socket.parent() {
         create_private_dir(parent)?;
@@ -257,7 +334,6 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let mut conns = JoinSet::new();
-    let mut stop = std::pin::pin!(stop);
     let mut check = tokio::time::interval(SOCKET_CHECK_INTERVAL);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -792,6 +868,109 @@ mod tests {
         crate::test_util::eventually(|| probe.try_lock()).expect("lock still held after release");
         crate::test_util::eventually(|| Store::open(&paths.db))
             .expect("successor could not open the store");
+    }
+
+    /// A future that is pending when first polled (waking at once) and
+    /// ready from then on: a stop that fires just after the lock is taken.
+    struct ReadyOnSecondPoll(bool);
+
+    impl Future for ReadyOnSecondPoll {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<()> {
+            if self.0 {
+                return Poll::Ready(());
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    fn config(paths: &Paths, wait_for_lock: bool) -> DaemonConfig {
+        DaemonConfig {
+            paths: paths.clone(),
+            wait_for_lock,
+        }
+    }
+
+    /// A stop that fires while the daemon is starting ends it before it
+    /// binds: the (stale) file at the socket path is never replaced, and
+    /// the lock is released.
+    #[tokio::test]
+    async fn stop_during_startup_never_binds_the_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(&paths.socket, b"stale").unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_until(config(&paths, false), ReadyOnSecondPoll(false)),
+        )
+        .await
+        .expect("serve_until hung")
+        .unwrap();
+        assert_eq!(std::fs::read(&paths.socket).unwrap(), b"stale");
+        let probe = std::fs::File::open(&paths.lock).unwrap();
+        crate::test_util::eventually(|| probe.try_lock()).expect("lock still held");
+    }
+
+    /// With `wait_for_lock`, a daemon that finds the lock held waits for it
+    /// instead of exiting, and serves once it is free.
+    #[tokio::test]
+    async fn wait_for_lock_serves_once_the_lock_is_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let holder = std::fs::File::create(&paths.lock).unwrap();
+        holder.lock().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until(config(&paths, true), async move {
+            let _ = stop_rx.await;
+        }));
+        // Well past the attempts a daemon makes without waiting.
+        tokio::time::sleep(LOCK_RETRY_INTERVAL * LOCK_ATTEMPTS * 3).await;
+        assert!(!task.is_finished(), "gave up on a held lock");
+        assert!(!paths.socket.exists(), "bound without the lock");
+
+        holder.unlock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !paths.socket.exists() {
+            assert!(!task.is_finished(), "{:?}", task.await.unwrap());
+            assert!(
+                Instant::now() < deadline,
+                "never served after the lock was freed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("did not stop")
+            .unwrap()
+            .unwrap();
+        assert!(!paths.socket.exists());
+    }
+
+    /// A stop while waiting for the lock ends the wait at once, without
+    /// serving.
+    #[tokio::test]
+    async fn stop_while_waiting_for_the_lock_returns_without_serving() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let holder = std::fs::File::create(&paths.lock).unwrap();
+        holder.lock().unwrap();
+        let wait = LOCK_RETRY_INTERVAL * LOCK_ATTEMPTS * 3;
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_until(config(&paths, true), tokio::time::sleep(wait)),
+        )
+        .await
+        .expect("stop did not end the wait for the lock")
+        .unwrap();
+        assert!(started.elapsed() >= wait);
+        assert!(!paths.socket.exists());
     }
 
     /// A handler over a fresh store, with one agent that has sent `human`

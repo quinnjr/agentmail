@@ -24,6 +24,11 @@ const SPAWN_WAIT: Duration = Duration::from_secs(3);
 /// How long a running daemon may take to accept and answer `Hello` (or
 /// `Shutdown`) before the client gives up on it.
 const ANSWER_WAIT: Duration = Duration::from_secs(3);
+/// How long a client that stopped (or caught shutting down) a daemon keeps
+/// trying to reach a successor before starting one itself: long enough for
+/// a supervisor such as systemd (`RestartSec=500ms`) to start a new daemon,
+/// so the client does not race it with an unsupervised one.
+const SUCCESSOR_WAIT: Duration = Duration::from_secs(2);
 /// How often to spawn again while waiting. A spawned daemon exits quietly
 /// when another holds the lock, e.g. one that is still shutting down.
 const RESPAWN_INTERVAL: Duration = Duration::from_millis(500);
@@ -290,6 +295,10 @@ impl Client {
     /// a peer that accepts but does not answer: starting another daemon would
     /// not help, as the silent one either holds the lock or is not a daemon
     /// at all.
+    ///
+    /// After stopping a daemon (or finding one shutting down), the client
+    /// first waits up to [`SUCCESSOR_WAIT`] for a successor to answer, as a
+    /// supervisor restarts a daemon it runs, and only then starts its own.
     pub async fn connect_or_spawn_with(paths: &Paths, bin: &Path) -> Result<Client> {
         match Client::open_and_hello(paths, ANSWER_WAIT).await {
             Ok(c) => return Ok(c),
@@ -297,15 +306,42 @@ impl Client {
                 let _ =
                     tokio::time::timeout(ANSWER_WAIT, c.call(&Caller::Human, Request::Shutdown))
                         .await;
+                drop(c);
+                if let Some(c) = Client::await_successor(paths).await? {
+                    return Ok(c);
+                }
             }
-            // The daemon is going away; start a new one below.
-            Err(Handshake::Refused(_, e)) if e.code == ErrorCode::ConnectionLost => {}
+            // The daemon is going away; wait for a successor below.
+            Err(Handshake::Refused(_, e)) if e.code == ErrorCode::ConnectionLost => {
+                if let Some(c) = Client::await_successor(paths).await? {
+                    return Ok(c);
+                }
+            }
             Err(Handshake::Refused(_, e)) => return Err(e.into()),
             Err(Handshake::TimedOut(e) | Handshake::WrongDataDir(e)) => return Err(e),
             // Nothing listening: start a daemon below.
             Err(Handshake::Open(_)) => {}
         }
         Client::spawn_and_connect(paths, bin).await
+    }
+
+    /// Try for up to [`SUCCESSOR_WAIT`] to reach a daemon of our protocol
+    /// that replaced one going away. `None` when none answered in time.
+    async fn await_successor(paths: &Paths) -> Result<Option<Client>> {
+        let deadline = Instant::now() + SUCCESSOR_WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match Client::open_and_hello(paths, left.max(RETRY_INTERVAL)).await {
+                Ok(c) => return Ok(Some(c)),
+                Err(Handshake::WrongDataDir(e)) => return Err(e),
+                // Nothing there yet, or the old daemon still going away.
+                Err(Handshake::Open(_) | Handshake::Refused(..) | Handshake::TimedOut(_)) => {}
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
     }
 
     async fn spawn_and_connect(paths: &Paths, bin: &Path) -> Result<Client> {

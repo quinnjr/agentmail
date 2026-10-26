@@ -52,14 +52,20 @@ user unit at `~/.config/systemd/user/agentmail.service`:
 Description=agentmail local agent mail daemon
 
 [Service]
-ExecStart=%h/.cargo/bin/agentmail daemon run
-Restart=on-failure
+ExecStart=%h/.cargo/bin/agentmail daemon run --wait-for-lock
+Restart=always
+RestartSec=500ms
 
 [Install]
 WantedBy=default.target
 ```
 
+`ExecStart` assumes `cargo install` put the binary in `~/.cargo/bin`; point it
+at wherever yours lives. Stop any daemon already running, then enable the
+unit:
+
 ```sh
+agentmail daemon stop
 systemctl --user daemon-reload
 systemctl --user enable --now agentmail
 loginctl enable-linger "$USER"   # optional: keep it running while logged out
@@ -69,9 +75,47 @@ loginctl enable-linger "$USER"   # optional: keep it running while logged out
 SIGINT: it removes its socket, drops open connections (blocked clients get
 `daemon connection lost`) and releases the lock once in-flight requests
 finish. Every acknowledged write is already durable, so `systemctl stop` loses
-nothing. If another daemon already holds the lock, `daemon run` exits 0 and
-leaves that one serving. Clients still start a daemon on demand whenever none
-is reachable.
+nothing. A second SIGTERM or SIGINT during that wait exits at once with
+status 1.
+
+With `--wait-for-lock`, a unit started while another daemon (say, one an
+agent started on demand) holds the lock waits for that daemon to exit and
+then takes over, instead of exiting. Without the flag `daemon run` exits 0 at
+once and leaves the other daemon serving, and a unit doing that shows as
+`inactive (dead)`: systemd supervises nothing until it is started again.
+
+`Restart=always` brings the daemon back whenever it exits, including on
+`agentmail daemon stop` and when a client of a newer version stops an older
+daemon after an upgrade; such a client waits briefly for the restarted daemon
+rather than starting its own. So with the unit enabled:
+
+- stop the daemon with `systemctl --user stop agentmail` (and `disable` it to
+  keep it stopped across logins); `agentmail daemon stop` only restarts it;
+- restart it, e.g. after `cargo install`, with `systemctl --user restart
+  agentmail`.
+
+Clients still start a daemon on demand whenever none is reachable, e.g.
+while the unit is stopped.
+
+The systemd user manager does not read your shell profile. If you set
+`XDG_DATA_HOME`, `XDG_RUNTIME_DIR` (systemd sets this one itself),
+`AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` there, the unit would serve a
+different data directory or socket than your clients use (they then report
+the data directory mismatch, or start a daemon of their own). Either leave
+them unset, or give the unit the same values, with `Environment=` lines in
+`[Service]`:
+
+```ini
+Environment=AGENTMAIL_DATA_DIR=%h/agentmail-data
+```
+
+or by importing them from your shell before starting it (this lasts only
+until the user manager restarts, so `Environment=` is the durable choice):
+
+```sh
+systemctl --user import-environment XDG_DATA_HOME AGENTMAIL_DATA_DIR AGENTMAIL_SOCKET
+systemctl --user restart agentmail
+```
 
 ## Quick start
 

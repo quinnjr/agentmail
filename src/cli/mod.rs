@@ -298,7 +298,12 @@ pub enum ContactAction {
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub enum DaemonAction {
     /// Serve in the foreground (what autostart runs).
-    Run,
+    Run {
+        /// If another daemon is running, wait for it to exit and then
+        /// serve, instead of exiting at once (for a systemd unit).
+        #[arg(long)]
+        wait_for_lock: bool,
+    },
     /// Start the daemon if it is not running.
     Start,
     /// Stop the running daemon.
@@ -1106,10 +1111,11 @@ fn daemon_status_json(
 
 async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitCode> {
     match action {
-        DaemonAction::Run => {
+        DaemonAction::Run { wait_for_lock } => {
             serve_until(
                 DaemonConfig {
                     paths: paths.clone(),
+                    wait_for_lock,
                 },
                 shutdown_signal()?,
             )

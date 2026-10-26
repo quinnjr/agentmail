@@ -49,7 +49,12 @@ impl TestDaemon {
         assert!(self.handle.is_none(), "daemon is still running");
         let spawn = |paths: Paths| {
             tokio::spawn(async move {
-                serve(DaemonConfig { paths }).await.expect("daemon failed");
+                serve(DaemonConfig {
+                    paths,
+                    wait_for_lock: false,
+                })
+                .await
+                .expect("daemon failed");
             })
         };
         let mut handle = spawn(self.paths.clone());
