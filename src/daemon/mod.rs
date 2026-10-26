@@ -137,6 +137,21 @@ async fn open_store<F: Future<Output = ()>>(
     }
 }
 
+/// Record why start-up failed in [`Paths::startup_error`], for the client
+/// that spawned this daemon without a stderr to read (see
+/// [`crate::client::Client::connect_or_spawn`]). Best effort; written to a
+/// temporary file and renamed into place, so a reader never sees it half
+/// written. Returns `err` for the caller to return.
+fn record_startup_error(paths: &Paths, err: anyhow::Error) -> anyhow::Error {
+    let path = paths.startup_error();
+    let tmp = path.with_extension(format!("err.{}", std::process::id()));
+    if std::fs::write(&tmp, format!("{err:#}\n")).is_err() || std::fs::rename(&tmp, &path).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    err
+}
+
 /// Write `record` to the lock file we hold, for clients to read once we
 /// are gone (see [`LockRecord`]). Best effort: without it clients just do
 /// not wait for a supervisor.
@@ -355,7 +370,10 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 /// then put a mode-0600 socket in place of any leftover one (no live daemon
 /// can own it while we hold the lock) and accept. Every fallible startup
 /// step runs before the socket appears, so a daemon that fails to start
-/// never leaves a socket without a listener behind. A `stop` that resolves
+/// never leaves a socket without a listener behind. A startup step that
+/// fails once the data directory exists records why in
+/// [`Paths::startup_error`] (a spawned daemon has no stderr), and a daemon
+/// that starts serving removes that record. A `stop` that resolves
 /// during startup, including while the store open is retried, ends it
 /// cleanly before the socket is bound.
 ///
@@ -379,7 +397,8 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         .write(true)
         .truncate(false)
         .open(&paths.lock)
-        .with_context(|| format!("opening {}", paths.lock.display()))?;
+        .with_context(|| format!("opening {}", paths.lock.display()))
+        .map_err(|e| record_startup_error(&paths, e))?;
     let record = LockRecord {
         supervised: cfg.wait_for_lock,
         pid: std::process::id(),
@@ -400,13 +419,16 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         () = &mut stop => return Ok(()),
         locked = locked => locked,
     };
-    if !locked? {
+    if !locked.map_err(|e| record_startup_error(&paths, e))? {
         return Ok(());
     }
     write_lock_record(&lock, &paths.lock, &record);
     drop(waiter);
 
-    let Some(store) = open_store(&paths.db, stop.as_mut()).await? else {
+    let Some(store) = open_store(&paths.db, stop.as_mut())
+        .await
+        .map_err(|e| record_startup_error(&paths, e))?
+    else {
         return Ok(());
     };
     // Stopped while starting: leave before publishing a socket that would
@@ -419,13 +441,16 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     let store = Arc::new(store);
 
     if let Some(parent) = paths.socket.parent() {
-        create_private_dir(parent)?;
+        create_private_dir(parent).map_err(|e| record_startup_error(&paths, e))?;
     }
-    let listener = bind_private(&paths.socket)?;
+    let listener = bind_private(&paths.socket).map_err(|e| record_startup_error(&paths, e))?;
     let Some(socket_id) = file_id(&paths.socket) else {
         // Someone removed it already; there is nothing of ours to clean up.
-        anyhow::bail!("{} vanished after bind", paths.socket.display());
+        let e = anyhow::anyhow!("{} vanished after bind", paths.socket.display());
+        return Err(record_startup_error(&paths, e));
     };
+    // Started: an earlier failure no longer says why there is no daemon.
+    let _ = std::fs::remove_file(paths.startup_error());
 
     let store_ref = Arc::downgrade(&store);
     let handler = Arc::new(Handler::new(store, Hub::new()));

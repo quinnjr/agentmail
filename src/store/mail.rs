@@ -755,29 +755,6 @@ impl Store {
         unsurfaced_urgent_in(&txn.open_table(MAILBOX)?, &txn.open_table(MESSAGES)?, addr)
     }
 
-    /// [`Store::unsurfaced_urgent`] and [`Store::mark_surfaced`] of what it
-    /// returns, in one write transaction: of concurrent callers, only one
-    /// gets each message. Takes no write transaction when there is nothing
-    /// to surface.
-    pub fn surface_urgent(&self, addr: &str) -> Result<Vec<Message>, StoreError> {
-        if self.unsurfaced_urgent(addr)?.is_empty() {
-            return Ok(Vec::new());
-        }
-        let txn = self.db.begin_write()?;
-        let out = {
-            let mut mailbox = txn.open_table(MAILBOX)?;
-            let out = unsurfaced_urgent_in(&mailbox, &txn.open_table(MESSAGES)?, addr)?;
-            for m in &out {
-                let key = (addr, m.id.as_str());
-                let flags = mailbox.get(key)?.map_or(0, |f| f.value());
-                mailbox.insert(key, flags | SURFACED)?;
-            }
-            out
-        };
-        txn.commit()?;
-        Ok(out)
-    }
-
     /// `addr`'s [`HookSnapshot`], read in one transaction. With `surface`,
     /// the urgent mail it returns is also marked surfaced in that same
     /// (write) transaction, so of concurrent callers only one gets each

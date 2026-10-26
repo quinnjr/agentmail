@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::Stream;
@@ -37,6 +37,11 @@ const DRAIN_WAIT: Duration = Duration::from_secs(5);
 /// How often to spawn again while waiting. A spawned daemon exits quietly
 /// when another holds the lock, e.g. one that is still shutting down.
 const RESPAWN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How much older than the client's first spawn a recorded start-up
+/// failure (see [`Paths::startup_error`]) may look and still count as one
+/// of the daemons it spawned: file times may be coarser than the clock.
+const STARTUP_ERROR_SLACK: Duration = Duration::from_secs(1);
 
 /// How many times to read a lock record that does not decode while the
 /// lock is held, [`RECORD_REREAD_INTERVAL`] apart.
@@ -131,6 +136,20 @@ fn daemon_bin_from(env: Option<OsString>) -> Result<PathBuf> {
         Some(bin) => Ok(PathBuf::from(bin)),
         None => std::env::current_exe().context("locating the agentmail executable"),
     }
+}
+
+/// Why a daemon spawned at or after `since` failed to start, as it recorded
+/// in [`Paths::startup_error`]. An older record is from an earlier attempt
+/// and says nothing about this one.
+fn fresh_startup_error(paths: &Paths, since: SystemTime) -> Option<String> {
+    let path = paths.startup_error();
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    if modified < since.checked_sub(STARTUP_ERROR_SLACK).unwrap_or(since) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Start `bin daemon run` for `paths`, detached: its own process group, no
@@ -533,6 +552,7 @@ impl Client {
         crate::daemon::check_socket_path(&paths.socket)?;
         let deadline = Instant::now() + SPAWN_WAIT;
         let mut last_spawn = Instant::now();
+        let first_spawn = SystemTime::now();
         spawn_daemon(paths, bin)?;
         let mut last_err = anyhow!("no daemon answered");
         loop {
@@ -558,6 +578,12 @@ impl Client {
                     .is_some_and(|e| e.code == ErrorCode::VersionMismatch);
                 let msg = if other_version {
                     Client::other_version(paths)
+                } else if let Some(why) = fresh_startup_error(paths, first_spawn) {
+                    // A daemon we spawned recorded why it could not start
+                    // (it has no stderr); one respawned since may still
+                    // hold the lock as it fails the same way. That reason
+                    // stands alone: the failed connect adds only noise.
+                    return Err(anyhow!("the agentmail daemon failed to start: {why}"));
                 } else if ours {
                     // It serves our socket but no longer listens: it is
                     // still finishing in-flight requests.

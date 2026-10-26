@@ -1275,26 +1275,6 @@ fn mark_surfaced_ignores_foreign_and_unknown_ids() {
 }
 
 #[test]
-fn surface_urgent_returns_each_message_once() {
-    let (_d, s) = store();
-    let a = agent(&s, "backend", None);
-    let b = agent(&s, "frontend", None);
-    assert!(s.surface_urgent(&b).unwrap().is_empty());
-    let u1 = s.insert_message(urgent(&a, &[&b], "one"), 1).unwrap();
-    s.insert_message(note(&a, &[&b], "calm", "x"), 2).unwrap();
-    let u2 = s.insert_message(urgent(&a, &[&b], "two"), 3).unwrap();
-    assert_eq!(
-        ids(&s.surface_urgent(&b).unwrap()),
-        vec![u1.id.as_str(), u2.id.as_str()]
-    );
-    assert!(s.surface_urgent(&b).unwrap().is_empty());
-    assert!(s.unsurfaced_urgent(&b).unwrap().is_empty());
-    assert_eq!(s.unread(&b).unwrap().len(), 3);
-    let u3 = s.insert_message(urgent(&a, &[&b], "three"), 4).unwrap();
-    assert_eq!(ids(&s.surface_urgent(&b).unwrap()), vec![u3.id.as_str()]);
-}
-
-#[test]
 fn hook_snapshot_counts_unread_lists_questions_and_urgent() {
     let (_d, s) = store();
     let a = agent(&s, "backend", None);

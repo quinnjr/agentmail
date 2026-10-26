@@ -9,6 +9,7 @@ const DB_FILE: &str = "agentmail.redb";
 const SOCKET_FILE: &str = "agentmail.sock";
 const LOCK_FILE: &str = "agentmail.lock";
 const WAITER_FILE: &str = "agentmail.waiter";
+const STARTUP_ERROR_FILE: &str = "daemon.err";
 
 /// What a daemon writes to the lock file once it holds the lock, read by
 /// clients deciding whether to wait for a successor after it has gone: one
@@ -220,6 +221,13 @@ impl Paths {
     /// holds the lock on [`Paths::waiter`]. Probes like [`Paths::lock_held`].
     pub fn waiter_held(&self) -> bool {
         held(&self.waiter())
+    }
+
+    /// Where a daemon that failed to start records why, next to
+    /// [`Paths::lock`], so the client that spawned it (with no stderr) can
+    /// report it. Removed once a daemon starts serving.
+    pub fn startup_error(&self) -> PathBuf {
+        self.data_dir.join(STARTUP_ERROR_FILE)
     }
 
     /// Put everything, socket included, in `dir`. Used by tests.

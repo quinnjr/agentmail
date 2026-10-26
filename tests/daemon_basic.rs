@@ -1007,6 +1007,88 @@ async fn unopenable_store_fails_without_leaving_a_socket() {
     );
 }
 
+/// Set the database at `paths` to schema `version`, as a newer build would.
+fn set_schema_version(paths: &Paths, version: &str) {
+    if !paths.db.exists() {
+        drop(agentmail::store::Store::open(&paths.db).unwrap());
+    }
+    let db = redb::Database::create(&paths.db).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let meta: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("meta");
+        let mut meta = txn.open_table(meta).unwrap();
+        meta.insert("schema_version", version).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[tokio::test]
+async fn autostart_reports_why_the_daemon_failed_to_start() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    set_schema_version(&paths, "999");
+    let err = Client::connect_or_spawn_with(&paths, &bin())
+        .await
+        .err()
+        .expect("autostart succeeded against an unsupported schema");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("schema version 999"), "{msg}");
+    assert!(!msg.contains("still shutting down"), "{msg}");
+    assert!(
+        std::fs::symlink_metadata(&paths.socket).is_err(),
+        "socket left behind"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_start_is_recorded_and_a_successful_one_clears_it() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    set_schema_version(&paths, "999");
+    let cfg = || DaemonConfig {
+        paths: paths.clone(),
+        wait_for_lock: false,
+    };
+    assert!(serve(cfg()).await.is_err());
+    let recorded = std::fs::read_to_string(paths.startup_error()).unwrap();
+    assert!(recorded.contains("schema version 999"), "{recorded}");
+
+    set_schema_version(&paths, agentmail::store::SCHEMA_VERSION);
+    let d = tokio::spawn(serve(cfg()));
+    let mut c = Client::connect(&paths).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while c.is_err() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        c = Client::connect(&paths).await;
+    }
+    c.unwrap();
+    assert!(!paths.startup_error().exists(), "stale start-up error kept");
+    assert!(Client::shutdown(&paths).await.unwrap());
+    d.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_start_up_error_is_not_reported() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    std::fs::write(paths.startup_error(), "an old failure").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(paths.startup_error())
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    // A "daemon" that exits at once without starting.
+    let err = Client::connect_or_spawn_with(&paths, Path::new("/bin/true"))
+        .await
+        .err()
+        .expect("connected without a daemon");
+    let msg = format!("{err:#}");
+    assert!(!msg.contains("an old failure"), "{msg}");
+    assert!(msg.contains("did not start"), "{msg}");
+}
+
 #[tokio::test]
 async fn bind_leaves_no_staging_files_and_replaces_leftovers() {
     let dir = TempDir::new().unwrap();
