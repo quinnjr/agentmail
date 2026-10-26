@@ -244,8 +244,8 @@ async fn mcp_server_end_to_end() {
     assert!(contacts.to_string().contains(&frontend), "{contacts}");
 
     // Two active agents named `api` in this repo: the name is ambiguous.
-    env.cli_agent("api");
-    env.cli_agent("api");
+    let mut apis = vec![env.cli_agent("api"), env.cli_agent("api")];
+    apis.sort();
     let r = call(
         &client,
         "send",
@@ -254,8 +254,18 @@ async fn mcp_server_end_to_end() {
     .await;
     assert_eq!(r.is_error, Some(true));
     let t = text(&r);
-    assert!(t.contains("AmbiguousRecipient"), "{t}");
-    assert!(t.contains("candidates"), "{t}");
+    let v: Value = serde_json::from_str(&t).unwrap_or_else(|e| panic!("bad json ({e}): {t}"));
+    assert_eq!(v["error"]["code"], "AmbiguousRecipient", "{t}");
+    let candidates = v["error"]["candidates"]
+        .as_array()
+        .expect("candidates array");
+    assert_eq!(candidates.len(), 2, "{t}");
+    let mut got: Vec<String> = candidates
+        .iter()
+        .map(|c| c["address"].as_str().unwrap().to_string())
+        .collect();
+    got.sort();
+    assert_eq!(got, apis, "{t}");
 
     // ask → pending, answered from the CLI, then await_answer.
     let a = ok(&call(
@@ -404,6 +414,29 @@ async fn mcp_server_status_agents_search_signoff() {
     assert_eq!(list.as_array().unwrap().len(), 0, "{list}");
     let list = ok(&call(&client, "agents", json!({"name": "backend", "all": true})).await);
     assert!(list.to_string().contains(&backend), "{list}");
+
+    client.cancel().await.unwrap();
+}
+
+/// `wake: false` and `fresh: true` reach the daemon as given.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_register_wake_and_fresh() {
+    let env = Env::new();
+    let client = env.mcp().await;
+
+    let first = ok(&call(&client, "register", json!({"name": "x", "wake": false})).await);
+    let first = first["address"].as_str().unwrap().to_string();
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["address"], first.as_str(), "{me}");
+    assert_eq!(me["agent"]["wake"], false, "{me}");
+
+    let second = ok(&call(&client, "register", json!({"name": "x", "fresh": true})).await);
+    let second = second["address"].as_str().unwrap().to_string();
+    assert!(second.starts_with("x-"), "{second}");
+    assert_ne!(first, second);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["address"], second.as_str(), "{me}");
+    assert_eq!(me["agent"]["wake"], true, "{me}");
 
     client.cancel().await.unwrap();
 }
