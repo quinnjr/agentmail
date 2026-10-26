@@ -484,6 +484,43 @@ pub(crate) fn absolute(p: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Why a registration binding a process of `sharing` (a harness whose
+/// process is shared between sessions) carries none of its sessions, given
+/// the session found (`session`) and the environment (`var`). The session
+/// variable may be set but not counted: this command does not run under
+/// that harness process (a detached job, `--pid` naming an unrelated one)
+/// or the harness process carries the value itself, inherited from an
+/// outer session. Otherwise it is unset, possibly with a session of another
+/// harness (kiro's) instead.
+fn no_session_cause(
+    sharing: Harness,
+    session: Option<&SessionKey>,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> String {
+    let h = sharing.as_str();
+    let Some(name) = identity::session_var(sharing) else {
+        return format!("{h} has no session variable");
+    };
+    if var(name).is_some_and(|v| !v.is_empty()) {
+        return format!(
+            "{name} is set but does not name a session of this {h} process: \
+             this command is not running in one of its sessions, or the value \
+             was inherited from the {h} process's own environment"
+        );
+    }
+    let other = session
+        .cloned()
+        .or_else(|| identity::session_from_env(&var))
+        .filter(|k| k.harness != sharing);
+    match other {
+        Some(k) => format!(
+            "{name} is not set; it carries a {} session, not an {h} one",
+            k.harness.as_str()
+        ),
+        None => format!("{name} is not set"),
+    }
+}
+
 /// Whether `register` should tell the user to act as the new agent through
 /// `AGENTMAIL_ADDRESS`: the agent is bound to no process and no session the
 /// CLI resolves callers by. Only sessions of a harness that shares its
@@ -818,11 +855,13 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                     ErrorCode::InvalidInput,
                     format!(
                         "this {h} process is shared between sessions and the \
-                         registration carries no {h} session (OPENCODE_SESSION_ID \
-                         is not set), so it cannot register; run register from \
-                         an {h} session's shell, or bind a process outside this \
-                         {h} with --pid",
-                        h = sharing.as_str()
+                         registration carries no {h} session ({cause}), so it \
+                         cannot register; run register from an {h} session's \
+                         shell, or bind a process outside this {h} with --pid",
+                        h = sharing.as_str(),
+                        cause = no_session_cause(sharing, session.as_ref(), |k| {
+                            std::env::var_os(k)
+                        }),
                     ),
                 )
                 .into());
@@ -1308,6 +1347,43 @@ async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_session_cause_names_what_happened() {
+        let unset = |_: &str| None;
+        let set = |k: &str| (k == identity::ENV_OPENCODE_SESSION).then(|| "s9".into());
+        let empty = |k: &str| (k == identity::ENV_OPENCODE_SESSION).then(|| "".into());
+        let o = Harness::Opencode;
+        assert_eq!(
+            no_session_cause(o, None, unset),
+            "OPENCODE_SESSION_ID is not set"
+        );
+        assert_eq!(
+            no_session_cause(o, None, empty),
+            "OPENCODE_SESSION_ID is not set"
+        );
+        let ignored = no_session_cause(o, None, set);
+        assert!(
+            ignored.starts_with("OPENCODE_SESSION_ID is set but"),
+            "{ignored}"
+        );
+        assert!(
+            ignored.contains("not running in one of its sessions"),
+            "{ignored}"
+        );
+        assert!(ignored.contains("inherited"), "{ignored}");
+        let kiro = SessionKey {
+            harness: Harness::Kiro,
+            id: "k1".into(),
+        };
+        let kiro_only = "OPENCODE_SESSION_ID is not set; it carries a kiro session, not an \
+                         opencode one";
+        assert_eq!(no_session_cause(o, Some(&kiro), unset), kiro_only);
+        // A kiro session variable that did not count still explains it.
+        let kiro_var = |k: &str| (k == identity::ENV_KIRO_SESSION).then(|| "k1".into());
+        assert_eq!(no_session_cause(o, None, kiro_var), kiro_only);
+    }
+
     use clap::CommandFactory;
 
     #[test]

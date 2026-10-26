@@ -23,6 +23,13 @@ const SESSION_VARS: [(&str, Harness); 2] = [
     (ENV_KIRO_SESSION, Harness::Kiro),
 ];
 
+/// The environment variable naming a session of `harness`, if it has one.
+pub fn session_var(harness: Harness) -> Option<&'static str> {
+    SESSION_VARS
+        .into_iter()
+        .find_map(|(name, h)| (h == harness).then_some(name))
+}
+
 /// The session of `harness` named by variable `name`, if set and non-empty.
 fn read_session(
     var: impl Fn(&str) -> Option<OsString>,
@@ -70,8 +77,8 @@ pub fn session_for(
     environ: impl Fn(u32, &str) -> Option<OsString>,
 ) -> Option<SessionKey> {
     let (proc, h) = nearest?;
-    let (name, harness) = SESSION_VARS.into_iter().find(|(_, vh)| *vh == h)?;
-    let session = read_session(&var, name, harness)?;
+    let name = session_var(h)?;
+    let session = read_session(&var, name, h)?;
     let inherited = environ(proc.pid, name).is_some_and(|v| v == session.id.as_str());
     (!inherited).then_some(session)
 }
@@ -333,6 +340,14 @@ fn binding_with(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn session_var_names_each_session_harness() {
+        assert_eq!(session_var(Harness::Opencode), Some(ENV_OPENCODE_SESSION));
+        assert_eq!(session_var(Harness::Kiro), Some(ENV_KIRO_SESSION));
+        assert_eq!(session_var(Harness::ClaudeCode), None);
+        assert_eq!(session_var(Harness::Other), None);
+    }
 
     fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = vars

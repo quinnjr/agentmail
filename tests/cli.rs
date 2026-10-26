@@ -1127,6 +1127,12 @@ fn opencode_session_carried_by_the_opencode_itself_is_ignored() {
             .contains("shared between sessions"),
         "{err}"
     );
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("OPENCODE_SESSION_ID is set but"),
+        "{message}"
+    );
+    assert!(!message.contains("is not set"), "{message}");
     let me = ok_json(env.in_session_of("outer").args(["whoami", "--json"]));
     assert_eq!(me["address"], outer.as_str(), "{me}");
     // B's own bash tool command, in B's session `inner`: that session.
@@ -1315,6 +1321,48 @@ fn register_other_session_bound_to_opencode_is_refused() {
     assert_eq!(err["error"]["code"], "InvalidInput", "{err}");
     let message = err["error"]["message"].as_str().unwrap();
     assert!(message.contains("shared between sessions"), "{message}");
+    assert!(
+        message.contains("carries a kiro session, not an opencode one"),
+        "{message}"
+    );
+    let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
+    assert_eq!(v, serde_json::json!([]), "{v}");
+}
+
+/// OPENCODE_SESSION_ID set in a command that does not run under the
+/// opencode process `--pid` names (a detached job, or any shell outside
+/// it) is ignored: the refusal says the variable is set but does not count,
+/// not that it is unset. No agent is created.
+#[test]
+fn register_ignored_opencode_session_bound_to_opencode_is_refused() {
+    let mut env = Env::new();
+    let fake = env.dir.path().join("opencode");
+    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+    // The trailing `exit` keeps the shell (named opencode) from exec'ing.
+    let opencode = StdCommand::new(&fake)
+        .args(["-c", "sleep 300; exit"])
+        .spawn()
+        .unwrap();
+    let pid = opencode.id().to_string();
+    env.sleeps.push(opencode);
+    let out = env
+        .cmd()
+        .env("OPENCODE_SESSION_ID", "s9")
+        .args(["register", "x", "--json", "--pid", &pid])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let err = json(&out);
+    assert_eq!(err["error"]["code"], "InvalidInput", "{err}");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("shared between sessions"), "{message}");
+    assert!(
+        message.contains(
+            "OPENCODE_SESSION_ID is set but does not name a session of this opencode process"
+        ),
+        "{message}"
+    );
+    assert!(!message.contains("is not set"), "{message}");
     let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
     assert_eq!(v, serde_json::json!([]), "{v}");
 }
