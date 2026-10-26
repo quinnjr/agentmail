@@ -5,6 +5,7 @@ pub mod client;
 pub mod daemon;
 pub mod identity;
 pub mod ids;
+pub mod mcp;
 pub mod model;
 pub mod paths;
 pub mod procinfo;

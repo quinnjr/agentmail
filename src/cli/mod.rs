@@ -257,6 +257,8 @@ pub enum Command {
         #[arg(long, value_parser = parse_duration, value_name = "DUR")]
         older_than: Duration,
     },
+    /// Serve MCP on stdin/stdout (run by harnesses, not by people).
+    Mcp,
     /// Manage the background daemon (default: status).
     Daemon {
         #[command(subcommand)]
@@ -581,7 +583,7 @@ impl Session {
 }
 
 /// The error for a short id with fewer than `MIN_SHORT_ID` characters.
-fn too_short_id(id: &str) -> Option<ClientError> {
+pub(crate) fn too_short_id(id: &str) -> Option<ClientError> {
     (id.chars().count() < MIN_SHORT_ID).then(|| {
         ClientError::new(
             ErrorCode::InvalidInput,
@@ -592,7 +594,7 @@ fn too_short_id(id: &str) -> Option<ClientError> {
 
 /// The error for a short id that ends several stored ids, listing the
 /// first `AMBIGUOUS_SHOWN` of them.
-fn ambiguous_id(id: &str, found: &[String]) -> ClientError {
+pub(crate) fn ambiguous_id(id: &str, found: &[String]) -> ClientError {
     let shown = found[..found.len().min(AMBIGUOUS_SHOWN)].join(", ");
     let more = match found.len().saturating_sub(AMBIGUOUS_SHOWN) {
         0 => String::new(),
@@ -618,7 +620,7 @@ fn wait_timeout_text(timeout_secs: u64) -> String {
 
 /// `id` as a full id when it is one (upper-cased), or empty; `None` for a
 /// short id that needs looking up.
-fn normalize_full_id(id: &str) -> Option<String> {
+pub(crate) fn normalize_full_id(id: &str) -> Option<String> {
     (id.len() == ULID_LEN || id.is_empty()).then(|| id.to_ascii_uppercase())
 }
 
@@ -626,6 +628,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
     if let Command::Daemon { action } = cli.command {
         return daemon(&paths, action.unwrap_or(DaemonAction::Status), cli.json).await;
+    }
+    if let Command::Mcp = cli.command {
+        crate::mcp::serve(paths).await?;
+        return Ok(ExitCode::SUCCESS);
     }
     let caller = identity::cli_caller(cli.as_who.is_some());
     if matches!(cli.command, Command::Register { .. }) && caller == Caller::Human {
@@ -986,7 +992,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 ))
             })?;
         }
-        Command::Daemon { .. } => unreachable!("handled in run"),
+        Command::Daemon { .. } | Command::Mcp => unreachable!("handled in run"),
     }
     Ok(ExitCode::SUCCESS)
 }

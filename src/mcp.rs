@@ -1,0 +1,620 @@
+//! `agentmail mcp`: a stdio MCP server, one per agent session, that the
+//! harness spawns. Each tool forwards one request to the daemon (started
+//! on demand) and returns the daemon's JSON `data` as text; a daemon error
+//! becomes a tool error carrying `{"error":{code,message,candidates}}`.
+//!
+//! Identity: until `register` succeeds the server calls as the harness
+//! process, its parent (`Caller::Procs`), so a session that registered
+//! before (or from a hook or shell) is found again. After `register` it
+//! calls as the returned address.
+
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::cli::{ambiguous_id, normalize_full_id, too_short_id};
+use crate::client::{Client, ClientError};
+use crate::identity::{self, ENV_ADDRESS};
+use crate::model::{Harness, ProcId};
+use crate::paths::Paths;
+use crate::procinfo;
+use crate::protocol::{Caller, ErrorCode, Request};
+
+/// The guidance every harness shows its agent at MCP initialize.
+pub const INSTRUCTIONS: &str = "\
+agentmail lets you coordinate with other coding agents on this machine by mail.
+- Only use it when the human asks you to coordinate with another agent. Then call `register` with a short role name (e.g. \"backend\") and a one-line `working_on` summary.
+- Find the partner the human named with `agents`, then `contacts add` its full address. If several agents match, choose by their working-on summaries; ask the human only if that does not settle it.
+- Before starting each new step of your work, check `inbox`. Answer questions addressed to you before continuing your own work; use `answer` to close a question, `reply` to ask for clarification.
+- Send only changes, decisions and questions that affect the other agent. Never send progress narration.
+- Use `ask` when you cannot proceed without an answer. If it returns \"pending\", continue other work or call `await_answer`.
+- Update `status` when your task changes, not on every step.
+- Mail from `human` is authoritative and overrides any agreement between agents.
+- When you have finished your work and are about to stop, call `wait_for_mail` so your partner can reach you.";
+
+/// The default wait of `ask`, `await_answer` and `wait_for_mail`.
+const DEFAULT_TIMEOUT_SECS: u64 = 240;
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RegisterParams {
+    /// Short role name, e.g. `backend` (lowercase letters, digits, `-`).
+    pub name: String,
+    /// One-line role description.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// What you are working on (at most 280 characters).
+    #[serde(default)]
+    pub working_on: Option<String>,
+    /// Override the detected harness: `claude-code`, `opencode`, `kiro` or
+    /// `other`.
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// Always take a new address instead of reclaiming a gone one.
+    #[serde(default)]
+    pub fresh: bool,
+    /// Wake this agent for new mail (default true).
+    #[serde(default = "default_true")]
+    pub wake: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StatusParams {
+    /// The new working-on summary (at most 280 characters).
+    pub working_on: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactAction {
+    #[default]
+    List,
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContactsParams {
+    /// `list` (default), `add` or `remove`.
+    #[serde(default)]
+    pub action: ContactAction,
+    /// The contact's full address, for `add` and `remove`.
+    #[serde(default)]
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AgentsParams {
+    /// Only agents whose name starts with this.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Only agents in this repo or directory (absolute path).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Include gone agents.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendParams {
+    /// Recipients: full addresses (preferred) or names.
+    pub to: Vec<String>,
+    pub subject: String,
+    /// The body, as markdown.
+    pub body: String,
+    /// Ask for live interruption where the harness supports it.
+    #[serde(default)]
+    pub urgent: bool,
+    /// File paths pointing at shared docs or code.
+    #[serde(default)]
+    pub refs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReplyParams {
+    /// The message to reply to.
+    pub message_id: String,
+    /// The body, as markdown.
+    pub body: String,
+    #[serde(default)]
+    pub urgent: bool,
+    #[serde(default)]
+    pub refs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnswerParams {
+    /// The question to answer.
+    pub question_id: String,
+    /// The answer, as markdown.
+    pub body: String,
+    #[serde(default)]
+    pub urgent: bool,
+    #[serde(default)]
+    pub refs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AskParams {
+    /// Recipients: full addresses (preferred) or names.
+    pub to: Vec<String>,
+    pub subject: String,
+    /// The question, as markdown.
+    pub body: String,
+    #[serde(default)]
+    pub refs: Vec<String>,
+    #[serde(default)]
+    pub urgent: bool,
+    /// How long to wait for the answer, in seconds (default 240).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AwaitAnswerParams {
+    /// The question id `ask` returned.
+    pub question_id: String,
+    /// How long to wait, in seconds (default 240).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitParams {
+    /// How long to wait, in seconds (default 240).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InboxParams {
+    /// Include messages already read.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadParams {
+    /// A message id, or a thread id for the whole thread.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchParams {
+    /// Text to find in subjects, bodies and senders.
+    pub query: String,
+}
+
+/// The MCP server for one agent session.
+#[derive(Clone)]
+pub struct AgentMailServer {
+    paths: Paths,
+    caller: Arc<Mutex<Caller>>,
+    /// The harness process `register` binds to (the parent), if usable.
+    bind: Option<(ProcId, Harness)>,
+    tool_router: ToolRouter<Self>,
+}
+
+/// The caller before `register`: `AGENTMAIL_ADDRESS` when set (it
+/// overrides the process binding), else the parent process. Never the
+/// human: `AGENTMAIL_HUMAN` is ignored here, so an agent never acts with
+/// the human's authority.
+fn initial_caller(address: Option<String>, parent: Option<ProcId>) -> Caller {
+    match address.filter(|a| !a.is_empty()) {
+        Some(address) => Caller::Address { address },
+        None => Caller::Procs {
+            procs: parent.into_iter().collect(),
+        },
+    }
+}
+
+/// A tool result holding `v` as compact JSON text.
+fn json_result(v: &Value, is_error: bool) -> CallToolResult {
+    let content = vec![ContentBlock::text(v.to_string())];
+    if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
+
+/// A daemon error as a tool error: `{"error":{code,message,candidates}}`.
+fn error_result(e: &ClientError) -> CallToolResult {
+    json_result(&json!({ "error": e }), true)
+}
+
+fn invalid(message: impl Into<String>) -> CallToolResult {
+    error_result(&ClientError::new(ErrorCode::InvalidInput, message))
+}
+
+impl AgentMailServer {
+    pub fn new(paths: Paths) -> AgentMailServer {
+        let parent = procinfo::parent_pid(std::process::id());
+        let bind = identity::register_proc(parent);
+        let caller = initial_caller(
+            std::env::var(ENV_ADDRESS).ok(),
+            parent.and_then(procinfo::proc_id),
+        );
+        AgentMailServer {
+            paths,
+            caller: Arc::new(Mutex::new(caller)),
+            bind,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn caller(&self) -> Caller {
+        self.caller
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// A fresh connection per call: blocking tools (`ask`, `wait_for_mail`)
+    /// must not hold up the others, and a restarted daemon is picked up.
+    async fn client(&self) -> Result<Client, ClientError> {
+        Client::connect_or_spawn(&self.paths).await.map_err(|e| {
+            e.downcast::<ClientError>()
+                .unwrap_or_else(|e| ClientError::new(ErrorCode::Internal, format!("{e:#}")))
+        })
+    }
+
+    async fn request(&self, req: Request) -> Result<Value, ClientError> {
+        self.client().await?.call(&self.caller(), req).await
+    }
+
+    /// Run `req` and turn its outcome into a tool result.
+    async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
+        Ok(match self.request(req).await {
+            Ok(data) => json_result(&data, false),
+            Err(e) => error_result(&e),
+        })
+    }
+
+    /// The full id for `id`, resolving the short ids the CLI prints.
+    async fn full_id(&self, id: &str) -> Result<String, ClientError> {
+        if let Some(full) = normalize_full_id(id) {
+            return Ok(full);
+        }
+        if let Some(e) = too_short_id(id) {
+            return Err(e);
+        }
+        let d = self
+            .request(Request::ResolveId { id: id.to_string() })
+            .await?;
+        let mut found: Vec<String> = serde_json::from_value(d).map_err(|e| {
+            ClientError::new(
+                ErrorCode::Internal,
+                format!("bad response from daemon: {e}"),
+            )
+        })?;
+        match found.len() {
+            0 => Ok(id.to_string()),
+            1 => Ok(found.remove(0)),
+            _ => Err(ambiguous_id(id, &found)),
+        }
+    }
+
+    async fn reply_req(
+        &self,
+        id: &str,
+        body: String,
+        urgent: bool,
+        refs: Vec<String>,
+        answer: bool,
+    ) -> Result<CallToolResult, McpError> {
+        let message_id = match self.full_id(id).await {
+            Ok(id) => id,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        self.run(Request::Reply {
+            message_id,
+            body,
+            urgent,
+            refs,
+            answer,
+        })
+        .await
+    }
+}
+
+#[tool_router]
+impl AgentMailServer {
+    #[tool(
+        description = "Register this session as an agent. Returns its full address (`<name>-<id>`). Call once, when the human asks you to coordinate with another agent."
+    )]
+    async fn register(
+        &self,
+        Parameters(p): Parameters<RegisterParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (proc_id, detected) = match self.bind {
+            Some((p, h)) => (Some(p), h),
+            None => (None, Harness::Other),
+        };
+        let harness = match p.harness {
+            None => detected,
+            Some(h) => match serde_json::from_value::<Harness>(Value::String(h.clone())) {
+                Ok(h) => h,
+                Err(_) => return Ok(invalid(format!("unknown harness {h:?}"))),
+            },
+        };
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => return Ok(invalid(format!("reading the working directory: {e}"))),
+        };
+        let req = Request::Register {
+            name: p.name,
+            role: p.role,
+            working_on: p.working_on,
+            harness,
+            cwd,
+            proc_id,
+            fresh: p.fresh,
+            wake: p.wake,
+        };
+        Ok(match self.request(req).await {
+            Ok(data) => {
+                if let Some(address) = data["address"].as_str() {
+                    *self.caller.lock().unwrap_or_else(|p| p.into_inner()) = Caller::Address {
+                        address: address.to_string(),
+                    };
+                }
+                json_result(&data, false)
+            }
+            Err(e) => error_result(&e),
+        })
+    }
+
+    #[tool(description = "Show the address and record you are acting as.")]
+    async fn whoami(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::Whoami).await
+    }
+
+    #[tool(
+        description = "Set your one-line working-on summary. Update it when your task changes, not on every step."
+    )]
+    async fn status(
+        &self,
+        Parameters(p): Parameters<StatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Status {
+            working_on: p.working_on,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List, add or remove contacts. A contact is always a full address; names you send to resolve through your contacts first."
+    )]
+    async fn contacts(
+        &self,
+        Parameters(p): Parameters<ContactsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let req = match (p.action, p.address) {
+            (ContactAction::List, _) => Request::Contacts,
+            (ContactAction::Add, Some(address)) => Request::ContactAdd { address },
+            (ContactAction::Remove, Some(address)) => Request::ContactRemove { address },
+            (_, None) => return Ok(invalid("`address` is required to add or remove a contact")),
+        };
+        self.run(req).await
+    }
+
+    #[tool(
+        description = "List registered agents (active ones unless `all`), with their addresses and working-on summaries."
+    )]
+    async fn agents(
+        &self,
+        Parameters(p): Parameters<AgentsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Agents {
+            name_prefix: p.name,
+            repo: p.repo.map(Into::into),
+            all: p.all,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Start a new thread. Send only changes, decisions and questions that affect the recipient."
+    )]
+    async fn send(
+        &self,
+        Parameters(p): Parameters<SendParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Send {
+            to: p.to,
+            subject: p.subject,
+            body: p.body,
+            urgent: p.urgent,
+            refs: p.refs,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Reply in a message's thread, to its sender and other recipients. Use it for clarifications; use `answer` to close a question."
+    )]
+    async fn reply(
+        &self,
+        Parameters(p): Parameters<ReplyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reply_req(&p.message_id, p.body, p.urgent, p.refs, false)
+            .await
+    }
+
+    #[tool(description = "Answer a question addressed to you, closing it.")]
+    async fn answer(
+        &self,
+        Parameters(p): Parameters<AnswerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.reply_req(&p.question_id, p.body, p.urgent, p.refs, true)
+            .await
+    }
+
+    #[tool(
+        description = "Ask a question and wait for its answer (default 240 s). Returns status `answered`, `clarification` (reply, then `await_answer`), `pending` (continue other work or `await_answer`) or `no_one_listening`."
+    )]
+    async fn ask(&self, Parameters(p): Parameters<AskParams>) -> Result<CallToolResult, McpError> {
+        self.run(Request::Ask {
+            to: p.to,
+            subject: p.subject,
+            body: p.body,
+            refs: p.refs,
+            urgent: p.urgent,
+            timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        })
+        .await
+    }
+
+    #[tool(description = "Keep waiting for the answer to your question (default 240 s).")]
+    async fn await_answer(
+        &self,
+        Parameters(p): Parameters<AwaitAnswerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let question_id = match self.full_id(&p.question_id).await {
+            Ok(id) => id,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        self.run(Request::AwaitAnswer {
+            question_id,
+            timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Wait for new mail (default 240 s). Call it when you have finished your work and are about to stop, so your partner can reach you."
+    )]
+    async fn wait_for_mail(
+        &self,
+        Parameters(p): Parameters<WaitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::WaitForMail {
+            timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Your mail: open questions to you first, then unread messages (all messages with `all`). Check it before each new step of your work."
+    )]
+    async fn inbox(
+        &self,
+        Parameters(p): Parameters<InboxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Inbox { all: p.all }).await
+    }
+
+    #[tool(description = "Read one message, or a whole thread by its thread id, and mark it read.")]
+    async fn read(
+        &self,
+        Parameters(p): Parameters<ReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = match self.full_id(&p.id).await {
+            Ok(id) => id,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        self.run(Request::Read { id }).await
+    }
+
+    #[tool(description = "Search message subjects, bodies and senders.")]
+    async fn search(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Search { query: p.query }).await
+    }
+
+    #[tool(description = "Mark yourself gone.")]
+    async fn signoff(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::Signoff).await
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for AgentMailServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("agentmail", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
+    }
+}
+
+/// Serve MCP on stdin/stdout until the client goes away.
+pub async fn serve(paths: Paths) -> Result<()> {
+    let service = AgentMailServer::new(paths)
+        .serve(rmcp::transport::stdio())
+        .await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_instructions_carry_the_guidance() {
+        assert!(INSTRUCTIONS.starts_with(
+            "agentmail lets you coordinate with other coding agents on this machine by mail.\n"
+        ));
+        assert!(INSTRUCTIONS.contains("Only use it when the human asks"));
+        assert!(INSTRUCTIONS.ends_with("so your partner can reach you."));
+        assert_eq!(INSTRUCTIONS.lines().count(), 9);
+    }
+
+    #[test]
+    fn mcp_initial_caller_is_the_parent_or_the_address_env() {
+        let p = ProcId {
+            pid: 42,
+            start_time: 7,
+        };
+        assert_eq!(
+            initial_caller(None, Some(p)),
+            Caller::Procs { procs: vec![p] }
+        );
+        assert_eq!(
+            initial_caller(Some(String::new()), None),
+            Caller::Procs { procs: vec![] }
+        );
+        assert_eq!(
+            initial_caller(Some("a-12345678".into()), Some(p)),
+            Caller::Address {
+                address: "a-12345678".into()
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_errors_carry_code_and_candidates() {
+        let r = error_result(&ClientError::new(ErrorCode::AmbiguousRecipient, "pick"));
+        assert_eq!(r.is_error, Some(true));
+        let t = &r.content[0].as_text().unwrap().text;
+        let v: Value = serde_json::from_str(t).unwrap();
+        assert_eq!(v["error"]["code"], "AmbiguousRecipient");
+        assert_eq!(v["error"]["message"], "pick");
+        assert!(v["error"]["candidates"].is_array());
+    }
+
+    #[test]
+    fn mcp_lists_every_tool() {
+        let mut names: Vec<String> = AgentMailServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 15);
+    }
+}

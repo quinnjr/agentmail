@@ -1,0 +1,290 @@
+//! Task 10: the stdio MCP server, driven through rmcp's client.
+
+use std::path::PathBuf;
+use std::process::{Child, Command as StdCommand, Stdio};
+
+use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
+use rmcp::service::RunningService;
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::{RoleClient, ServiceExt};
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+const BIN: &str = env!("CARGO_BIN_EXE_agentmail");
+
+/// The tools the server must offer, sorted.
+const TOOLS: [&str; 15] = [
+    "agents",
+    "answer",
+    "ask",
+    "await_answer",
+    "contacts",
+    "inbox",
+    "read",
+    "register",
+    "reply",
+    "search",
+    "send",
+    "signoff",
+    "status",
+    "wait_for_mail",
+    "whoami",
+];
+
+/// A private data directory and socket. Dropping it stops the daemon and
+/// the fake harness processes.
+struct Env {
+    dir: TempDir,
+    work: PathBuf,
+    sleeps: Vec<Child>,
+}
+
+impl Env {
+    fn new() -> Env {
+        let dir = TempDir::new().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        Env {
+            dir,
+            work,
+            sleeps: Vec::new(),
+        }
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("data")
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.dir.path().join("agentmail.sock")
+    }
+
+    fn cmd(&self) -> StdCommand {
+        let mut c = StdCommand::new(BIN);
+        c.env("AGENTMAIL_DATA_DIR", self.data_dir())
+            .env("AGENTMAIL_SOCKET", self.socket())
+            .env_remove("AGENTMAIL_ADDRESS")
+            .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_BIN")
+            .current_dir(&self.work);
+        c
+    }
+
+    /// Register a CLI agent `name` bound to a fresh `sleep`; its address.
+    fn cli_agent(&mut self, name: &str) -> String {
+        let sleep = StdCommand::new("sleep").arg("300").spawn().unwrap();
+        let out = self
+            .cmd()
+            .args(["register", name, "--json", "--fresh", "--pid"])
+            .arg(sleep.id().to_string())
+            .output()
+            .unwrap();
+        self.sleeps.push(sleep);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["address"].as_str().unwrap().to_string()
+    }
+
+    /// `agentmail mcp` as a child process, with an initialized client.
+    async fn mcp(&self) -> RunningService<RoleClient, ClientConfig> {
+        let transport = TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|c| {
+            c.arg("mcp")
+                .env("AGENTMAIL_DATA_DIR", self.data_dir())
+                .env("AGENTMAIL_SOCKET", self.socket())
+                .env_remove("AGENTMAIL_ADDRESS")
+                .env_remove("AGENTMAIL_HUMAN")
+                .env_remove("AGENTMAIL_BIN")
+                .current_dir(&self.work);
+        }))
+        .unwrap();
+        ClientConfig::default().serve(transport).await.unwrap()
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let _ = self
+            .cmd()
+            .args(["daemon", "stop"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for s in &mut self.sleeps {
+            let _ = s.kill();
+            let _ = s.wait();
+        }
+    }
+}
+
+async fn call(
+    c: &RunningService<RoleClient, ClientConfig>,
+    tool: &str,
+    args: Value,
+) -> CallToolResult {
+    let args = args.as_object().cloned().unwrap_or_default();
+    c.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
+        .await
+        .unwrap()
+}
+
+fn text(r: &CallToolResult) -> String {
+    r.content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The tool's JSON result; panics on a tool error.
+fn ok(r: &CallToolResult) -> Value {
+    assert_ne!(r.is_error, Some(true), "tool error: {}", text(r));
+    serde_json::from_str(&text(r)).unwrap_or_else(|e| panic!("bad json ({e}): {}", text(r)))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_server_end_to_end() {
+    let mut env = Env::new();
+    let client = env.mcp().await;
+
+    let info = client.peer_info().expect("initialized");
+    let instructions = info.instructions.clone().unwrap_or_default();
+    assert!(
+        instructions.contains("Only use it when the human asks"),
+        "{instructions}"
+    );
+    assert_eq!(
+        info.server_info.as_ref().map(|i| i.name.as_str()),
+        Some("agentmail")
+    );
+
+    let mut names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, TOOLS);
+
+    // Before registering there is no identity.
+    let r = call(&client, "whoami", json!({})).await;
+    assert_eq!(r.is_error, Some(true));
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+
+    let reg = ok(&call(
+        &client,
+        "register",
+        json!({"name": "backend", "working_on": "the API"}),
+    )
+    .await);
+    let backend = reg["address"].as_str().unwrap().to_string();
+    assert!(backend.starts_with("backend-"), "{backend}");
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["address"], backend.as_str());
+
+    // A CLI agent mails the MCP agent by full address.
+    let frontend = env.cli_agent("frontend");
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &frontend)
+        .args([
+            "send",
+            "--to",
+            &backend,
+            "--subject",
+            "hello there",
+            "--body",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inbox = ok(&call(&client, "inbox", json!({})).await);
+    let msgs = inbox.as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{inbox}");
+    assert_eq!(msgs[0]["subject"], "hello there");
+    assert_eq!(msgs[0]["from"], frontend.as_str());
+
+    // Read and reply through MCP; the CLI agent sees the reply.
+    let id = msgs[0]["id"].as_str().unwrap().to_string();
+    let read = ok(&call(&client, "read", json!({"id": id})).await);
+    assert!(read.to_string().contains("hi"), "{read}");
+    ok(&call(
+        &client,
+        "reply",
+        json!({"message_id": id, "body": "got it"}),
+    )
+    .await);
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &frontend)
+        .args(["inbox", "--json"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("got it"));
+
+    // Contacts.
+    ok(&call(
+        &client,
+        "contacts",
+        json!({"action": "add", "address": frontend}),
+    )
+    .await);
+    let contacts = ok(&call(&client, "contacts", json!({"action": "list"})).await);
+    assert!(contacts.to_string().contains(&frontend), "{contacts}");
+
+    // Two active agents named `api` in this repo: the name is ambiguous.
+    env.cli_agent("api");
+    env.cli_agent("api");
+    let r = call(
+        &client,
+        "send",
+        json!({"to": ["api"], "subject": "s", "body": "b"}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true));
+    let t = text(&r);
+    assert!(t.contains("AmbiguousRecipient"), "{t}");
+    assert!(t.contains("candidates"), "{t}");
+
+    // ask → pending, answered from the CLI, then await_answer.
+    let a = ok(&call(
+        &client,
+        "ask",
+        json!({"to": [frontend], "subject": "q", "body": "which port?", "timeout_secs": 1}),
+    )
+    .await);
+    assert_eq!(a["status"], "pending", "{a}");
+    let qid = a["question_id"].as_str().unwrap().to_string();
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &frontend)
+        .args(["answer", &qid, "--body", "8080"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let a = ok(&call(&client, "await_answer", json!({"question_id": qid})).await);
+    assert_eq!(a["status"], "answered", "{a}");
+    assert_eq!(a["answer"]["body"], "8080");
+    let answer_id = a["answer"]["id"].as_str().unwrap();
+    ok(&call(&client, "read", json!({"id": answer_id})).await);
+
+    // A short wait with no mail times out.
+    let w = ok(&call(&client, "wait_for_mail", json!({"timeout_secs": 1})).await);
+    assert_eq!(w["status"], "timeout");
+
+    client.cancel().await.unwrap();
+}
