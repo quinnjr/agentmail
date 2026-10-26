@@ -445,7 +445,7 @@ fn read_body(b: &BodyArgs) -> Result<String> {
 }
 
 /// `p` made absolute against the working directory.
-fn absolute(p: &Path) -> Result<PathBuf> {
+pub(crate) fn absolute(p: &Path) -> Result<PathBuf> {
     if p.is_absolute() {
         Ok(p.to_path_buf())
     } else {

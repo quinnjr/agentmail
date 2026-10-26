@@ -8,6 +8,7 @@
 //! before (or from a hook or shell) is found again. After `register` it
 //! calls as the returned address.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -19,7 +20,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::cli::{ambiguous_id, normalize_full_id, too_short_id};
+use crate::cli::{absolute, ambiguous_id, normalize_full_id, too_short_id};
 use crate::client::{Client, ClientError};
 use crate::identity::{self, ENV_ADDRESS};
 use crate::model::{Harness, ProcId};
@@ -98,7 +99,8 @@ pub struct AgentsParams {
     /// Only agents whose name starts with this.
     #[serde(default)]
     pub name: Option<String>,
-    /// Only agents in this repo or directory (absolute path).
+    /// Only agents in this repo or directory (a relative path resolves
+    /// against the working directory).
     #[serde(default)]
     pub repo: Option<String>,
     /// Include gone agents.
@@ -277,6 +279,9 @@ impl AgentMailServer {
     /// Run `req` and turn its outcome into a tool result.
     async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
         Ok(match self.request(req).await {
+            // A request with no data (e.g. `contacts add`) reports success
+            // explicitly rather than as a bare `null` an agent may misread.
+            Ok(Value::Null) => json_result(&json!({ "ok": true }), false),
             Ok(data) => json_result(&data, false),
             Err(e) => error_result(&e),
         })
@@ -417,9 +422,19 @@ impl AgentMailServer {
         &self,
         Parameters(p): Parameters<AgentsParams>,
     ) -> Result<CallToolResult, McpError> {
+        // A relative repo resolves against the working directory, as the CLI's `--repo` does.
+        let repo = match p
+            .repo
+            .as_deref()
+            .map(|r| absolute(Path::new(r)))
+            .transpose()
+        {
+            Ok(repo) => repo,
+            Err(e) => return Ok(invalid(format!("cannot resolve repo: {e}"))),
+        };
         self.run(Request::Agents {
             name_prefix: p.name,
-            repo: p.repo.map(Into::into),
+            repo,
             all: p.all,
         })
         .await

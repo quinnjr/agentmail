@@ -232,13 +232,14 @@ async fn mcp_server_end_to_end() {
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("got it"));
 
-    // Contacts.
-    ok(&call(
+    // Contacts. A call with no data says so instead of returning a bare `null`.
+    let added = ok(&call(
         &client,
         "contacts",
         json!({"action": "add", "address": frontend}),
     )
     .await);
+    assert_eq!(added, json!({"ok": true}), "{added}");
     let contacts = ok(&call(&client, "contacts", json!({"action": "list"})).await);
     assert!(contacts.to_string().contains(&frontend), "{contacts}");
 
@@ -321,7 +322,8 @@ async fn mcp_server_status_agents_search_signoff() {
     assert_eq!(me["agent"]["wake"], true, "{me}");
 
     // `status` updates the working-on summary.
-    ok(&call(&client, "status", json!({"working_on": "the schema"})).await);
+    let st = ok(&call(&client, "status", json!({"working_on": "the schema"})).await);
+    assert_eq!(st["working_on"], "the schema", "{st}");
     let me = ok(&call(&client, "whoami", json!({})).await);
     assert_eq!(me["agent"]["working_on"], "the schema", "{me}");
 
@@ -334,6 +336,10 @@ async fn mcp_server_status_agents_search_signoff() {
     assert_eq!(found[0]["working_on"], "the schema");
     let work = env.work.to_string_lossy().to_string();
     let list = ok(&call(&client, "agents", json!({"repo": work})).await);
+    assert!(list.to_string().contains(&backend), "{list}");
+    assert!(list.to_string().contains(&frontend), "{list}");
+    // A relative `repo` resolves against the server's working directory, as the CLI flag does.
+    let list = ok(&call(&client, "agents", json!({"repo": "."})).await);
     assert!(list.to_string().contains(&backend), "{list}");
     assert!(list.to_string().contains(&frontend), "{list}");
     let elsewhere = env.dir.path().join("elsewhere");
