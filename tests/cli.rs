@@ -53,6 +53,8 @@ impl Env {
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
             .env_remove("AGENTMAIL_BIN")
+            .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("KIRO_SESSION_ID")
             .current_dir(&self.work)
             .timeout(Duration::from_secs(30));
         c
@@ -951,4 +953,57 @@ fn closed_stdout_does_not_panic() {
     }
     // An error with --json prints JSON to the closed stdout too.
     closed_stdout(&env, &["--as", "human", "read", "NOSUCHID", "--json"]);
+}
+
+/// Shell commands in two opencode sessions run in the same process tree;
+/// `OPENCODE_SESSION_ID` tells them apart.
+#[test]
+fn opencode_env_session_register_and_whoami() {
+    let mut env = Env::new();
+    fn in_session_of(env: &Env, id: &str) -> Command {
+        let mut c = env.cmd();
+        c.env("OPENCODE_SESSION_ID", id);
+        c
+    }
+    let r1 = ok_json(in_session_of(&env, "s1").args(["register", "backend", "--json"]));
+    let backend = r1["address"].as_str().unwrap().to_string();
+    let r2 = ok_json(in_session_of(&env, "s2").args(["register", "frontend", "--json"]));
+    let frontend = r2["address"].as_str().unwrap().to_string();
+    assert_ne!(backend, frontend);
+
+    let me = ok_json(in_session_of(&env, "s1").args(["whoami", "--json"]));
+    assert_eq!(me["address"], backend.as_str(), "{me}");
+    assert_eq!(me["agent"]["session"]["harness"], "opencode", "{me}");
+    assert_eq!(me["agent"]["session"]["id"], "s1", "{me}");
+    let me = ok_json(in_session_of(&env, "s2").args(["whoami", "--json"]));
+    assert_eq!(me["address"], frontend.as_str(), "{me}");
+
+    // The same session registering again keeps its address.
+    let again = ok_json(in_session_of(&env, "s1").args(["register", "backend", "--json"]));
+    assert_eq!(again["address"], backend.as_str(), "{again}");
+
+    // Without the session the shared process tree resolves to neither.
+    let out = env.cmd().args(["whoami", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("not registered"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    // Mail to s1's agent is in s1's inbox only.
+    let sender = env.agent("sender");
+    ok_text(env.as_agent(&sender).args([
+        "send",
+        "--to",
+        &backend,
+        "--subject",
+        "for s1",
+        "--body",
+        "x",
+    ]));
+    let inbox = ok_json(in_session_of(&env, "s1").args(["inbox", "--json"]));
+    assert!(inbox.to_string().contains("for s1"), "{inbox}");
+    let inbox = ok_json(in_session_of(&env, "s2").args(["inbox", "--json"]));
+    assert!(!inbox.to_string().contains("for s1"), "{inbox}");
 }

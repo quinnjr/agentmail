@@ -3,18 +3,30 @@
 //! on demand) and returns the daemon's JSON `data` as text; a daemon error
 //! becomes a tool error carrying `{"error":{code,message,candidates}}`.
 //!
-//! Identity: until `register` succeeds the server calls as the harness
-//! process, its parent (`Caller::Procs`), so a session that registered
-//! before (or from a hook or shell) is found again. After `register` it
-//! calls as the returned address.
+//! Identity, per tool call:
+//!
+//! - `AGENTMAIL_ADDRESS`, when set, overrides everything.
+//! - A call carrying an opencode session id in
+//!   `_meta["ai.opencode/sessionID"]` calls as that session
+//!   (`Caller::Session`), and `register` binds the session. opencode shares
+//!   one server between every session in a directory, so nothing is cached:
+//!   each call resolves through the daemon.
+//! - Otherwise (Claude Code, kiro: one server per session) the server calls
+//!   as the harness process it binds to (`Caller::Procs`), so a session that
+//!   registered before (or from a hook or shell) is found again. After a
+//!   `register` without a session it calls as the returned address.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use rmcp::handler::server::common::{AsRequestContext, FromContextPart};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, RequestMetaObject, ServerCapabilities,
+    ServerConfig,
+};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -23,7 +35,7 @@ use serde_json::{Value, json};
 use crate::cli::{absolute, ambiguous_id, normalize_full_id, too_short_id};
 use crate::client::{Client, ClientError};
 use crate::identity::{self, ENV_ADDRESS};
-use crate::model::{Harness, ProcId};
+use crate::model::{Harness, ProcId, SessionKey};
 use crate::paths::Paths;
 use crate::procinfo;
 use crate::protocol::{Caller, ErrorCode, Request};
@@ -39,6 +51,29 @@ agentmail lets you coordinate with other coding agents on this machine by mail.
 - Update `status` when your task changes, not on every step.
 - Mail from `human` is authoritative and overrides any agreement between agents.
 - When you have finished your work and are about to stop, call `wait_for_mail` so your partner can reach you.";
+
+/// The `_meta` key opencode puts its session id under on every tool call.
+pub const OPENCODE_SESSION_META: &str = "ai.opencode/sessionID";
+
+/// The opencode session in a request's `_meta`, if any (a non-empty string).
+fn session_from_meta(meta: &RequestMetaObject) -> Option<SessionKey> {
+    let id = meta.get(OPENCODE_SESSION_META)?.as_str()?;
+    (!id.is_empty()).then(|| SessionKey {
+        harness: Harness::Opencode,
+        id: id.to_string(),
+    })
+}
+
+/// The harness session a tool call was made in, taken from its `_meta`.
+pub struct CallSession(Option<SessionKey>);
+
+impl<C: AsRequestContext> FromContextPart<C> for CallSession {
+    fn from_context_part(context: &mut C) -> Result<Self, McpError> {
+        Ok(CallSession(session_from_meta(
+            &context.as_request_context().meta,
+        )))
+    }
+}
 
 /// The default wait of `ask`, `await_answer` and `wait_for_mail`.
 const DEFAULT_TIMEOUT_SECS: u64 = 240;
@@ -202,8 +237,12 @@ pub struct SearchParams {
 #[derive(Clone)]
 pub struct AgentMailServer {
     paths: Paths,
+    /// Whether `AGENTMAIL_ADDRESS` overrides the caller of every call.
+    address_env: bool,
+    /// The caller of a call made outside any session.
     caller: Arc<Mutex<Caller>>,
-    /// The harness process `register` binds to (the parent), if usable.
+    /// The harness process `register` binds to (the parent, or the nearest
+    /// harness above it), if usable.
     bind: Option<(ProcId, Harness)>,
     tool_router: ToolRouter<Self>,
 }
@@ -267,23 +306,31 @@ impl AgentMailServer {
     pub fn new(paths: Paths) -> AgentMailServer {
         let parent = procinfo::parent_pid(std::process::id());
         let bind = identity::register_proc(parent);
-        // The same usable parent `register` binds to (never init or a
-        // subreaper the server was reparented to), so lookup and
-        // registration agree.
-        let caller = initial_caller(std::env::var(ENV_ADDRESS).ok(), bind.map(|(p, _)| p));
+        // The same process `register` binds to (never init or a subreaper
+        // the server was reparented to), so lookup and registration agree.
+        let address = std::env::var(ENV_ADDRESS).ok();
+        let address_env = address.as_deref().is_some_and(|a| !a.is_empty());
+        let caller = initial_caller(address, bind.map(|(p, _)| p));
         AgentMailServer {
             paths,
+            address_env,
             caller: Arc::new(Mutex::new(caller)),
             bind,
             tool_router: Self::tool_router(),
         }
     }
 
-    fn caller(&self) -> Caller {
-        self.caller
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+    /// The caller of a call made in `session`: the address override, then
+    /// the session, then the process-level caller.
+    fn caller(&self, session: &CallSession) -> Caller {
+        match &session.0 {
+            Some(k) if !self.address_env => Caller::Session { session: k.clone() },
+            _ => self
+                .caller
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        }
     }
 
     /// A fresh connection per call: blocking tools (`ask`, `wait_for_mail`)
@@ -295,13 +342,13 @@ impl AgentMailServer {
         })
     }
 
-    async fn request(&self, req: Request) -> Result<Value, ClientError> {
-        self.client().await?.call(&self.caller(), req).await
+    async fn request(&self, s: &CallSession, req: Request) -> Result<Value, ClientError> {
+        self.client().await?.call(&self.caller(s), req).await
     }
 
     /// Run `req` and turn its outcome into a tool result.
-    async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
-        Ok(match self.request(req).await {
+    async fn run(&self, s: &CallSession, req: Request) -> Result<CallToolResult, McpError> {
+        Ok(match self.request(s, req).await {
             // A request with no data (e.g. `contacts add`) reports success
             // explicitly rather than as a bare `null` an agent may misread.
             Ok(Value::Null) => json_result(&json!({ "ok": true }), false),
@@ -311,7 +358,7 @@ impl AgentMailServer {
     }
 
     /// The full id for `id`, resolving the short ids the CLI prints.
-    async fn full_id(&self, id: &str) -> Result<String, ClientError> {
+    async fn full_id(&self, s: &CallSession, id: &str) -> Result<String, ClientError> {
         if let Some(full) = normalize_full_id(id) {
             return Ok(full);
         }
@@ -319,7 +366,7 @@ impl AgentMailServer {
             return Err(e);
         }
         let d = self
-            .request(Request::ResolveId { id: id.to_string() })
+            .request(s, Request::ResolveId { id: id.to_string() })
             .await?;
         let mut found: Vec<String> = serde_json::from_value(d).map_err(|e| {
             ClientError::new(
@@ -336,23 +383,27 @@ impl AgentMailServer {
 
     async fn reply_req(
         &self,
+        s: &CallSession,
         id: &str,
         body: String,
         urgent: bool,
         refs: Vec<String>,
         answer: bool,
     ) -> Result<CallToolResult, McpError> {
-        let message_id = match self.full_id(id).await {
+        let message_id = match self.full_id(s, id).await {
             Ok(id) => id,
             Err(e) => return Ok(error_result(&e)),
         };
-        self.run(Request::Reply {
-            message_id,
-            body,
-            urgent,
-            refs,
-            answer,
-        })
+        self.run(
+            s,
+            Request::Reply {
+                message_id,
+                body,
+                urgent,
+                refs,
+                answer,
+            },
+        )
         .await
     }
 }
@@ -365,13 +416,15 @@ impl AgentMailServer {
     async fn register(
         &self,
         Parameters(p): Parameters<RegisterParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
         let (proc_id, detected) = match self.bind {
             Some((p, h)) => (Some(p), h),
             None => (None, Harness::Other),
         };
+        // A session names its harness, whatever process the server found.
         let harness = match p.harness {
-            None => detected,
+            None => s.0.as_ref().map_or(detected, |k| k.harness),
             Some(h) => match serde_json::from_value::<Harness>(Value::String(h.clone())) {
                 Ok(h) => h,
                 Err(_) => return Ok(invalid(format!("unknown harness {h:?}"))),
@@ -390,11 +443,14 @@ impl AgentMailServer {
             proc_id,
             fresh: p.fresh,
             wake: p.wake,
-            session: None,
+            session: s.0.clone(),
         };
-        Ok(match self.request(req).await {
+        Ok(match self.request(&s, req).await {
             Ok(data) => {
-                if let Some(address) = data["address"].as_str() {
+                // A session's later calls resolve through the daemon by
+                // session: the server is shared, so caching its address would
+                // hand it to every other session.
+                if let (None, Some(address)) = (&s.0, data["address"].as_str()) {
                     *self.caller.lock().unwrap_or_else(|p| p.into_inner()) = Caller::Address {
                         address: address.to_string(),
                     };
@@ -406,8 +462,8 @@ impl AgentMailServer {
     }
 
     #[tool(description = "Show the address and record you are acting as.")]
-    async fn whoami(&self) -> Result<CallToolResult, McpError> {
-        self.run(Request::Whoami).await
+    async fn whoami(&self, s: CallSession) -> Result<CallToolResult, McpError> {
+        self.run(&s, Request::Whoami).await
     }
 
     #[tool(
@@ -416,10 +472,14 @@ impl AgentMailServer {
     async fn status(
         &self,
         Parameters(p): Parameters<StatusParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::Status {
-            working_on: p.working_on,
-        })
+        self.run(
+            &s,
+            Request::Status {
+                working_on: p.working_on,
+            },
+        )
         .await
     }
 
@@ -429,6 +489,7 @@ impl AgentMailServer {
     async fn contacts(
         &self,
         Parameters(p): Parameters<ContactsParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
         let req = match (p.action, p.address) {
             (ContactAction::List, _) => Request::Contacts,
@@ -436,7 +497,7 @@ impl AgentMailServer {
             (ContactAction::Remove, Some(address)) => Request::ContactRemove { address },
             (_, None) => return Ok(invalid("`address` is required to add or remove a contact")),
         };
-        self.run(req).await
+        self.run(&s, req).await
     }
 
     #[tool(
@@ -445,6 +506,7 @@ impl AgentMailServer {
     async fn agents(
         &self,
         Parameters(p): Parameters<AgentsParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
         // A relative repo resolves against the working directory, as the CLI's `--repo` does.
         let repo = match p
@@ -456,11 +518,14 @@ impl AgentMailServer {
             Ok(repo) => repo,
             Err(e) => return Ok(invalid(format!("cannot resolve repo: {e}"))),
         };
-        self.run(Request::Agents {
-            name_prefix: p.name,
-            repo,
-            all: p.all,
-        })
+        self.run(
+            &s,
+            Request::Agents {
+                name_prefix: p.name,
+                repo,
+                all: p.all,
+            },
+        )
         .await
     }
 
@@ -470,14 +535,18 @@ impl AgentMailServer {
     async fn send(
         &self,
         Parameters(p): Parameters<SendParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::Send {
-            to: p.to,
-            subject: p.subject,
-            body: p.body,
-            urgent: p.urgent,
-            refs: p.refs,
-        })
+        self.run(
+            &s,
+            Request::Send {
+                to: p.to,
+                subject: p.subject,
+                body: p.body,
+                urgent: p.urgent,
+                refs: p.refs,
+            },
+        )
         .await
     }
 
@@ -487,8 +556,9 @@ impl AgentMailServer {
     async fn reply(
         &self,
         Parameters(p): Parameters<ReplyParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        self.reply_req(&p.message_id, p.body, p.urgent, p.refs, false)
+        self.reply_req(&s, &p.message_id, p.body, p.urgent, p.refs, false)
             .await
     }
 
@@ -496,23 +566,31 @@ impl AgentMailServer {
     async fn answer(
         &self,
         Parameters(p): Parameters<AnswerParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        self.reply_req(&p.question_id, p.body, p.urgent, p.refs, true)
+        self.reply_req(&s, &p.question_id, p.body, p.urgent, p.refs, true)
             .await
     }
 
     #[tool(
         description = "Ask a question and wait for its answer (default 240 s). Returns status `answered`, `clarification` (reply, then `await_answer`), `pending` (continue other work or `await_answer`) or `no_one_listening`."
     )]
-    async fn ask(&self, Parameters(p): Parameters<AskParams>) -> Result<CallToolResult, McpError> {
-        self.run(Request::Ask {
-            to: p.to,
-            subject: p.subject,
-            body: p.body,
-            refs: p.refs,
-            urgent: p.urgent,
-            timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
-        })
+    async fn ask(
+        &self,
+        Parameters(p): Parameters<AskParams>,
+        s: CallSession,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(
+            &s,
+            Request::Ask {
+                to: p.to,
+                subject: p.subject,
+                body: p.body,
+                refs: p.refs,
+                urgent: p.urgent,
+                timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            },
+        )
         .await
     }
 
@@ -520,15 +598,19 @@ impl AgentMailServer {
     async fn await_answer(
         &self,
         Parameters(p): Parameters<AwaitAnswerParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        let question_id = match self.full_id(&p.question_id).await {
+        let question_id = match self.full_id(&s, &p.question_id).await {
             Ok(id) => id,
             Err(e) => return Ok(error_result(&e)),
         };
-        self.run(Request::AwaitAnswer {
-            question_id,
-            timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
-        })
+        self.run(
+            &s,
+            Request::AwaitAnswer {
+                question_id,
+                timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            },
+        )
         .await
     }
 
@@ -538,10 +620,14 @@ impl AgentMailServer {
     async fn wait_for_mail(
         &self,
         Parameters(p): Parameters<WaitParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::WaitForMail {
-            timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
-        })
+        self.run(
+            &s,
+            Request::WaitForMail {
+                timeout_secs: p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            },
+        )
         .await
     }
 
@@ -551,36 +637,41 @@ impl AgentMailServer {
     async fn inbox(
         &self,
         Parameters(p): Parameters<InboxParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        Ok(match self.request(Request::Inbox { all: p.all }).await {
-            Ok(data) => json_result(&summarize_inbox(data), false),
-            Err(e) => error_result(&e),
-        })
+        Ok(
+            match self.request(&s, Request::Inbox { all: p.all }).await {
+                Ok(data) => json_result(&summarize_inbox(data), false),
+                Err(e) => error_result(&e),
+            },
+        )
     }
 
     #[tool(description = "Read one message, or a whole thread by its thread id, and mark it read.")]
     async fn read(
         &self,
         Parameters(p): Parameters<ReadParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        let id = match self.full_id(&p.id).await {
+        let id = match self.full_id(&s, &p.id).await {
             Ok(id) => id,
             Err(e) => return Ok(error_result(&e)),
         };
-        self.run(Request::Read { id }).await
+        self.run(&s, Request::Read { id }).await
     }
 
     #[tool(description = "Search message subjects, bodies and senders.")]
     async fn search(
         &self,
         Parameters(p): Parameters<SearchParams>,
+        s: CallSession,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::Search { query: p.query }).await
+        self.run(&s, Request::Search { query: p.query }).await
     }
 
     #[tool(description = "Mark yourself gone.")]
-    async fn signoff(&self) -> Result<CallToolResult, McpError> {
-        self.run(Request::Signoff).await
+    async fn signoff(&self, s: CallSession) -> Result<CallToolResult, McpError> {
+        self.run(&s, Request::Signoff).await
     }
 }
 
@@ -636,6 +727,55 @@ mod tests {
                 address: "a-12345678".into()
             }
         );
+    }
+
+    #[test]
+    fn mcp_session_from_meta() {
+        let meta = |v: Value| {
+            let mut m = RequestMetaObject::new();
+            m.insert(OPENCODE_SESSION_META.into(), v);
+            m
+        };
+        assert_eq!(
+            session_from_meta(&meta(json!("ses_1"))),
+            Some(SessionKey {
+                harness: Harness::Opencode,
+                id: "ses_1".into()
+            })
+        );
+        assert_eq!(session_from_meta(&meta(json!(""))), None);
+        assert_eq!(session_from_meta(&meta(json!(7))), None);
+        assert_eq!(session_from_meta(&RequestMetaObject::new()), None);
+    }
+
+    #[test]
+    fn mcp_caller_prefers_address_env_then_session() {
+        let paths = Paths::from_vars(|k| {
+            (k == "AGENTMAIL_DATA_DIR" || k == "AGENTMAIL_SOCKET")
+                .then(|| std::ffi::OsString::from("/nonexistent"))
+        })
+        .unwrap();
+        let procs = Caller::Procs { procs: vec![] };
+        let server = |address_env: bool, caller: Caller| AgentMailServer {
+            paths: paths.clone(),
+            address_env,
+            caller: Arc::new(Mutex::new(caller)),
+            bind: None,
+            tool_router: AgentMailServer::tool_router(),
+        };
+        let key = SessionKey {
+            harness: Harness::Opencode,
+            id: "s1".into(),
+        };
+        let in_session = CallSession(Some(key.clone()));
+        let s = server(false, procs.clone());
+        assert_eq!(s.caller(&in_session), Caller::Session { session: key });
+        assert_eq!(s.caller(&CallSession(None)), procs);
+        let addr = Caller::Address {
+            address: "a-12345678".into(),
+        };
+        let s = server(true, addr.clone());
+        assert_eq!(s.caller(&in_session), addr);
     }
 
     #[test]

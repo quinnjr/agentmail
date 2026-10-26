@@ -763,9 +763,14 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 Some((p, h)) => (Some(p), h),
                 None => (None, Harness::Other),
             };
-            let harness = match harness {
-                Some(h) => harness_from(&h)?,
-                None => detected,
+            // A session from the environment names its harness: the
+            // process found may be another harness further up the tree.
+            let session = identity::session_from_env(|k| std::env::var_os(k));
+            let has_session = session.is_some();
+            let harness = match (harness, &session) {
+                (Some(h), _) => harness_from(&h)?,
+                (None, Some(k)) => k.harness,
+                (None, None) => detected,
             };
             let req = Request::Register {
                 name,
@@ -776,7 +781,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 proc_id,
                 fresh,
                 wake: !no_wake,
-                session: None,
+                session,
             };
             let d = s.call(req).await?;
             s.show(&d, |d| {
@@ -789,7 +794,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 if let Some(n) = d["released"].as_u64().filter(|n| *n > 0) {
                     out.push_str(&format!("{n} held message(s) delivered to you\n"));
                 }
-                if proc_id.is_none() {
+                if proc_id.is_none() && !has_session {
                     out.push_str(&format!(
                         "not bound to a process: set AGENTMAIL_ADDRESS={address} to act as it\n"
                     ));

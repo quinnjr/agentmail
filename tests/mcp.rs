@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, RequestMetaObject};
 use rmcp::service::RunningService;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
@@ -66,6 +66,8 @@ impl Env {
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
             .env_remove("AGENTMAIL_BIN")
+            .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("KIRO_SESSION_ID")
             .current_dir(&self.work);
         c
     }
@@ -98,6 +100,8 @@ impl Env {
                 .env_remove("AGENTMAIL_ADDRESS")
                 .env_remove("AGENTMAIL_HUMAN")
                 .env_remove("AGENTMAIL_BIN")
+                .env_remove("OPENCODE_SESSION_ID")
+                .env_remove("KIRO_SESSION_ID")
                 .current_dir(&self.work);
         }))
         .unwrap();
@@ -129,6 +133,21 @@ async fn call(
     c.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
         .await
         .unwrap()
+}
+
+/// `call` as opencode makes it: with `_meta["ai.opencode/sessionID"]`.
+async fn call_in_session(
+    c: &RunningService<RoleClient, ClientConfig>,
+    session: &str,
+    tool: &str,
+    args: Value,
+) -> CallToolResult {
+    let args = args.as_object().cloned().unwrap_or_default();
+    let mut meta = RequestMetaObject::new();
+    meta.insert("ai.opencode/sessionID".into(), json!(session));
+    let mut params = CallToolRequestParams::new(tool.to_string()).with_arguments(args);
+    params.meta = Some(meta);
+    c.call_tool(params).await.unwrap()
 }
 
 fn text(r: &CallToolResult) -> String {
@@ -493,6 +512,102 @@ async fn mcp_blocking_tools_do_not_block_others() {
     let w = ok(&r);
     assert_eq!(w["status"], "mail", "{w}");
     assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+
+    client.cancel().await.unwrap();
+}
+
+/// Two opencode sessions share one MCP server: each call is resolved by the
+/// session in its `_meta`, never by a cached address.
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_meta_session_isolates_callers() {
+    let mut env = Env::new();
+    let client = env.mcp().await;
+
+    let r1 = ok(&call_in_session(&client, "s1", "register", json!({"name": "backend"})).await);
+    let backend = r1["address"].as_str().unwrap().to_string();
+    let r2 = ok(&call_in_session(&client, "s2", "register", json!({"name": "frontend"})).await);
+    let frontend = r2["address"].as_str().unwrap().to_string();
+    assert!(backend.starts_with("backend-"), "{backend}");
+    assert!(frontend.starts_with("frontend-"), "{frontend}");
+
+    for _ in 0..2 {
+        let me = ok(&call_in_session(&client, "s1", "whoami", json!({})).await);
+        assert_eq!(me["address"], backend.as_str(), "{me}");
+        assert_eq!(me["agent"]["harness"], "opencode", "{me}");
+        assert_eq!(me["agent"]["session"]["id"], "s1", "{me}");
+        let me = ok(&call_in_session(&client, "s2", "whoami", json!({})).await);
+        assert_eq!(me["address"], frontend.as_str(), "{me}");
+    }
+
+    // Registering again from s1 returns the same address.
+    let again = ok(&call_in_session(&client, "s1", "register", json!({"name": "backend"})).await);
+    assert_eq!(again["address"], backend.as_str(), "{again}");
+
+    // Neither registration became the process-level identity.
+    let r = call(&client, "whoami", json!({})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+    // An unregistered session has no identity either.
+    let r = call_in_session(&client, "s3", "whoami", json!({})).await;
+    assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
+
+    // Mail to s1 reaches s1 only.
+    let sender = env.cli_agent("sender");
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &sender)
+        .args([
+            "send",
+            "--to",
+            &backend,
+            "--subject",
+            "for s1",
+            "--body",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inbox = ok(&call_in_session(&client, "s1", "inbox", json!({})).await);
+    assert_eq!(inbox.as_array().unwrap().len(), 1, "{inbox}");
+    let inbox = ok(&call_in_session(&client, "s2", "inbox", json!({})).await);
+    assert_eq!(inbox, json!([]), "{inbox}");
+
+    client.cancel().await.unwrap();
+}
+
+/// Under kiro V3 the MCP server's parent is a helper (`node`), not
+/// `kiro-cli`: `register` binds the nearest harness ancestor instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_prefers_harness_ancestor() {
+    let env = Env::new();
+    let fake = env.dir.path().join("kiro-cli");
+    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+    // kiro-cli -> sh (the intermediate) -> agentmail mcp. The trailing
+    // `true`s stop either shell from exec'ing its last command.
+    let script = format!("/bin/sh -c '{BIN} mcp; true'; true");
+    let transport = TokioChildProcess::new(tokio::process::Command::new(&fake).configure(|c| {
+        c.arg("-c")
+            .arg(&script)
+            .env("AGENTMAIL_DATA_DIR", env.data_dir())
+            .env("AGENTMAIL_SOCKET", env.socket())
+            .env_remove("AGENTMAIL_ADDRESS")
+            .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_BIN")
+            .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("KIRO_SESSION_ID")
+            .current_dir(&env.work);
+    }))
+    .unwrap();
+    let client = ClientConfig::default().serve(transport).await.unwrap();
+
+    ok(&call(&client, "register", json!({"name": "kiroagent"})).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["harness"], "kiro", "{me}");
 
     client.cancel().await.unwrap();
 }
