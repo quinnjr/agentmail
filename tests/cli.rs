@@ -1127,3 +1127,28 @@ fn kiro_cli_after_mcp_register_resolves_by_process() {
     assert_eq!(me["agent"]["session"]["harness"], "kiro", "{me}");
     assert_eq!(me["agent"]["session"]["id"], "k1", "{me}");
 }
+
+/// opencode runs every session in one process, so a `register` under it
+/// without OPENCODE_SESSION_ID would make the agent the identity of the
+/// whole shared process. It is refused, whatever `--harness` says, and no
+/// agent is created.
+#[test]
+fn opencode_register_without_session_is_refused() {
+    let env = Env::new();
+    for extra in [&[][..], &["--harness", "other"][..]] {
+        let out = env
+            .under("opencode")
+            .args(["register", "plain", "--json"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        let err = json(&out);
+        assert_eq!(err["error"]["code"], "InvalidInput", "{err}");
+        let message = err["error"]["message"].as_str().unwrap();
+        assert!(message.contains("OPENCODE_SESSION_ID"), "{message}");
+        assert!(message.contains("shared between sessions"), "{message}");
+    }
+    let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
+    assert_eq!(v, serde_json::json!([]), "{v}");
+}

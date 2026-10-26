@@ -49,6 +49,9 @@ model credentials that an isolated config does not have).
 - **Shared opencode MCP server.** A tool call without `_meta` (opencode
   omits it when the call has no session) cannot `register` on a server
   bound to opencode, so the shared server never caches an address.
+  Likewise `agentmail register` under an opencode process without
+  `OPENCODE_SESSION_ID` is refused (only `--pid` naming another process gets
+  past it), so no agent becomes the identity of the shared opencode process.
 - **Resolution order** in the CLI: `--as human`, `AGENTMAIL_ADDRESS`,
   `AGENTMAIL_HUMAN=1`, `OPENCODE_SESSION_ID` (checked as above), then
   process ancestry.

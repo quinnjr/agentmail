@@ -5,7 +5,8 @@
 //!
 //! Identity, per tool call:
 //!
-//! - `AGENTMAIL_ADDRESS`, when set, overrides everything.
+//! - `AGENTMAIL_ADDRESS`, when set, overrides everything, including the
+//!   address a `register` returns.
 //! - A call carrying an opencode session id in
 //!   `_meta["ai.opencode/sessionID"]` calls as that session
 //!   (`Caller::Session`), and `register` binds the session. opencode shares
@@ -14,7 +15,8 @@
 //! - Otherwise (Claude Code, kiro: one server per session) the server calls
 //!   as the harness process it binds to (`Caller::Procs`), so a session that
 //!   registered before (or from a hook or shell) is found again. After a
-//!   `register` without a session it calls as the returned address. A server
+//!   `register` without a session it calls as the returned address (unless
+//!   `AGENTMAIL_ADDRESS` is set). A server
 //!   bound to a harness that shares its process between sessions (opencode)
 //!   refuses `register` without a session, so it never caches an address.
 
@@ -335,6 +337,22 @@ impl AgentMailServer {
         }
     }
 
+    /// After a successful `register` returning `data`: a call made outside
+    /// any session acts as the registered address from now on, unless
+    /// `AGENTMAIL_ADDRESS` overrides every call. A session's later calls
+    /// resolve through the daemon by session: the server is shared, so
+    /// caching its address would hand it to every other session.
+    fn remember_registered(&self, session: &CallSession, data: &Value) {
+        if self.address_env {
+            return;
+        }
+        if let (None, Some(address)) = (&session.0, data["address"].as_str()) {
+            *self.caller.lock().unwrap_or_else(|p| p.into_inner()) = Caller::Address {
+                address: address.to_string(),
+            };
+        }
+    }
+
     /// A fresh connection per call: blocking tools (`ask`, `wait_for_mail`)
     /// must not hold up the others, and a restarted daemon is picked up.
     async fn client(&self) -> Result<Client, ClientError> {
@@ -459,14 +477,7 @@ impl AgentMailServer {
         };
         Ok(match self.request(&s, req).await {
             Ok(data) => {
-                // A session's later calls resolve through the daemon by
-                // session: the server is shared, so caching its address would
-                // hand it to every other session.
-                if let (None, Some(address)) = (&s.0, data["address"].as_str()) {
-                    *self.caller.lock().unwrap_or_else(|p| p.into_inner()) = Caller::Address {
-                        address: address.to_string(),
-                    };
-                }
+                self.remember_registered(&s, &data);
                 json_result(&data, false)
             }
             Err(e) => error_result(&e),
@@ -788,6 +799,46 @@ mod tests {
         };
         let s = server(true, addr.clone());
         assert_eq!(s.caller(&in_session), addr);
+    }
+
+    #[test]
+    fn mcp_register_caches_the_address_unless_overridden() {
+        let paths = Paths::from_vars(|k| {
+            (k == "AGENTMAIL_DATA_DIR" || k == "AGENTMAIL_SOCKET")
+                .then(|| std::ffi::OsString::from("/nonexistent"))
+        })
+        .unwrap();
+        let server = |address_env: bool, caller: Caller| AgentMailServer {
+            paths: paths.clone(),
+            address_env,
+            caller: Arc::new(Mutex::new(caller)),
+            bind: None,
+            tool_router: AgentMailServer::tool_router(),
+        };
+        let registered = json!({"address": "new-87654321"});
+        let new = Caller::Address {
+            address: "new-87654321".into(),
+        };
+        let none = CallSession(None);
+        // Without the override, a sessionless register sets the caller.
+        let s = server(false, Caller::Procs { procs: vec![] });
+        s.remember_registered(&none, &registered);
+        assert_eq!(s.caller(&none), new);
+        // A register in a session caches nothing.
+        let s = server(false, Caller::Procs { procs: vec![] });
+        let in_session = CallSession(Some(SessionKey {
+            harness: Harness::Opencode,
+            id: "s1".into(),
+        }));
+        s.remember_registered(&in_session, &registered);
+        assert_eq!(s.caller(&none), Caller::Procs { procs: vec![] });
+        // AGENTMAIL_ADDRESS keeps overriding after a register.
+        let env = Caller::Address {
+            address: "env-12345678".into(),
+        };
+        let s = server(true, env.clone());
+        s.remember_registered(&none, &registered);
+        assert_eq!(s.caller(&none), env);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::daemon::handler::MAX_WAIT;
 use crate::daemon::{DaemonConfig, serve_until, shutdown_signal};
 use crate::identity;
 use crate::ids::now_ms;
-use crate::model::{AgentView, HUMAN, Harness, MAX_BODY_BYTES, Message};
+use crate::model::{AgentView, HUMAN, Harness, MAX_BODY_BYTES, Message, ProcId, SessionKey};
 use crate::paths::Paths;
 use crate::protocol::{Caller, ErrorCode, PROTOCOL_VERSION, Request};
 use crate::store::{ThreadFilter, ThreadSummary};
@@ -479,6 +479,15 @@ pub(crate) fn absolute(p: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Whether `register` should tell the user to act as the new agent through
+/// `AGENTMAIL_ADDRESS`: the agent is bound to no process and no session the
+/// CLI resolves callers by. Only sessions of a harness that shares its
+/// process (opencode) are used to find the caller; a kiro session is not
+/// (see [`identity::cli_caller`]).
+fn unbound_hint(proc_id: Option<ProcId>, session: Option<&SessionKey>) -> bool {
+    proc_id.is_none() && !session.is_some_and(|k| k.harness.shares_process())
+}
+
 fn harness_from(s: &str) -> Result<Harness> {
     serde_json::from_value(Value::String(s.to_string()))
         .map_err(|_| anyhow!("unknown harness {s:?}"))
@@ -768,7 +777,25 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             // Only the session of the harness this process runs under
             // counts, not one inherited from an outer harness.
             let session = identity::env_session();
-            let has_session = session.is_some();
+            // A harness that runs every session in one process (opencode)
+            // has no identity of its own: binding its process without a
+            // session would make the agent the caller of every session's
+            // sessionless calls. `--harness` does not change the binding,
+            // so only `--pid` naming another process gets past this.
+            if session.is_none() && detected.shares_process() {
+                return Err(ClientError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "this {} process is shared between sessions and \
+                         OPENCODE_SESSION_ID is not set, so it cannot register; \
+                         run register from an opencode session's shell, or bind \
+                         another process with --pid",
+                        detected.as_str()
+                    ),
+                )
+                .into());
+            }
+            let hint = unbound_hint(proc_id, session.as_ref());
             let harness = match (harness, &session) {
                 (Some(h), _) => harness_from(&h)?,
                 (None, Some(k)) => k.harness,
@@ -796,7 +823,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 if let Some(n) = d["released"].as_u64().filter(|n| *n > 0) {
                     out.push_str(&format!("{n} held message(s) delivered to you\n"));
                 }
-                if proc_id.is_none() && !has_session {
+                if hint {
                     out.push_str(&format!(
                         "not bound to a process: set AGENTMAIL_ADDRESS={address} to act as it\n"
                     ));
@@ -1253,6 +1280,26 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_unbound_hint_unless_resolvable() {
+        let p = ProcId {
+            pid: 42,
+            start_time: 7,
+        };
+        let key = |harness| SessionKey {
+            harness,
+            id: "s1".into(),
+        };
+        assert!(unbound_hint(None, None));
+        assert!(!unbound_hint(Some(p), None));
+        // An opencode session resolves the CLI caller by itself.
+        assert!(!unbound_hint(None, Some(&key(Harness::Opencode))));
+        // A kiro session does not: CLI calls resolve by process, so an agent
+        // with no process is reachable only through AGENTMAIL_ADDRESS.
+        assert!(unbound_hint(None, Some(&key(Harness::Kiro))));
+        assert!(!unbound_hint(Some(p), Some(&key(Harness::Kiro))));
     }
 
     #[test]
