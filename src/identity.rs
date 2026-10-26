@@ -157,7 +157,8 @@ fn caller_from(
 ///    (`sh -c`), and a session-bound opencode agent's process is the
 ///    opencode process itself, whichever path registered it. The harness
 ///    must sit above `explicit_pid`: a pid that names a process above it
-///    (say the terminal that launched it) is bound exactly.
+///    (say the terminal that launched it) is bound exactly. The MCP server
+///    ([`mcp_bind`]) narrows this further: see there.
 ///
 ///    This narrows the plan's rule (prefer the harness ancestor for every
 ///    explicit pid) on purpose, for Claude Code: an unknown MCP client run
@@ -168,8 +169,7 @@ fn caller_from(
 ///    mcp'`) binds the wrapper, so CLI calls and hooks from Claude Code's
 ///    shell (which find the agent through Claude Code's process) do not
 ///    find it. Claude Code configs should run `agentmail mcp` directly, or
-///    `exec` it from a wrapper. opencode is safe, as its sessionless
-///    registrations are refused (the server is shared).
+///    `exec` it from a wrapper.
 /// 2. Any other `explicit_pid` (`register --pid`, or a parent that is a
 ///    harness, has no kiro or opencode above it, or sits above it): exactly
 ///    that process, with the harness its command name suggests.
@@ -186,16 +186,74 @@ pub fn register_proc(explicit_pid: Option<u32>) -> Option<(ProcId, Harness)> {
 
 /// [`register_proc`] for process `me`.
 fn register_proc_for(me: u32, explicit_pid: Option<u32>) -> Option<(ProcId, Harness)> {
-    register_proc_with(me, explicit_pid, procinfo::find_harness_ancestor)
+    register_proc_with(me, explicit_pid, procinfo::find_harness_ancestor, |_| true)
+}
+
+/// The process the MCP server's `register` binds to, given its `parent`:
+/// [`register_proc`], except that rule 1 (an explicit pid redirected to the
+/// kiro or opencode process above it) applies only when that harness
+/// started the server itself, not when the server belongs to some other
+/// MCP client run from the harness's shell
+/// ([`launched_from_harness_shell`]). Such a client (another agent tool, an
+/// MCP inspector) binds its own process, as under Claude Code: redirected,
+/// it would bind kiro-cli and take over the agent kiro's own server
+/// registered, or bind opencode and be refused as a sessionless call on
+/// opencode's shared server.
+pub fn mcp_bind(parent: Option<u32>) -> Option<(ProcId, Harness)> {
+    let me = std::process::id();
+    register_proc_with(
+        me,
+        parent,
+        procinfo::find_harness_ancestor,
+        started_by_harness(me),
+    )
+}
+
+/// [`mcp_bind`]'s rule-1 filter for process `me`: the harness found may
+/// take the binding only when it started `me` itself.
+fn started_by_harness(me: u32) -> impl Fn(&(ProcId, Harness)) -> bool {
+    move |(p, h)| !launched_from_harness_shell(me, p, *h, procinfo::env_var)
+}
+
+/// Whether process `me` was started from a shell command of `harness_proc`
+/// (a `harness` process above `me`), rather than by the harness itself.
+///
+/// kiro and opencode set their session variable (`KIRO_SESSION_ID`,
+/// `OPENCODE_SESSION_ID`) for the commands their shell tool runs, but not
+/// for their MCP servers (see docs/harness-notes.md). So a process between
+/// `me` (inclusive) and the harness whose environment, as it was started,
+/// carries that variable came from the harness's shell. An MCP client that
+/// passes its server a cleaned environment does not hide this: the client
+/// process itself still carries the variable. A value the harness process
+/// carries itself does not count: it was inherited from an outer session
+/// (kiro run from a kiro shell), and the harness passes it on to everything
+/// it starts.
+fn launched_from_harness_shell(
+    me: u32,
+    harness_proc: &ProcId,
+    harness: Harness,
+    environ: impl Fn(u32, &str) -> Option<OsString>,
+) -> bool {
+    let Some((name, _)) = SESSION_VARS.into_iter().find(|(_, h)| *h == harness) else {
+        return false;
+    };
+    let inherited = environ(harness_proc.pid, name);
+    std::iter::once(me)
+        .chain(procinfo::ancestors(me).into_iter().map(|p| p.pid))
+        .take_while(|pid| *pid != harness_proc.pid)
+        .filter_map(|pid| environ(pid, name).filter(|v| !v.is_empty()))
+        .any(|v| Some(&v) != inherited.as_ref())
 }
 
 /// [`register_proc_for`] with the harness-ancestor lookup injected, so the
 /// grandparent fallback can be tested even when the tests themselves run
-/// under a harness.
+/// under a harness, and with `redirect` deciding whether rule 1 may hand an
+/// explicit pid to the kiro or opencode process found above it.
 fn register_proc_with(
     me: u32,
     explicit_pid: Option<u32>,
     find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+    redirect: impl Fn(&(ProcId, Harness)) -> bool,
 ) -> Option<(ProcId, Harness)> {
     let usable = |p: &ProcId| p.pid > 1;
     if let Some(pid) = explicit_pid {
@@ -203,8 +261,9 @@ fn register_proc_with(
         let harness = procinfo::comm(pid).map_or(Harness::Other, |c| procinfo::detect_harness(&c));
         if harness == Harness::Other
             && procinfo::ancestors(me).contains(&p)
-            && let Some(found) = find_harness(pid)
-                .filter(|(h, k)| usable(h) && (*k == Harness::Kiro || k.shares_process()))
+            && let Some(found) = find_harness(pid).filter(|(h, k)| {
+                usable(h) && (*k == Harness::Kiro || k.shares_process()) && redirect(&(*h, *k))
+            })
         {
             return Some(found);
         }
@@ -232,6 +291,15 @@ mod tests {
             .map(|(k, v)| (k.to_string(), OsString::from(v)))
             .collect();
         move |k| map.get(k).cloned()
+    }
+
+    /// [`register_proc_with`] as the CLI runs it: rule 1 always redirects.
+    fn redirecting(
+        me: u32,
+        explicit_pid: Option<u32>,
+        find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+    ) -> Option<(ProcId, Harness)> {
+        register_proc_with(me, explicit_pid, find_harness, |_| true)
     }
 
     /// A harness-ancestor lookup that finds none.
@@ -530,11 +598,11 @@ mod tests {
         let me = procinfo::proc_id(std::process::id()).unwrap();
         let shell = child.id();
         let harness = |_| Some((me, Harness::Kiro));
-        let via_parent = register_proc_with(grandchild, Some(shell), harness);
+        let via_parent = redirecting(grandchild, Some(shell), harness);
         // No harness above: the named parent itself.
-        let no_harness = register_proc_with(grandchild, Some(shell), |_| None);
+        let no_harness = redirecting(grandchild, Some(shell), |_| None);
         // A pid that is not our ancestor binds exactly, harness or not.
-        let not_ancestor = register_proc_with(me.pid, Some(grandchild), harness);
+        let not_ancestor = redirecting(me.pid, Some(grandchild), harness);
         let shell_id = procinfo::proc_id(shell);
         let sleep_id = procinfo::proc_id(grandchild);
         reap(child, grandchild);
@@ -557,7 +625,7 @@ mod tests {
                 .map(|p| (p, Harness::Kiro))
         };
         let me = procinfo::proc_id(std::process::id()).unwrap();
-        let above = register_proc_with(grandchild, Some(me.pid), kiro_above);
+        let above = redirecting(grandchild, Some(me.pid), kiro_above);
         // The lookup really does see the kiro from the sleep.
         let seen = kiro_above(grandchild).map(|(p, _)| p.pid);
         reap(child, grandchild);
@@ -572,7 +640,7 @@ mod tests {
         // binds itself.
         let (child, grandchild) = spawn_grandchild();
         let shell = child.id();
-        let found = register_proc_with(grandchild, Some(shell), under(Harness::ClaudeCode));
+        let found = redirecting(grandchild, Some(shell), under(Harness::ClaudeCode));
         let shell_id = procinfo::proc_id(shell);
         reap(child, grandchild);
         assert_eq!(found, shell_id.map(|p| (p, Harness::Other)));
@@ -584,9 +652,138 @@ mod tests {
         // (the shell here) is not bound, the opencode above it is.
         let (child, grandchild) = spawn_grandchild();
         let me = procinfo::proc_id(std::process::id()).unwrap();
-        let found = register_proc_with(grandchild, Some(child.id()), under(Harness::Opencode));
+        let found = redirecting(grandchild, Some(child.id()), under(Harness::Opencode));
         reap(child, grandchild);
         assert_eq!(found, Some((me, Harness::Opencode)));
+    }
+
+    #[test]
+    fn identity_launched_from_harness_shell_reads_the_chain() {
+        // sleep -> sh -> test process, the test process standing in for the
+        // harness. `vars` gives each pid's environment.
+        let (child, grandchild) = spawn_grandchild();
+        let shell = child.id();
+        let me = procinfo::proc_id(std::process::id()).unwrap();
+        let check = |harness: Harness, vars: &[(u32, &str, &str)]| {
+            let vars: Vec<(u32, String, OsString)> = vars
+                .iter()
+                .map(|(p, k, v)| (*p, k.to_string(), OsString::from(v)))
+                .collect();
+            launched_from_harness_shell(grandchild, &me, harness, |pid, name| {
+                vars.iter()
+                    .find(|(p, k, _)| *p == pid && k == name)
+                    .map(|(_, _, v)| v.clone())
+            })
+        };
+        let kiro = Harness::Kiro;
+        // (harness, each pid's variables, launched from its shell?)
+        type Case<'a> = (Harness, Vec<(u32, &'a str, &'a str)>, bool);
+        let cases: Vec<Case> = vec![
+            // Nothing set: the harness started the chain.
+            (kiro, vec![], false),
+            // The harness's shell, or the server itself, carries it.
+            (kiro, vec![(shell, ENV_KIRO_SESSION, "k1")], true),
+            (kiro, vec![(grandchild, ENV_KIRO_SESSION, "k1")], true),
+            // Empty does not count.
+            (kiro, vec![(shell, ENV_KIRO_SESSION, "")], false),
+            // Only the variable of the harness found counts.
+            (kiro, vec![(shell, ENV_OPENCODE_SESSION, "o1")], false),
+            (
+                Harness::Opencode,
+                vec![(shell, ENV_OPENCODE_SESSION, "o1")],
+                true,
+            ),
+            // Inherited by the harness itself (kiro run from a kiro shell).
+            (
+                kiro,
+                vec![
+                    (me.pid, ENV_KIRO_SESSION, "outer"),
+                    (shell, ENV_KIRO_SESSION, "outer"),
+                ],
+                false,
+            ),
+            (
+                kiro,
+                vec![
+                    (me.pid, ENV_KIRO_SESSION, "outer"),
+                    (shell, ENV_KIRO_SESSION, "inner"),
+                ],
+                true,
+            ),
+            // A harness with no session variable never counts.
+            (
+                Harness::ClaudeCode,
+                vec![(shell, ENV_KIRO_SESSION, "k1")],
+                false,
+            ),
+        ];
+        let got: Vec<bool> = cases.iter().map(|(h, v, _)| check(*h, v)).collect();
+        reap(child, grandchild);
+        let want: Vec<bool> = cases.iter().map(|(_, _, w)| *w).collect();
+        assert_eq!(got, want);
+    }
+
+    /// Spawn `sh -c 'sleep 5 & echo $!; wait'` with `vars` set and return
+    /// the shell child and the PID of its `sleep` grandchild.
+    fn spawn_grandchild_with(vars: &[(&str, &str)]) -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5 & echo $!; wait")
+            .envs(vars.iter().copied())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (child, line.trim().parse().unwrap())
+    }
+
+    #[test]
+    fn identity_mcp_bind_skips_harness_redirect_from_its_shell() {
+        // kiro-cli (the test process) -> sh with KIRO_SESSION_ID set (kiro's
+        // shell tool running another MCP client) -> that client's server
+        // (the sleep). The server binds the client's process, not kiro-cli,
+        // so it cannot take over the agent kiro's own server registered.
+        let me = procinfo::proc_id(std::process::id()).unwrap();
+        let value = format!("agentmail-test-{}", me.pid);
+        for (harness, var) in [
+            (Harness::Kiro, ENV_KIRO_SESSION),
+            (Harness::Opencode, ENV_OPENCODE_SESSION),
+        ] {
+            let (child, sleep) = spawn_grandchild_with(&[(var, &value)]);
+            let shell = procinfo::proc_id(child.id());
+            let from_shell = register_proc_with(
+                sleep,
+                Some(child.id()),
+                under(harness),
+                started_by_harness(sleep),
+            );
+            // The CLI's `register --pid $$` in that shell still redirects.
+            let cli = redirecting(sleep, Some(child.id()), under(harness));
+            reap(child, sleep);
+            assert_eq!(
+                from_shell,
+                shell.map(|p| (p, Harness::Other)),
+                "{harness:?}"
+            );
+            assert_eq!(cli, Some((me, harness)), "{harness:?}");
+
+            // Started by the harness itself (no variable): redirected.
+            let (child, sleep) = spawn_grandchild_with(&[]);
+            let by_harness = register_proc_with(
+                sleep,
+                Some(child.id()),
+                under(harness),
+                started_by_harness(sleep),
+            );
+            reap(child, sleep);
+            // Any value the test process itself carries is inherited by
+            // the whole chain, and so ignored.
+            assert_eq!(by_harness, Some((me, harness)), "{harness:?}");
+        }
     }
 
     #[test]
@@ -608,7 +805,7 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         let grandchild: u32 = line.trim().parse().unwrap();
-        let found = register_proc_with(grandchild, Some(child.id()), under(Harness::Kiro));
+        let found = redirecting(grandchild, Some(child.id()), under(Harness::Kiro));
         let parent = procinfo::proc_id(child.id());
         reap(child, grandchild);
         assert_eq!(found, parent.map(|p| (p, Harness::Opencode)));
@@ -619,7 +816,7 @@ mod tests {
         // With no harness ancestor, the sleep binds to its grandparent: the
         // test process itself (sleep -> sh -> test process).
         let (child, grandchild) = spawn_grandchild();
-        let found = register_proc_with(grandchild, None, |_| None);
+        let found = redirecting(grandchild, None, |_| None);
         let shell_saw_us = procinfo::parent_pid(child.id());
         reap(child, grandchild);
         let me = std::process::id();
@@ -636,8 +833,7 @@ mod tests {
         // grandparent.
         let (child, grandchild) = spawn_grandchild();
         let init = procinfo::proc_id(1);
-        let found =
-            register_proc_with(grandchild, None, |_| init.map(|p| (p, Harness::ClaudeCode)));
+        let found = redirecting(grandchild, None, |_| init.map(|p| (p, Harness::ClaudeCode)));
         reap(child, grandchild);
         let me = std::process::id();
         assert_eq!(
@@ -662,6 +858,6 @@ mod tests {
             _ => me,
         };
         assert_eq!(procinfo::ancestors(x).get(1).map(|p| p.pid).unwrap_or(1), 1);
-        assert_eq!(register_proc_with(x, None, |_| None), None);
+        assert_eq!(redirecting(x, None, |_| None), None);
     }
 }

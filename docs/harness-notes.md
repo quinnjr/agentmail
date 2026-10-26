@@ -44,8 +44,9 @@ model credentials that an isolated config does not have).
     `kiro-cli-chat` process in between is not a harness name (it is
     detected as other), so the binding skips it too and reaches `kiro-cli`
     (test `bind_skips_kiro_cli_chat`). An unknown MCP client run from a
-    Claude Code shell binds its own parent instead (see opencode below for
-    the other exception). What sits between `kiro-cli-chat` and `node` was
+    Claude Code shell binds its own parent instead, and so does one run
+    from a kiro or opencode shell (see "MCP clients run from a harness
+    shell" below). What sits between `kiro-cli-chat` and `node` was
     not observed live: in an isolated `HOME`/`KIRO_HOME` the real
     `kiro-cli chat` stops at the browser login prompt before starting the
     engine (no credentials in isolation). The binding does not depend on
@@ -67,7 +68,11 @@ model credentials that an isolated config does not have).
   bound to opencode, so the shared server never caches an address.
   Likewise `agentmail register` under an opencode process without
   `OPENCODE_SESSION_ID` is refused (only `--pid` naming a process outside
-  that opencode gets past it), so no agent becomes the identity of the shared opencode process.
+  that opencode gets past it), so no agent becomes the identity of the
+  shared opencode process. A server that is not opencode's own (another
+  MCP client run from its bash tool, below) is not bound to opencode and
+  not shared. The refusal names the cause: the server was started by
+  opencode, which shares it between its sessions.
 - **opencode MCP server behind a wrapper.** When opencode starts the
   server through a wrapper (opencode -> `sh -c` -> agentmail mcp), the
   server's parent is the wrapper, but a session `register` over MCP binds
@@ -92,6 +97,39 @@ model credentials that an isolated config does not have).
   command directly, so a plain `agentmail mcp` config (or a wrapper that
   `exec`s it) is unaffected. Pinned by the test
   `claude_code_wrapper_binds_the_wrapper`.
+- **MCP clients run from a harness shell (kiro, opencode).** Another MCP
+  client with agentmail configured (codex, gemini-cli, an MCP inspector)
+  can be started from kiro's shell tool or opencode's bash tool. Its
+  `agentmail mcp` has a non-harness parent with kiro-cli or opencode above
+  it, exactly like the server kiro's engine or an opencode wrapper starts.
+  Redirected to the harness, it would do harm: under kiro it binds
+  kiro-cli and, on `register`, displaces the agent kiro's own server bound
+  there (that agent loses its process, and the newcomer, sessionless and of
+  the same harness, inherits its session), so kiro's shell commands and
+  hooks then resolve to the foreign agent; under opencode it counts as
+  opencode's shared server and every sessionless `register` is refused
+  with an opencode session-id error, though the client is not opencode.
+  Decision: the MCP server redirects to the harness only when the harness
+  started it. kiro and opencode set their session variable
+  (`KIRO_SESSION_ID`, `OPENCODE_SESSION_ID`) for shell commands but not
+  for MCP servers (see above), so when any process from the server up to
+  (not including) the harness was started with that harness's variable,
+  the server came from the harness's shell: it binds its parent exactly,
+  as under Claude Code, and is not treated as shared. The environment
+  checked is each process's start environment (`/proc/<pid>/environ`), so
+  a client that hands its server a cleaned environment (the MCP SDKs pass
+  only a few default variables) is still caught through the client process
+  itself. A value the harness process itself carries is ignored: it was
+  inherited from an outer session (kiro run from a kiro shell) and passed
+  on to everything the harness starts. Known limit: a client that clears
+  its own start environment is not detected and binds the harness. The
+  CLI's `register --pid $$` in such a shell keeps the redirect (it is the
+  harness's own session registering). Pinned by
+  `client_from_kiro_shell_binds_itself`,
+  `client_from_opencode_shell_binds_itself` and
+  `identity_mcp_bind_skips_harness_redirect_from_its_shell`. Like the
+  Claude Code decision, this follows from the process model and the
+  bundle reading above, not a live model run.
 - **`register --pid` under opencode.** A `--pid` naming a non-harness
   ancestor (the shell, `$$`) is redirected to the opencode process above it,
   and so refused without a session like any other sessionless opencode

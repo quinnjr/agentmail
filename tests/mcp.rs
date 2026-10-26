@@ -679,7 +679,7 @@ async fn opencode_via_wrapper_refuses_sessionless_register() {
     let r = call(&client, "register", json!({"name": "nosession"})).await;
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
     assert!(text(&r).contains("no opencode session id"), "{}", text(&r));
-    assert!(text(&r).contains("opencode"), "{}", text(&r));
+    assert!(text(&r).contains("started by opencode"), "{}", text(&r));
     let r = call(&client, "whoami", json!({})).await;
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
     assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
@@ -769,6 +769,106 @@ async fn bind_skips_kiro_cli_chat() {
     let me = ok(&call(&client, "whoami", json!({})).await);
     assert_eq!(me["agent"]["harness"], "kiro", "{me}");
     assert_eq!(me["agent"]["proc_id"]["pid"], kiro, "{me}");
+
+    client.cancel().await.unwrap();
+}
+
+/// Run `$MCP` as another MCP client (a copy of `/bin/sh` named `client`)
+/// would from a harness shell that sets `var=value`: the shell snippet
+/// for [`Env::mcp_under`], and the file the client writes its pid to.
+fn from_harness_shell(env: &Env, client: &str, var: &str, value: &str) -> (String, PathBuf) {
+    let fake = env.dir.path().join(client);
+    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+    let pid_file = env.dir.path().join(format!("{client}.pid"));
+    let script = format!(
+        "{var}={value} /bin/sh -c \"'{}' -c 'echo \\$\\$ > {}; $MCP; true'; true\"; true",
+        fake.display(),
+        pid_file.display()
+    );
+    (script, pid_file)
+}
+
+fn read_pid(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Another MCP client run from kiro's shell tool (kiro-cli -> sh with
+/// `KIRO_SESSION_ID` -> the client -> agentmail mcp) binds its own process.
+/// Redirected to kiro-cli, it would take over the agent kiro's own server
+/// registered there.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_from_kiro_shell_binds_itself() {
+    let env = Env::new();
+    let (script, client_pid) = from_harness_shell(&env, "codex", "KIRO_SESSION_ID", "k1");
+    let (client, kiro) = env.mcp_under("kiro-cli", &script).await;
+    let foreign = read_pid(&client_pid);
+
+    // The agent kiro's own server registered, bound to kiro-cli.
+    let out = env
+        .cmd()
+        .args(["register", "kiroagent", "--json", "--pid"])
+        .arg(kiro.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kiro_agent: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kiro_address = kiro_agent["address"].as_str().unwrap().to_string();
+
+    let r = ok(&call(&client, "register", json!({"name": "foreign"})).await);
+    assert!(
+        r["address"].as_str().unwrap().starts_with("foreign-"),
+        "{r}"
+    );
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["proc_id"]["pid"], foreign, "{me}");
+    assert_eq!(me["agent"]["harness"], "other", "{me}");
+
+    // kiro's agent keeps its binding.
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &kiro_address)
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let who: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(who["address"], kiro_address.as_str(), "{who}");
+    assert_eq!(who["agent"]["proc_id"]["pid"], kiro, "{who}");
+
+    client.cancel().await.unwrap();
+}
+
+/// Another MCP client run from opencode's bash tool (opencode -> sh with
+/// `OPENCODE_SESSION_ID` -> the client -> agentmail mcp) is not opencode's
+/// shared server: it binds its own process and registers without a
+/// session.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_from_opencode_shell_binds_itself() {
+    let env = Env::new();
+    let (script, client_pid) = from_harness_shell(&env, "gemini", "OPENCODE_SESSION_ID", "o1");
+    let (client, _opencode) = env.mcp_under("opencode", &script).await;
+    let foreign = read_pid(&client_pid);
+
+    let r = ok(&call(&client, "register", json!({"name": "foreign"})).await);
+    assert!(
+        r["address"].as_str().unwrap().starts_with("foreign-"),
+        "{r}"
+    );
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["proc_id"]["pid"], foreign, "{me}");
+    assert_eq!(me["agent"]["harness"], "other", "{me}");
 
     client.cancel().await.unwrap();
 }

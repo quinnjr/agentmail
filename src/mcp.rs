@@ -1,8 +1,9 @@
 //! `agentmail mcp`: a stdio MCP server that the harness spawns: one per
 //! session under Claude Code and kiro, and one per working directory under
-//! opencode, shared by every opencode session there. Each tool forwards one request to the daemon (started
-//! on demand) and returns the daemon's JSON `data` as text; a daemon error
-//! becomes a tool error carrying `{"error":{code,message,candidates}}`.
+//! opencode, shared by every opencode session there. Each tool forwards one
+//! request to the daemon (started on demand) and returns the daemon's JSON
+//! `data` as text; a daemon error becomes a tool error carrying
+//! `{"error":{code,message,candidates}}`.
 //!
 //! Identity, per tool call:
 //!
@@ -22,6 +23,10 @@
 //!   (opencode) refuses `register` without a session, so it never caches an
 //!   address, and tells any other sessionless call that it carried no
 //!   session id instead of suggesting a `register` it would refuse.
+//! - A server that another MCP client run from a kiro or opencode shell
+//!   started binds that client's process, not the harness above it
+//!   ([`identity::mcp_bind`]), so it neither takes over the harness's own
+//!   agent nor counts as opencode's shared server.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -254,9 +259,11 @@ pub struct AgentMailServer {
     /// harness above it), if usable.
     bind: Option<(ProcId, Harness)>,
     /// The harness whose sessions share this server, if any: the bound
-    /// process's harness or any harness above the server (opencode may
-    /// start it through a wrapper such as `sh -c`). A call made outside
-    /// any session then has no identity of its own.
+    /// process's harness. [`identity::mcp_bind`] binds the opencode process
+    /// when opencode started the server, directly or through a wrapper
+    /// such as `sh -c`, and the client's own process when another MCP
+    /// client run from opencode's shell did, which is then not shared. A
+    /// call made outside any session then has no identity of its own.
     shared: Option<Harness>,
     tool_router: ToolRouter<Self>,
 }
@@ -316,8 +323,9 @@ fn error_result(e: &ClientError) -> CallToolResult {
 /// cannot `what`.
 fn no_session_message(shared: Harness, what: &str) -> String {
     format!(
-        "this {h} MCP server is shared between sessions and the call carried \
-         no {h} session id, so it cannot {what}",
+        "this MCP server was started by {h}, which shares it between \
+         its sessions, and the call carried no {h} session id, so it \
+         cannot {what}",
         h = shared.as_str()
     )
 }
@@ -329,17 +337,13 @@ fn invalid(message: impl Into<String>) -> CallToolResult {
 impl AgentMailServer {
     pub fn new(paths: Paths) -> AgentMailServer {
         let parent = procinfo::parent_pid(std::process::id());
-        let bind = identity::register_proc(parent);
+        let bind = identity::mcp_bind(parent);
         // The same process `register` binds to (never init or a subreaper
         // the server was reparented to), so lookup and registration agree.
         let address = std::env::var(ENV_ADDRESS).ok();
         let address_env = address.as_deref().is_some_and(|a| !a.is_empty());
         let caller = initial_caller(address, bind.map(|(p, _)| p));
-        let shared = bind
-            .map(|(_, h)| h)
-            .into_iter()
-            .chain(procinfo::find_harness_ancestor(std::process::id()).map(|(_, h)| h))
-            .find(|h| h.shares_process());
+        let shared = bind.map(|(_, h)| h).filter(|h| h.shares_process());
         AgentMailServer {
             paths,
             address_env,

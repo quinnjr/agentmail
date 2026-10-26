@@ -401,6 +401,14 @@ processes, so they find their address through the harness process they share
   (`sh -c 'agentmail mcp'`), the server binds the wrapper, and CLI calls and
   hooks from Claude Code's shell, which look up Claude Code's process, do not
   find that agent.
+- The same holds under kiro and opencode for an MCP client run from their
+  shell (codex, gemini-cli or an inspector started from kiro's shell tool or
+  opencode's bash tool): such a server binds the client's own process, not
+  kiro-cli or opencode, so it neither takes over the agent kiro's own server
+  registered nor counts as opencode's shared server. agentmail tells the two
+  apart by the session variable (`KIRO_SESSION_ID`, `OPENCODE_SESSION_ID`)
+  that these harnesses set for shell commands but not for their own MCP
+  servers.
 - `AGENTMAIL_ADDRESS=<address>` overrides the lookup, for unusual setups.
 
 The CLI resolves who it is acting as in this order:

@@ -71,6 +71,25 @@ pub fn comm(pid: u32) -> Option<String> {
     }
 }
 
+/// Environment variable `name` of process `pid`, as the process was started
+/// (`/proc/<pid>/environ`). `None` when unset or unreadable.
+pub fn env_var(pid: u32, name: &str) -> Option<std::ffi::OsString> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+        raw.split(|b| *b == 0).find_map(|entry| {
+            let value = entry.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+            Some(std::ffi::OsStr::from_bytes(value).to_os_string())
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, name);
+        None
+    }
+}
+
 /// Map a process command name to the harness it belongs to.
 pub fn detect_harness(comm: &str) -> Harness {
     match comm {
@@ -231,6 +250,38 @@ mod tests {
             assert!(!chain.is_empty());
             assert_eq!(Some(chain[0].pid), parent_pid(me));
             assert!(chain.iter().all(|p| p.pid != me));
+        }
+
+        #[test]
+        fn procinfo_env_var_reads_a_child_environment() {
+            // The shell prints a line once it runs: until it has exec'd, the
+            // forked child still shows the test process's environment.
+            use std::io::BufRead;
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("echo ready; sleep 5")
+                .env("AGENTMAIL_TEST_ENV", "v=1")
+                .env("AGENTMAIL_TEST_ENV_EMPTY", "")
+                .env_remove("AGENTMAIL_TEST_ENV_UNSET")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let pid = child.id();
+            let set = env_var(pid, "AGENTMAIL_TEST_ENV");
+            let empty = env_var(pid, "AGENTMAIL_TEST_ENV_EMPTY");
+            let prefix = env_var(pid, "AGENTMAIL_TEST");
+            let unset = env_var(pid, "AGENTMAIL_TEST_ENV_UNSET");
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_eq!(set, Some("v=1".into()));
+            assert_eq!(empty, Some("".into()));
+            assert_eq!(prefix, None);
+            assert_eq!(unset, None);
+            assert_eq!(env_var(u32::MAX, "PATH"), None);
         }
 
         #[test]
