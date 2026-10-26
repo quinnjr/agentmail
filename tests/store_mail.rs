@@ -1214,3 +1214,80 @@ fn ids_ending_with_matches_any_message_case_insensitively() {
     assert_eq!(s.ids_ending_with("").unwrap().len(), 2);
     assert!(s.ids_ending_with("@@@@").unwrap().is_empty());
 }
+
+// Harness Task 2: the surfaced flag.
+
+fn urgent(from: &str, to: &[&str], subject: &str) -> NewMessage {
+    NewMessage {
+        urgent: true,
+        ..note(from, to, subject, "now")
+    }
+}
+
+#[test]
+fn unsurfaced_urgent_lists_unread_unsurfaced_urgent_oldest_first() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let u1 = s.insert_message(urgent(&a, &[&b], "one"), 1).unwrap();
+    s.insert_message(note(&a, &[&b], "calm", "x"), 2).unwrap();
+    let u2 = s.insert_message(urgent(&a, &[&b], "two"), 3).unwrap();
+    let u3 = s.insert_message(urgent(&a, &[&b], "three"), 4).unwrap();
+    assert_eq!(
+        ids(&s.unsurfaced_urgent(&b).unwrap()),
+        vec![u1.id.as_str(), u2.id.as_str(), u3.id.as_str()]
+    );
+    // The sender's mailbox has none of it.
+    assert!(s.unsurfaced_urgent(&a).unwrap().is_empty());
+
+    // Read mail is never surfaced.
+    s.mark_read(&b, std::slice::from_ref(&u3.id)).unwrap();
+    s.mark_surfaced(&b, std::slice::from_ref(&u1.id)).unwrap();
+    assert_eq!(ids(&s.unsurfaced_urgent(&b).unwrap()), vec![u2.id.as_str()]);
+
+    // Surfaced is separate from read.
+    assert_eq!(s.unread(&b).unwrap().len(), 3);
+    assert_eq!(s.unread_counts(&b).unwrap(), (3, 0));
+    // Marking read after surfacing keeps it read (and surfaced).
+    s.mark_read(&b, std::slice::from_ref(&u1.id)).unwrap();
+    assert_eq!(s.unread(&b).unwrap().len(), 2);
+    assert_eq!(ids(&s.unsurfaced_urgent(&b).unwrap()), vec![u2.id.as_str()]);
+}
+
+#[test]
+fn mark_surfaced_ignores_foreign_and_unknown_ids() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    let u = s.insert_message(urgent(&a, &[&b], "one"), 1).unwrap();
+    s.mark_surfaced(&a, &[u.id.clone(), "nope".into()]).unwrap();
+    s.mark_surfaced(&b, &[]).unwrap();
+    assert_eq!(ids(&s.unsurfaced_urgent(&b).unwrap()), vec![u.id.as_str()]);
+    // No mailbox row is created for the sender.
+    assert!(s.inbox(&a, true).unwrap().is_empty());
+    // Twice is the same as once.
+    s.mark_surfaced(&b, std::slice::from_ref(&u.id)).unwrap();
+    s.mark_surfaced(&b, std::slice::from_ref(&u.id)).unwrap();
+    assert!(s.unsurfaced_urgent(&b).unwrap().is_empty());
+    assert_eq!(ids(&s.unread(&b).unwrap()), vec![u.id.as_str()]);
+}
+
+#[test]
+fn surface_urgent_returns_each_message_once() {
+    let (_d, s) = store();
+    let a = agent(&s, "backend", None);
+    let b = agent(&s, "frontend", None);
+    assert!(s.surface_urgent(&b).unwrap().is_empty());
+    let u1 = s.insert_message(urgent(&a, &[&b], "one"), 1).unwrap();
+    s.insert_message(note(&a, &[&b], "calm", "x"), 2).unwrap();
+    let u2 = s.insert_message(urgent(&a, &[&b], "two"), 3).unwrap();
+    assert_eq!(
+        ids(&s.surface_urgent(&b).unwrap()),
+        vec![u1.id.as_str(), u2.id.as_str()]
+    );
+    assert!(s.surface_urgent(&b).unwrap().is_empty());
+    assert!(s.unsurfaced_urgent(&b).unwrap().is_empty());
+    assert_eq!(s.unread(&b).unwrap().len(), 3);
+    let u3 = s.insert_message(urgent(&a, &[&b], "three"), 4).unwrap();
+    assert_eq!(ids(&s.surface_urgent(&b).unwrap()), vec![u3.id.as_str()]);
+}

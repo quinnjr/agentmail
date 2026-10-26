@@ -1271,6 +1271,7 @@ impl Handler {
                 }
                 Ok(Value::Array(out))
             }
+            Request::HookStatus { surface_urgent } => self.hook_status(caller, surface_urgent),
             Request::Counts => {
                 let me = self.resolve_caller(caller)?;
                 let (unread, open_questions) = self.store.unread_counts(&me).map_err(store_err)?;
@@ -1323,6 +1324,45 @@ impl Handler {
                 "handled by the connection loop",
             )),
         }
+    }
+
+    /// See [`Request::HookStatus`].
+    fn hook_status(&self, caller: &Caller, surface_urgent: bool) -> Result<Value, ClientError> {
+        let me = self.resolve_caller(caller)?;
+        if me == HUMAN {
+            return Err(human_has_no("hook status"));
+        }
+        let agent = self
+            .store
+            .get_agent(&me)
+            .map_err(store_err)?
+            .ok_or_else(|| ClientError::new(ErrorCode::NotFound, format!("no agent {me:?}")))?;
+        let (unread, _) = self.store.unread_counts(&me).map_err(store_err)?;
+        let mut open_questions = Vec::new();
+        for q in self.store.open_questions_to(&me).map_err(store_err)? {
+            // A question whose message is gone (pruned) has nothing to show.
+            if let Some(m) = self.store.get_message(&q.id).map_err(store_err)? {
+                open_questions.push(json!({
+                    "id": m.id,
+                    "from": m.from,
+                    "subject": m.subject,
+                }));
+            }
+        }
+        let urgent = if surface_urgent {
+            self.store.surface_urgent(&me)
+        } else {
+            self.store.unsurfaced_urgent(&me)
+        }
+        .map_err(store_err)?;
+        Ok(json!({
+            "address": agent.address,
+            "name": agent.name,
+            "wake": agent.wake,
+            "unread": unread,
+            "open_questions": open_questions,
+            "urgent": to_json(&urgent)?,
+        }))
     }
 
     fn register(&self, mut req: RegisterReq) -> Result<Value, ClientError> {

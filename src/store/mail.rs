@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::questions::is_open;
 use super::{
-    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, RegisterReq, Registered, Store,
-    StoreError, THREADS, all_json, encode, get_json,
+    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, READ, RegisterReq, Registered,
+    SURFACED, Store, StoreError, THREADS, all_json, encode, get_json,
 };
 use crate::ids::{new_message_id, validate_name};
 use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message, Presence};
@@ -193,19 +193,39 @@ fn all_threads(
     Ok(out)
 }
 
-/// `addr`'s mailbox rows: `(message id, read)`, in id order.
+/// `addr`'s mailbox rows: `(message id, flags)`, in id order.
 fn mailbox_rows(
-    mailbox: &impl ReadableTable<(&'static str, &'static str), bool>,
+    mailbox: &impl ReadableTable<(&'static str, &'static str), u8>,
     addr: &str,
-) -> Result<Vec<(String, bool)>, StoreError> {
+) -> Result<Vec<(String, u8)>, StoreError> {
     let mut out = Vec::new();
     for row in mailbox.range((addr, "")..)? {
-        let (key, read) = row?;
+        let (key, flags) = row?;
         let (a, id) = key.value();
         if a != addr {
             break;
         }
-        out.push((id.to_string(), read.value()));
+        out.push((id.to_string(), flags.value()));
+    }
+    Ok(out)
+}
+
+/// `addr`'s urgent mail that is neither read nor surfaced, in id order.
+fn unsurfaced_urgent_in(
+    mailbox: &impl ReadableTable<(&'static str, &'static str), u8>,
+    messages: &impl ReadableTable<&'static str, &'static [u8]>,
+    addr: &str,
+) -> Result<Vec<Message>, StoreError> {
+    let mut out = Vec::new();
+    for (id, flags) in mailbox_rows(mailbox, addr)? {
+        if flags & (READ | SURFACED) != 0 {
+            continue;
+        }
+        if let Some(msg) = get_json::<Message>(messages, &id)?
+            && msg.urgent
+        {
+            out.push(msg);
+        }
     }
     Ok(out)
 }
@@ -262,10 +282,10 @@ pub(crate) fn agent_repo_key(agent: &Agent) -> Option<String> {
     repo_key(agent.repo.as_deref().unwrap_or(&agent.cwd)).ok()
 }
 
-/// A mailbox listing for `addr`: its messages paired with read state, plus
-/// which of them are open questions addressed to `addr`.
+/// A mailbox listing for `addr`: its messages paired with their mailbox
+/// flags, plus which of them are open questions addressed to `addr`.
 struct MailboxView {
-    entries: Vec<(Message, bool)>,
+    entries: Vec<(Message, u8)>,
     open: HashSet<String>,
 }
 
@@ -470,10 +490,10 @@ impl Store {
             messages.insert(msg.id.as_str(), encode(&msg)?.as_slice())?;
             threads.insert((msg.thread_id.as_str(), msg.id.as_str()), ())?;
             for addr in &msg.to {
-                mailbox.insert((addr.as_str(), msg.id.as_str()), false)?;
+                mailbox.insert((addr.as_str(), msg.id.as_str()), 0)?;
             }
             if human_joins {
-                mailbox.insert((HUMAN, msg.id.as_str()), true)?;
+                mailbox.insert((HUMAN, msg.id.as_str()), READ)?;
             }
             msg
         };
@@ -612,7 +632,7 @@ impl Store {
                 }
                 let boxed = mailbox.get((addr, id.as_str()))?.is_none();
                 if boxed {
-                    mailbox.insert((addr, id.as_str()), false)?;
+                    mailbox.insert((addr, id.as_str()), 0)?;
                 }
                 if appended || boxed {
                     released.push((msg, appended));
@@ -636,7 +656,7 @@ impl Store {
         let index = txn.open_table(OPEN_QUESTIONS)?;
         let mut entries = Vec::new();
         let mut open = HashSet::new();
-        for (id, read) in mailbox_rows(&mailbox, addr)? {
+        for (id, flags) in mailbox_rows(&mailbox, addr)? {
             let Some(msg): Option<Message> = get_json(&messages, &id)? else {
                 continue;
             };
@@ -646,7 +666,7 @@ impl Store {
             {
                 open.insert(msg.id.clone());
             }
-            entries.push((msg, read));
+            entries.push((msg, flags));
         }
         Ok(MailboxView { entries, open })
     }
@@ -663,7 +683,7 @@ impl Store {
             .map(|(m, _)| m)
             .chain(
                 rest.into_iter()
-                    .filter(|(_, read)| include_read || !read)
+                    .filter(|(_, flags)| include_read || flags & READ == 0)
                     .map(|(m, _)| m),
             )
             .collect())
@@ -675,15 +695,48 @@ impl Store {
         let MailboxView { entries, .. } = self.mailbox_view(addr)?;
         Ok(entries
             .into_iter()
-            .filter(|(_, read)| !read)
+            .filter(|(_, flags)| flags & READ == 0)
             .map(|(m, _)| m)
             .collect())
+    }
+
+    /// `addr`'s urgent mail that is neither read nor yet surfaced (see
+    /// [`Store::mark_surfaced`]), oldest first.
+    pub fn unsurfaced_urgent(&self, addr: &str) -> Result<Vec<Message>, StoreError> {
+        let txn = self.read()?;
+        unsurfaced_urgent_in(&txn.open_table(MAILBOX)?, &txn.open_table(MESSAGES)?, addr)
+    }
+
+    /// [`Store::unsurfaced_urgent`] and [`Store::mark_surfaced`] of what it
+    /// returns, in one write transaction: of concurrent callers, only one
+    /// gets each message. Takes no write transaction when there is nothing
+    /// to surface.
+    pub fn surface_urgent(&self, addr: &str) -> Result<Vec<Message>, StoreError> {
+        if self.unsurfaced_urgent(addr)?.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_write()?;
+        let out = {
+            let mut mailbox = txn.open_table(MAILBOX)?;
+            let out = unsurfaced_urgent_in(&mailbox, &txn.open_table(MESSAGES)?, addr)?;
+            for m in &out {
+                let key = (addr, m.id.as_str());
+                let flags = mailbox.get(key)?.map_or(0, |f| f.value());
+                mailbox.insert(key, flags | SURFACED)?;
+            }
+            out
+        };
+        txn.commit()?;
+        Ok(out)
     }
 
     /// `(unread messages, open questions addressed to addr)`.
     pub fn unread_counts(&self, addr: &str) -> Result<(usize, usize), StoreError> {
         let MailboxView { entries, open } = self.mailbox_view(addr)?;
-        let unread = entries.iter().filter(|(_, read)| !read).count();
+        let unread = entries
+            .iter()
+            .filter(|(_, flags)| flags & READ == 0)
+            .count();
         Ok((unread, open.len()))
     }
 
@@ -723,35 +776,48 @@ impl Store {
     /// Mark messages read for `addr`. Ids not in `addr`'s mailbox are
     /// ignored, so a whole thread can be marked read at once.
     pub fn mark_read(&self, addr: &str, ids: &[String]) -> Result<(), StoreError> {
-        // Look first under a read transaction: re-reading mail that is
-        // already read is common and must not cost a durable commit or hold
-        // the writer lock.
-        let unread: Vec<&str> = {
+        self.set_flag(addr, ids, READ)
+    }
+
+    /// Mark messages surfaced for `addr`: an urgent message was pushed to
+    /// it mid-run, so [`Store::unsurfaced_urgent`] leaves it out from now
+    /// on. Read state is unchanged. Ids not in `addr`'s mailbox are ignored.
+    pub fn mark_surfaced(&self, addr: &str, ids: &[String]) -> Result<(), StoreError> {
+        self.set_flag(addr, ids, SURFACED)
+    }
+
+    /// Set `flag` on `addr`'s mailbox rows for `ids`, keeping their other
+    /// flags. Ids not in the mailbox are ignored.
+    fn set_flag(&self, addr: &str, ids: &[String], flag: u8) -> Result<(), StoreError> {
+        // Look first under a read transaction: setting a flag that is
+        // already set (re-reading read mail, say) is common and must not
+        // cost a durable commit or hold the writer lock.
+        let missing = |flags: Option<u8>| flags.is_some_and(|f| f & flag == 0);
+        let todo: Vec<&str> = {
             let txn = self.read()?;
             let mailbox = txn.open_table(MAILBOX)?;
-            let mut unread = Vec::new();
+            let mut todo = Vec::new();
             for id in ids {
-                if mailbox
-                    .get((addr, id.as_str()))?
-                    .is_some_and(|read| !read.value())
-                {
-                    unread.push(id.as_str());
+                if missing(mailbox.get((addr, id.as_str()))?.map(|f| f.value())) {
+                    todo.push(id.as_str());
                 }
             }
-            unread
+            todo
         };
-        if unread.is_empty() {
+        if todo.is_empty() {
             return Ok(());
         }
         let txn = self.db.begin_write()?;
         {
             let mut mailbox = txn.open_table(MAILBOX)?;
-            for id in unread {
-                // Re-check under the writer lock: the entry may have gone
-                // (pruned) since the read above.
-                let still_unread = mailbox.get((addr, id))?.is_some_and(|read| !read.value());
-                if still_unread {
-                    mailbox.insert((addr, id), true)?;
+            for id in todo {
+                // Re-read under the writer lock: the entry may have gone
+                // (pruned) or changed since the read above.
+                let current = mailbox.get((addr, id))?.map(|f| f.value());
+                if let Some(flags) = current
+                    && flags & flag == 0
+                {
+                    mailbox.insert((addr, id), flags | flag)?;
                 }
             }
         }

@@ -24,8 +24,23 @@ pub(crate) const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("ag
 pub(crate) const CONTACTS: TableDefinition<(&str, &str), ()> = TableDefinition::new("contacts");
 /// Messages by id (ULID). Value: JSON [`crate::model::Message`].
 pub(crate) const MESSAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("messages");
-/// Per-recipient delivery and read state: `(address, message id) -> read`.
-pub(crate) const MAILBOX: TableDefinition<(&str, &str), bool> = TableDefinition::new("mailbox");
+/// Per-recipient delivery state: `(address, message id) -> flags`, a set
+/// of [`READ`] and [`SURFACED`]. A row with no flags is delivered, unread
+/// and not yet surfaced.
+///
+/// Not named `mailbox`: a schema-1 build opens its bool `mailbox` table
+/// before checking the schema version, and redb refuses a table opened
+/// under another value type, so reusing the name would turn that build's
+/// clear "schema version 2" refusal into a type-mismatch error.
+pub(crate) const MAILBOX: TableDefinition<(&str, &str), u8> = TableDefinition::new("mailbox_flags");
+/// [`MAILBOX`] flag: the recipient has read the message.
+pub(crate) const READ: u8 = 0b01;
+/// [`MAILBOX`] flag: an urgent message was pushed to the recipient mid-run
+/// (see [`Store::mark_surfaced`]). Independent of [`READ`].
+pub(crate) const SURFACED: u8 = 0b10;
+/// The mailbox as schema 1 stored it: `(address, message id) -> read`.
+/// Only the migration opens it, and deletes it.
+const MAILBOX_V1: TableDefinition<(&str, &str), bool> = TableDefinition::new("mailbox");
 /// Thread membership: `(thread id, message id)`.
 pub(crate) const THREADS: TableDefinition<(&str, &str), ()> = TableDefinition::new("threads");
 /// Mail held for a name not yet registered: `(repo, name, message id)`.
@@ -43,7 +58,7 @@ pub(crate) const META: TableDefinition<&str, &str> = TableDefinition::new("meta"
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The on-disk schema this build reads and writes.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 /// Errors from store operations.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -117,6 +132,22 @@ impl Store {
         let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
         let txn = db.begin_write()?;
         {
+            let mut meta = txn.open_table(META)?;
+            let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());
+            match existing.as_deref() {
+                None => {
+                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)?;
+                }
+                Some(SCHEMA_VERSION) => {}
+                Some("1") => {
+                    migrate_mailbox_v1(&txn)?;
+                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)?;
+                }
+                Some(v) => bail!(
+                    "{} has schema version {v}, this build supports {SCHEMA_VERSION}",
+                    path.display()
+                ),
+            }
             txn.open_table(AGENTS)?;
             txn.open_table(CONTACTS)?;
             txn.open_table(MESSAGES)?;
@@ -126,18 +157,6 @@ impl Store {
             txn.open_table(QUESTIONS)?;
             txn.open_table(SESSIONS)?;
             questions::rebuild_open_index(&txn)?;
-            let mut meta = txn.open_table(META)?;
-            let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());
-            match existing {
-                None => {
-                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)?;
-                }
-                Some(v) if v == SCHEMA_VERSION => {}
-                Some(v) => bail!(
-                    "{} has schema version {v}, this build supports {SCHEMA_VERSION}",
-                    path.display()
-                ),
-            }
         }
         txn.commit()?;
         Ok(Store { db })
@@ -147,6 +166,29 @@ impl Store {
     pub(crate) fn read(&self) -> Result<redb::ReadTransaction, StoreError> {
         Ok(self.db.begin_read()?)
     }
+}
+
+/// Schema 1 to 2: move every row of the old bool mailbox into [`MAILBOX`]
+/// as flags (`true` becomes [`READ`], `false` no flags) and delete the old
+/// table, inside the caller's write transaction, so the version bump
+/// commits with it or not at all.
+fn migrate_mailbox_v1(txn: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let mut rows = Vec::new();
+    {
+        let old = txn.open_table(MAILBOX_V1)?;
+        for row in old.iter()? {
+            let (key, read) = row?;
+            let (addr, id) = key.value();
+            rows.push((addr.to_string(), id.to_string(), read.value()));
+        }
+    }
+    txn.delete_table(MAILBOX_V1)?;
+    let mut mailbox = txn.open_table(MAILBOX)?;
+    for (addr, id, read) in rows {
+        let flags = if read { READ } else { 0 };
+        mailbox.insert((addr.as_str(), id.as_str()), flags)?;
+    }
+    Ok(())
 }
 
 /// Encode a record as JSON.
@@ -199,6 +241,121 @@ mod tests {
             .err()
             .expect("schema 999 must be refused");
         assert!(err.to_string().contains("schema version 999"), "{err}");
+    }
+
+    fn v1_message(id: &str, to: &str) -> crate::model::Message {
+        crate::model::Message {
+            id: id.into(),
+            thread_id: id.into(),
+            in_reply_to: None,
+            from_human: true,
+            from: crate::model::HUMAN.into(),
+            to: vec![to.into()],
+            subject: format!("subject {id}"),
+            body: "body".into(),
+            kind: crate::model::Kind::Note,
+            urgent: true,
+            refs: Vec::new(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn migrates_schema_1_mailbox() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("agentmail.redb");
+        let addr = "backend-aaaaaaaa";
+        {
+            // A schema-1 database as the core build wrote it: no sessions
+            // table, a bool mailbox.
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut messages = txn.open_table(MESSAGES).unwrap();
+                let mut threads = txn.open_table(THREADS).unwrap();
+                let mut mailbox = txn.open_table(MAILBOX_V1).unwrap();
+                for (id, read) in [("01AREAD", true), ("01BUNREAD", false)] {
+                    let m = v1_message(id, addr);
+                    messages.insert(id, encode(&m).unwrap().as_slice()).unwrap();
+                    threads.insert((id, id), ()).unwrap();
+                    mailbox.insert((addr, id), read).unwrap();
+                }
+                txn.open_table(META)
+                    .unwrap()
+                    .insert(SCHEMA_VERSION_KEY, "1")
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        {
+            let txn = store.read().unwrap();
+            let meta = txn.open_table(META).unwrap();
+            assert_eq!(meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(), "2");
+            let mailbox = txn.open_table(MAILBOX).unwrap();
+            assert_eq!(
+                mailbox.get((addr, "01AREAD")).unwrap().unwrap().value(),
+                READ
+            );
+            assert_eq!(
+                mailbox.get((addr, "01BUNREAD")).unwrap().unwrap().value(),
+                0
+            );
+        }
+        let ids = |msgs: Vec<crate::model::Message>| -> Vec<String> {
+            msgs.into_iter().map(|m| m.id).collect()
+        };
+        assert_eq!(ids(store.inbox(addr, false).unwrap()), vec!["01BUNREAD"]);
+        assert_eq!(
+            ids(store.inbox(addr, true).unwrap()),
+            vec!["01AREAD", "01BUNREAD"]
+        );
+        // Read state survives; surfaced starts clear.
+        assert_eq!(
+            ids(store.unsurfaced_urgent(addr).unwrap()),
+            vec!["01BUNREAD"]
+        );
+
+        // The old table is gone.
+        {
+            let txn = store.read().unwrap();
+            let names: Vec<String> = txn
+                .list_tables()
+                .unwrap()
+                .map(|t| redb::TableHandle::name(&t).to_string())
+                .collect();
+            assert!(!names.iter().any(|n| n == "mailbox"), "{names:?}");
+        }
+        drop(store);
+
+        // Opening the migrated database again changes nothing.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(ids(store.inbox(addr, false).unwrap()), vec!["01BUNREAD"]);
+        assert_eq!(
+            ids(store.unsurfaced_urgent(addr).unwrap()),
+            vec!["01BUNREAD"]
+        );
+    }
+
+    /// A schema-1 build opens every table, its bool `mailbox` among them,
+    /// before checking the version. On a schema-2 database that must
+    /// succeed, so the build gets to its clear "schema version 2" refusal
+    /// instead of failing on a table type mismatch.
+    #[test]
+    fn schema_1_build_reaches_its_version_check_on_schema_2() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("agentmail.redb");
+        let store = Store::open(&path).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            txn.open_table(MAILBOX_V1)
+                .expect("a schema-1 build must be able to open its mailbox");
+            let meta = txn.open_table(META).unwrap();
+            assert_eq!(meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(), "2");
+        }
+        // The old build bails here, so its transaction never commits.
+        txn.abort().unwrap();
     }
 
     #[test]

@@ -386,3 +386,177 @@ async fn old_protocol_client_rejected() {
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
 }
+
+// Harness Task 2: hook status and the surfaced flag.
+
+fn hook_status(surface_urgent: bool) -> Request {
+    Request::HookStatus { surface_urgent }
+}
+
+fn urgent_req(to: &str, subject: &str) -> Request {
+    Request::Send {
+        to: vec![to.to_string()],
+        subject: subject.to_string(),
+        body: "now".to_string(),
+        urgent: true,
+        refs: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn urgent_surfaced_once() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let h = FakeHarness::spawn();
+    let cwd = d.dir.path();
+    let a = address(&register(&mut c, "backend", cwd, Some(h.id), "s1", "api").await);
+    c.call(&Caller::Human, urgent_req(&a, "fire"))
+        .await
+        .unwrap();
+    // Not urgent: never surfaced as urgent.
+    c.call(&Caller::Human, send_req(&[&a], "calm", "later"))
+        .await
+        .unwrap();
+
+    // Peeking does not surface.
+    let peek = c.call(&session("s1"), hook_status(false)).await.unwrap();
+    assert_eq!(peek["urgent"].as_array().unwrap().len(), 1, "{peek}");
+
+    let first = c.call(&session("s1"), hook_status(true)).await.unwrap();
+    let urgent = first["urgent"].as_array().unwrap();
+    assert_eq!(urgent.len(), 1, "{first}");
+    assert_eq!(urgent[0]["subject"], "fire");
+    assert_eq!(urgent[0]["urgent"], true);
+
+    let second = c.call(&session("s1"), hook_status(true)).await.unwrap();
+    assert!(second["urgent"].as_array().unwrap().is_empty(), "{second}");
+    assert_eq!(second["unread"], 2);
+
+    // Surfaced is not read.
+    let inbox = c
+        .call(&session("s1"), Request::Inbox { all: false })
+        .await
+        .unwrap();
+    assert_eq!(inbox.as_array().unwrap().len(), 2, "{inbox}");
+
+    // A wait still returns at once: surfaced-but-unread mail is unread.
+    let waited = c
+        .call(&session("s1"), Request::WaitForMail { timeout_secs: 5 })
+        .await
+        .unwrap();
+    assert_eq!(waited["status"], "mail");
+    assert_eq!(waited["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn read_urgent_mail_is_not_surfaced() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let h = FakeHarness::spawn();
+    let cwd = d.dir.path();
+    let a = address(&register(&mut c, "backend", cwd, Some(h.id), "s1", "api").await);
+    let msg = c
+        .call(&Caller::Human, urgent_req(&a, "fire"))
+        .await
+        .unwrap();
+    c.call(
+        &session("s1"),
+        Request::Read {
+            id: msg["id"].as_str().unwrap().to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let status = c.call(&session("s1"), hook_status(true)).await.unwrap();
+    assert!(status["urgent"].as_array().unwrap().is_empty(), "{status}");
+    assert_eq!(status["unread"], 0);
+}
+
+#[tokio::test]
+async fn hook_status_lists_open_questions_and_counts() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let h = FakeHarness::spawn();
+    let cwd = d.dir.path();
+    let a = address(&register(&mut c, "backend", cwd, Some(h.id), "s1", "api").await);
+    let b = address(&register(&mut c, "frontend", cwd, Some(h.id), "s2", "ui").await);
+    let ask = |to: &str, subject: &str| Request::Ask {
+        to: vec![to.to_string()],
+        subject: subject.to_string(),
+        body: "?".to_string(),
+        refs: Vec::new(),
+        urgent: false,
+        timeout_secs: 0,
+    };
+    let q1 = c.call(&Caller::Human, ask(&a, "first")).await.unwrap();
+    let q2 = c.call(&session("s2"), ask(&a, "second")).await.unwrap();
+    // A question a asks is not one a must answer.
+    let docs = address(&register(&mut c, "docs", cwd, Some(h.id), "s3", "docs").await);
+    c.call(&session("s1"), ask(&docs, "mine")).await.unwrap();
+    c.call(&Caller::Human, send_req(&[&a], "note", "hi"))
+        .await
+        .unwrap();
+
+    let status = c.call(&session("s1"), hook_status(false)).await.unwrap();
+    assert_eq!(status["address"], a.as_str());
+    assert_eq!(status["name"], "backend");
+    assert_eq!(status["wake"], true);
+    assert_eq!(status["unread"], 3, "{status}");
+    let open = status["open_questions"].as_array().unwrap();
+    assert_eq!(open.len(), 2, "{status}");
+    assert_eq!(open[0]["id"], q1["question_id"]);
+    assert_eq!(open[0]["from"], "human");
+    assert_eq!(open[0]["subject"], "first");
+    assert_eq!(open[1]["id"], q2["question_id"]);
+    assert_eq!(open[1]["from"], b.as_str());
+    assert_eq!(open[1]["subject"], "second");
+    assert!(status["urgent"].as_array().unwrap().is_empty());
+
+    // Answering closes it; reading does not.
+    let q1_id = q1["question_id"].as_str().unwrap().to_string();
+    c.call(&session("s1"), Request::Read { id: q1_id.clone() })
+        .await
+        .unwrap();
+    let status = c.call(&session("s1"), hook_status(false)).await.unwrap();
+    assert_eq!(status["open_questions"].as_array().unwrap().len(), 2);
+    assert_eq!(status["unread"], 2);
+    c.call(
+        &session("s1"),
+        Request::Reply {
+            message_id: q1_id,
+            body: "yes".into(),
+            urgent: false,
+            refs: Vec::new(),
+            answer: true,
+        },
+    )
+    .await
+    .unwrap();
+    let status = c.call(&session("s1"), hook_status(false)).await.unwrap();
+    let open = status["open_questions"].as_array().unwrap();
+    assert_eq!(open.len(), 1, "{status}");
+    assert_eq!(open[0]["id"], q2["question_id"]);
+}
+
+#[tokio::test]
+async fn hook_status_unregistered_is_no_identity() {
+    let d = TestDaemon::start().await;
+    let mut c = d.client().await;
+    let err = c
+        .call(&session("nobody"), hook_status(true))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NoIdentity);
+    // A signed-off session is unregistered too.
+    let h = FakeHarness::spawn();
+    register(&mut c, "backend", d.dir.path(), Some(h.id), "s1", "api").await;
+    c.call(&session("s1"), Request::Signoff).await.unwrap();
+    let err = c.call(&session("s1"), hook_status(true)).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NoIdentity);
+    // The human has no hook status.
+    let err = c
+        .call(&Caller::Human, hook_status(false))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+}

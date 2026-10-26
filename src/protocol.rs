@@ -161,10 +161,24 @@ pub enum Request {
         question_id: String,
         timeout_secs: u64,
     },
-    /// Block until the caller has unread mail (at once if it already has):
-    /// `{"status":"mail","messages":[Message]}`, or `{"status":"timeout"}`.
+    /// Block until the caller has unread mail: at once if it already has
+    /// some (surfaced but unread mail counts), otherwise when mail is
+    /// delivered to it. Data: `{"status":"mail","messages":[unread
+    /// Message]}`, or `{"status":"timeout"}`.
     WaitForMail {
         timeout_secs: u64,
+    },
+    /// What a harness hook needs about the caller, in one round trip.
+    /// Data: `{"address", "name", "wake", "unread": count,
+    /// "open_questions": [{"id","from","subject"}], "urgent": [Message]}`.
+    /// `open_questions` are those addressed to the caller, oldest first;
+    /// `urgent` is its urgent mail that is neither read nor surfaced yet,
+    /// oldest first. With `surface_urgent`, those messages are marked
+    /// surfaced, so the next call leaves them out; their read state is
+    /// unchanged. Agents only (`InvalidInput` for the human).
+    HookStatus {
+        #[serde(default)]
+        surface_urgent: bool,
     },
     Inbox {
         /// Include read messages.
@@ -329,6 +343,19 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Request::Shutdown).unwrap(),
             json!({"op":"shutdown"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::HookStatus {
+                surface_urgent: true
+            })
+            .unwrap(),
+            json!({"op":"hook_status","surface_urgent":true})
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({"op":"hook_status"})).unwrap(),
+            Request::HookStatus {
+                surface_urgent: false
+            }
         );
         assert_eq!(
             serde_json::to_value(Request::ResolveId { id: "x".into() }).unwrap(),
