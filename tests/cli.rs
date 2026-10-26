@@ -1073,6 +1073,31 @@ fn inherited_opencode_session_is_ignored() {
     assert_eq!(me["address"], backend.as_str(), "{me}");
 }
 
+/// A process detached from opencode (a tmux server or `setsid` job started
+/// from its bash tool) keeps OPENCODE_SESSION_ID but has no opencode
+/// ancestor, so it is not that session.
+#[test]
+fn opencode_session_without_opencode_ancestor_is_ignored() {
+    let env = Env::new();
+    ok_json(
+        env.under("opencode")
+            .env("OPENCODE_SESSION_ID", "s1")
+            .args(["register", "backend", "--json"]),
+    );
+    let out = env
+        .cmd()
+        .env("OPENCODE_SESSION_ID", "s1")
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("not registered"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 /// kiro's MCP server registers by process alone (kiro passes it no session
 /// id), while kiro's shell commands carry KIRO_SESSION_ID. The CLI in that
 /// shell still resolves to the agent the MCP server registered.

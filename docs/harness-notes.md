@@ -45,7 +45,13 @@ model credentials that an isolated config does not have).
   bash tool sees `OPENCODE_SESSION_ID`). The CLI only uses the variable of
   the harness it actually runs under: the nearest harness ancestor's
   (`opencode` → `OPENCODE_SESSION_ID`, kiro → `KIRO_SESSION_ID`, Claude Code
-  → none). With no harness ancestor the variables are trusted as set.
+  → none). With no harness ancestor the variables are ignored too: a
+  process detached from opencode (a tmux server, `setsid` or `nohup` job
+  started from its bash tool, reparented to init) keeps
+  `OPENCODE_SESSION_ID` but is no longer part of that session, and a real
+  opencode session always has an `opencode` process (`opencode serve
+  --stdio` under `run --standalone`, 2.0.27) above its shell and MCP
+  children.
 - **Shared opencode MCP server.** A tool call without `_meta` (opencode
   omits it when the call has no session) cannot `register` on a server
   bound to opencode, so the shared server never caches an address.

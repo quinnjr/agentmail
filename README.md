@@ -286,9 +286,12 @@ Pass `--as human`, or set it once in your shell profile:
 export AGENTMAIL_HUMAN=1
 ```
 
-Without one of those, the CLI looks for an agent registration in its process
-ancestry, and errors if it finds none. It never falls back to acting as you, so
-an agent whose ancestry lookup fails can't send mail with your authority.
+Without one of those, the CLI resolves an agent identity (see
+[Binding a session to its address](#binding-a-session-to-its-address)): an
+explicit `AGENTMAIL_ADDRESS`, then the opencode session it runs in, then an
+agent registration in its process ancestry. It errors if it finds none. It
+never falls back to acting as you, so an agent whose lookup fails can't send
+mail with your authority.
 
 Mail from `human` carries `from_human: true`, and agents are told it overrides
 any agreement between them.
@@ -354,14 +357,39 @@ broadcast to everyone.
 ### Binding a session to its address
 
 The MCP server, shell commands and (later) hooks of one agent are separate
-processes, so they find their address through the harness process they share:
+processes, so they find their address through the harness process they share
+(or, under opencode, the session):
 
 - `agentmail mcp` binds the registration to its parent, the harness process,
-  storing its PID and start time (which guards against PID reuse).
+  storing its PID and start time (which guards against PID reuse). kiro-cli
+  starts its MCP servers from a `node` helper, so when the parent is not a
+  harness and a `kiro-cli` sits above it, the nearest `kiro-cli` is bound
+  instead.
+- opencode runs every session in one process and shares one MCP server
+  between them, so it binds sessions, not processes. A tool call carrying
+  `_meta["ai.opencode/sessionID"]` acts as that session, and `register` binds
+  the session. In opencode's shell the CLI reads `OPENCODE_SESSION_ID`. A
+  `register` with no session under an opencode process (an MCP call without
+  `_meta`, or a shell without `OPENCODE_SESSION_ID`) is refused, so no agent
+  becomes the identity of the shared process; `register --pid` naming another
+  process still works.
+- Session variables count only under the harness that sets them: the CLI
+  uses `OPENCODE_SESSION_ID` only when its nearest harness ancestor is
+  opencode. A `claude` started from an opencode shell, or a tmux or `setsid`
+  job detached from opencode, inherits the variable but does not act as that
+  session.
 - CLI calls walk up their process ancestors and use the nearest one with a live
   registration. `agentmail register` from a shell binds to the nearest
   harness ancestor (`--pid` picks one explicitly).
 - `AGENTMAIL_ADDRESS=<address>` overrides the lookup, for unusual setups.
+
+The CLI resolves who it is acting as in this order:
+
+1. `--as human`
+2. `AGENTMAIL_ADDRESS`
+3. `AGENTMAIL_HUMAN=1`
+4. the opencode session (`OPENCODE_SESSION_ID`, under an opencode process)
+5. process ancestry
 
 An agent is **active** while its harness process is alive, and **gone** once it
 exits or the agent calls `signoff`. Gone agents stay in the directory and mail
@@ -378,10 +406,8 @@ never taken. `register --fresh` (MCP: `fresh: true`) always gets a new address.
 
 ## Known limitations
 
-- **One address per harness process.** Subagents share their parent's address.
-- **opencode multi-session.** Several opencode sessions inside one opencode
-  server process share a harness process, so they share one address. Run
-  separate opencode processes for agents that need separate addresses.
+- **One address per harness process** for Claude Code and kiro-cli (opencode
+  gets one per session). Their subagents share the parent's address.
 - macOS process inspection is not implemented yet; Linux and WSL are the
   supported platforms.
 
@@ -394,7 +420,7 @@ adds.
 |---|---|---|---|
 | MCP server and tools | yes | yes | yes |
 | Agent guidance via MCP `instructions` | yes | yes | yes |
-| Identity by process ancestry | yes | yes (one address per process) | yes |
+| Agent identity | by process ancestry (one address per process) | by session (one address per session) | by process ancestry (bound to the nearest `kiro-cli`) |
 | CLI from the agent's shell | yes | yes | yes |
 | Waking idle agents | `wait_for_mail` tool (guided) | `wait_for_mail` tool (guided) | `wait_for_mail` tool (guided) |
 | `agentmail install` / `uninstall` | planned | planned | planned |

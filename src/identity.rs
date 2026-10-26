@@ -53,13 +53,17 @@ pub fn session_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<Sessio
 /// outer `OPENCODE_SESSION_ID` on to its own commands. Only the variable of
 /// the harness this process actually runs under counts, so with a harness
 /// ancestor that sets none (Claude Code) there is no session. With no
-/// harness ancestor at all the environment is trusted as is.
+/// harness ancestor at all there is no session either: a process detached
+/// from its harness (a tmux server, `setsid` or `nohup` job started from an
+/// opencode bash tool, reparented to init) still carries the variable, but
+/// is no longer part of that session. A real opencode session always has
+/// its `opencode` process above its shell and MCP children.
 pub fn session_for(
     var: impl Fn(&str) -> Option<OsString>,
     nearest: Option<Harness>,
 ) -> Option<SessionKey> {
     match nearest {
-        None | Some(Harness::Other) => session_from_env(var),
+        None | Some(Harness::Other) => None,
         Some(h) => SESSION_VARS
             .into_iter()
             .find(|(_, vh)| *vh == h)
@@ -314,9 +318,10 @@ mod tests {
     #[test]
     fn identity_cli_caller_prefers_session_over_procs() {
         let me = std::process::id();
+        let opencode_harness = under(Harness::Opencode);
         let session = env(&[(ENV_OPENCODE_SESSION, "s1")]);
         assert_eq!(
-            caller_from(false, &session, me, none),
+            caller_from(false, &session, me, &opencode_harness),
             Caller::Session {
                 session: opencode("s1")
             }
@@ -324,14 +329,34 @@ mod tests {
         // An explicit address, the human env and --as human all beat it.
         let addr = env(&[(ENV_OPENCODE_SESSION, "s1"), (ENV_ADDRESS, "x")]);
         assert_eq!(
-            caller_from(false, &addr, me, none),
+            caller_from(false, &addr, me, &opencode_harness),
             Caller::Address {
                 address: "x".into()
             }
         );
         let human = env(&[(ENV_OPENCODE_SESSION, "s1"), (ENV_HUMAN, "1")]);
-        assert_eq!(caller_from(false, &human, me, none), Caller::Human);
-        assert_eq!(caller_from(true, &session, me, none), Caller::Human);
+        assert_eq!(
+            caller_from(false, &human, me, &opencode_harness),
+            Caller::Human
+        );
+        assert_eq!(
+            caller_from(true, &session, me, &opencode_harness),
+            Caller::Human
+        );
+    }
+
+    #[test]
+    fn identity_cli_caller_ignores_session_without_harness_ancestor() {
+        // A tmux server or `setsid` job started from an opencode bash tool
+        // keeps OPENCODE_SESSION_ID after it is reparented away from
+        // opencode; its shells are not that session.
+        let me = std::process::id();
+        let detached = env(&[(ENV_OPENCODE_SESSION, "s1")]);
+        match caller_from(false, &detached, me, none) {
+            Caller::Procs { procs } => assert_eq!(procs, procinfo::ancestors(me)),
+            other => panic!("expected Procs, got {other:?}"),
+        }
+        assert_eq!(session_in(&detached, me, none), None);
     }
 
     #[test]
@@ -388,11 +413,9 @@ mod tests {
             id: id.into(),
         };
         let both = env(&[(ENV_OPENCODE_SESSION, "o1"), (ENV_KIRO_SESSION, "k1")]);
-        assert_eq!(session_for(&both, None), Some(opencode("o1")));
-        assert_eq!(
-            session_for(&both, Some(Harness::Other)),
-            Some(opencode("o1"))
-        );
+        // No harness ancestor: the variables are inherited, not ours.
+        assert_eq!(session_for(&both, None), None);
+        assert_eq!(session_for(&both, Some(Harness::Other)), None);
         assert_eq!(
             session_for(&both, Some(Harness::Opencode)),
             Some(opencode("o1"))
