@@ -1638,21 +1638,20 @@ async fn sigint_shuts_down_cleanly() {
     exits_cleanly_on(libc::SIGINT).await;
 }
 
-/// A second signal while shutdown waits for an in-flight request exits at
-/// once with status 1, so a stuck shutdown never needs `kill -9`.
-#[tokio::test]
-async fn second_signal_exits_without_waiting() {
-    let dir = TempDir::new().unwrap();
-    let paths = Paths::in_dir(dir.path());
-    // A `git` that stalls, so registering holds the store past shutdown
-    // (until the daemon gives up on git, after 2s).
-    let fake = dir.path().join("fakebin");
+/// A fake `git` on a `PATH` (returned first) that writes its pid to the
+/// returned file and then stalls, so a request that runs it holds the store
+/// until the daemon gives up on git (after 2s).
+fn stalling_git(dir: &Path) -> (std::ffi::OsString, std::path::PathBuf) {
+    let fake = dir.join("fakebin");
     std::fs::create_dir(&fake).unwrap();
-    let started = dir.path().join("git-started");
+    let started = dir.join("git-started");
     let git = fake.join("git");
     std::fs::write(
         &git,
-        format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", started.display()),
+        format!(
+            "#!/bin/sh\necho $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            started.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1661,20 +1660,62 @@ async fn second_signal_exits_without_waiting() {
         path.push(":");
         path.push(orig);
     }
+    (path, started)
+}
 
-    let mut child = Foreground::spawn(&paths, &["daemon", "run"], Some(&path));
-    let mut c = child.serving(&paths).await;
-    let cwd = dir.path().to_path_buf();
-    let slow = tokio::spawn(async move {
-        c.call(&Caller::Human, common::register_req("slow", &cwd))
-            .await
-    });
+/// A process killed on drop, so a failing test leaves nothing behind.
+struct KillOnDrop(libc::pid_t);
+
+impl KillOnDrop {
+    fn alive(&self) -> bool {
+        // SAFETY: kill(2) with signal 0 only checks that the pid exists.
+        unsafe { libc::kill(self.0, 0) == 0 }
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: kill(2) takes plain integers and touches no memory.
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+        }
+    }
+}
+
+/// Start registering in `cwd` on `c` (which runs the stalling git), and
+/// wait until git runs. Returns the request and the git process.
+async fn stall_in_git(
+    mut c: Client,
+    cwd: &Path,
+    started: &Path,
+) -> (
+    tokio::task::JoinHandle<Result<Value, agentmail::client::ClientError>>,
+    KillOnDrop,
+) {
+    let req = common::register_req("slow", cwd);
+    let slow = tokio::spawn(async move { c.call(&Caller::Human, req).await });
     let deadline = Instant::now() + PROCESS_WAIT;
     while !started.exists() {
         assert!(!slow.is_finished(), "register ended: {:?}", slow.await);
         assert!(Instant::now() < deadline, "git never ran");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let pid = std::fs::read_to_string(started).unwrap();
+    (slow, KillOnDrop(pid.trim().parse().unwrap()))
+}
+
+/// A second signal while shutdown waits for an in-flight request exits at
+/// once with status 1, so a stuck shutdown never needs `kill -9`. It kills
+/// the commands those requests run rather than orphaning them.
+#[tokio::test]
+async fn second_signal_exits_without_waiting() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let (path, started) = stalling_git(dir.path());
+
+    let mut child = Foreground::spawn(&paths, &["daemon", "run"], Some(&path));
+    let c = child.serving(&paths).await;
+    let (slow, git) = stall_in_git(c, dir.path(), &started).await;
 
     child.signal(libc::SIGTERM);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1687,6 +1728,138 @@ async fn second_signal_exits_without_waiting() {
     assert_eq!(status.code(), Some(1), "{status:?}: {err}");
     assert!(err.contains("second signal"), "{err}");
     let _ = slow.await;
+    // Orphaned, git would sleep on for 30s; init reaps it once killed.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while git.alive() {
+        assert!(Instant::now() < deadline, "git outlived the daemon");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// What a supervised daemon (`daemon run --wait-for-lock`) records in the
+/// lock file for `paths`.
+fn supervised_record(paths: &Paths) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut rec = b"supervised\n".to_vec();
+    rec.extend_from_slice(paths.socket.as_os_str().as_bytes());
+    rec.push(b'\n');
+    rec
+}
+
+/// `systemctl restart`: while a supervised daemon stopped by SIGTERM still
+/// finishes a slow request, a client that finds no socket waits for the
+/// daemon the supervisor starts next instead of starting its own.
+#[tokio::test]
+async fn client_waits_for_the_supervisor_while_a_stopped_daemon_drains() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let (path, started) = stalling_git(dir.path());
+    let args = ["daemon", "run", "--wait-for-lock"];
+    let mut old = Foreground::spawn(&paths, &args, Some(&path));
+    let c = old.serving(&paths).await;
+    let (slow, _git) = stall_in_git(c, dir.path(), &started).await;
+
+    old.signal(libc::SIGTERM);
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while paths.socket.exists() {
+        assert!(Instant::now() < deadline, "socket never removed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(old.running(), "the old daemon did not wait for git");
+    // Starting a daemon of its own would fail: there is no such binary.
+    let client = tokio::spawn({
+        let paths = paths.clone();
+        async move { Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail")).await }
+    });
+    let (status, err) = old.exit_within(PROCESS_WAIT).await;
+    assert!(status.success(), "{status:?}: {err}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let new = Foreground::spawn(&paths, &args, None);
+    let mut c = client
+        .await
+        .unwrap()
+        .expect("the client did not wait for the supervisor");
+    assert_eq!(hello_pid(&mut c).await, u64::from(new.0.id()));
+    drop(c);
+    let _ = slow.await;
+    new.terminate().await;
+}
+
+/// `agentmail daemon stop` under `Restart=always`: once the supervised
+/// daemon has gone, a client waits for the one the supervisor starts after
+/// `RestartSec` instead of starting its own.
+#[tokio::test]
+async fn client_waits_for_the_supervisor_to_restart_a_stopped_daemon() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    std::fs::write(&paths.lock, supervised_record(&paths)).unwrap();
+    let supervisor = tokio::spawn({
+        let paths = paths.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            serve(DaemonConfig {
+                paths,
+                wait_for_lock: false,
+            })
+            .await
+        }
+    });
+    let mut c = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+        .await
+        .expect("the client did not wait for the supervisor");
+    assert_eq!(hello_pid(&mut c).await, u64::from(std::process::id()));
+    c.call(&Caller::Human, Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("daemon did not stop")
+        .unwrap()
+        .unwrap();
+}
+
+/// Without a supervisor, a client that stops an old-protocol daemon starts
+/// a new one at once rather than waiting for a successor that never comes.
+#[tokio::test]
+async fn unsupervised_version_mismatch_does_not_wait_for_a_successor() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let old = spawn_old_daemon(&paths);
+    let began = Instant::now();
+    let err = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+        .await
+        .err()
+        .expect("connected without a daemon");
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "waited {:?} before starting a daemon",
+        began.elapsed()
+    );
+    assert!(
+        format!("{err:#}").contains("/nonexistent/agentmail"),
+        "{err:#}"
+    );
+    assert_eq!(old.await.unwrap(), vec![vec!["hello", "shutdown"]]);
+}
+
+/// A signal while the daemon retries opening a busy database ends it
+/// cleanly and at once, without waiting out the retries.
+#[tokio::test]
+async fn signal_while_opening_a_busy_store_exits_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let store = agentmail::store::Store::open(&paths.db).unwrap();
+    let mut child = Foreground::spawn(&paths, &["daemon", "run"], None);
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while !paths.lock_held() {
+        assert!(child.running(), "daemon exited before taking the lock");
+        assert!(Instant::now() < deadline, "daemon never took the lock");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    child.signal(libc::SIGTERM);
+    let (status, err) = child.exit_within(Duration::from_secs(1)).await;
+    assert!(status.success(), "{status:?}: {err}");
+    assert!(!paths.socket.exists(), "socket left behind");
+    drop(store);
 }
 
 /// How long a daemon without `--wait-for-lock` takes at most to give up on
@@ -1734,6 +1907,7 @@ async fn signal_while_waiting_for_the_lock_exits_cleanly() {
 async fn version_mismatch_uses_a_daemon_the_supervisor_restarts() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
+    std::fs::write(&paths.lock, supervised_record(&paths)).unwrap();
     let old = spawn_old_daemon(&paths);
     let supervisor = tokio::spawn({
         let paths = paths.clone();

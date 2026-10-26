@@ -4,11 +4,11 @@
 //! Every method here is synchronous and may block on the database; the
 //! connection loop runs it inside `spawn_blocking`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -215,6 +215,36 @@ fn output_within(cmd: Command, limit: Duration) -> Option<Vec<u8>> {
     output_within_with(cmd, limit, kill_group).ok()
 }
 
+/// The process groups of commands running under [`output_within`], so a
+/// process exiting without waiting for them can kill them. A group is
+/// listed from spawn until just before its leader is reaped, so its id
+/// cannot have been reused by an unrelated process while listed.
+static RUNNING_GROUPS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
+/// Kill every command running under [`output_within`], with its whole
+/// process group. For a daemon about to exit without waiting for the
+/// requests that run them, which would otherwise orphan them.
+pub fn kill_running_commands() {
+    // Holding the lock keeps every listed leader unreaped (see
+    // `RUNNING_GROUPS`) until all the kills are sent.
+    let groups = RUNNING_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    for &pgid in groups.iter() {
+        kill_group(pgid);
+    }
+}
+
+/// Reap `child`, the leader of process group `pgid`, after taking the group
+/// off [`RUNNING_GROUPS`].
+fn reap(child: &mut std::process::Child, pgid: u32) {
+    RUNNING_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&pgid);
+    let _ = child.wait();
+}
+
 /// Why [`output_within_with`] gave up on a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GiveUp {
@@ -260,9 +290,13 @@ fn output_within_with(
         .map_err(|_| GiveUp::Spawn)?;
     // With `process_group(0)` the group id is the child's pid.
     let pgid = child.id();
+    RUNNING_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(pgid);
     let Some(mut stdout) = child.stdout.take() else {
         kill_group(pgid);
-        let _ = child.wait();
+        reap(&mut child, pgid);
         return Err(GiveUp::Read);
     };
     let (tx, rx) = mpsc::channel();
@@ -278,7 +312,7 @@ fn output_within_with(
             Ok(None) => {
                 // Timed out: the leader is still running, so unreaped.
                 kill_group(pgid);
-                let _ = child.wait();
+                reap(&mut child, pgid);
                 return Err(GiveUp::TimedOut);
             }
             Err(_) => {
@@ -286,7 +320,7 @@ fn output_within_with(
                 // for, so the group id may already be free: do not signal
                 // the group, only the child std still tracks.
                 let _ = child.kill();
-                let _ = child.wait();
+                reap(&mut child, pgid);
                 return Err(GiveUp::LeaderUnknown);
             }
         }
@@ -310,7 +344,7 @@ fn output_within_with(
     if out.is_err() {
         kill_group(pgid);
     }
-    let _ = child.wait();
+    reap(&mut child, pgid);
     out
 }
 

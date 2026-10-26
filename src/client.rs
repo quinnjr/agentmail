@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-use crate::paths::Paths;
+use crate::paths::{LockRecord, Paths};
 pub use crate::protocol::ClientError;
 use crate::protocol::{Caller, Envelope, ErrorCode, Event, PROTOCOL_VERSION, Request, Response};
 use crate::store::lexical;
@@ -24,11 +24,16 @@ const SPAWN_WAIT: Duration = Duration::from_secs(3);
 /// How long a running daemon may take to accept and answer `Hello` (or
 /// `Shutdown`) before the client gives up on it.
 const ANSWER_WAIT: Duration = Duration::from_secs(3);
-/// How long a client that stopped (or caught shutting down) a daemon keeps
-/// trying to reach a successor before starting one itself: long enough for
-/// a supervisor such as systemd (`RestartSec=500ms`) to start a new daemon,
-/// so the client does not race it with an unsupervised one.
+/// How long a client that finds a supervised daemon gone (its lock record
+/// says so, see [`LockRecord`]) keeps trying to reach a successor, once the
+/// lock is free, before starting a daemon itself: long enough for a
+/// supervisor such as systemd (`RestartSec=500ms`) to start a new one, so
+/// the client does not race it with an unsupervised daemon.
 const SUCCESSOR_WAIT: Duration = Duration::from_secs(2);
+/// How long a client waits for a daemon that is going away (it holds the
+/// lock but no longer listens) to finish its in-flight requests before
+/// going ahead anyway. Requests run commands under a 2s timeout.
+const DRAIN_WAIT: Duration = Duration::from_secs(5);
 /// How often to spawn again while waiting. A spawned daemon exits quietly
 /// when another holds the lock, e.g. one that is still shutting down.
 const RESPAWN_INTERVAL: Duration = Duration::from_millis(500);
@@ -296,9 +301,9 @@ impl Client {
     /// not help, as the silent one either holds the lock or is not a daemon
     /// at all.
     ///
-    /// After stopping a daemon (or finding one shutting down), the client
-    /// first waits up to [`SUCCESSOR_WAIT`] for a successor to answer, as a
-    /// supervisor restarts a daemon it runs, and only then starts its own.
+    /// Before starting a daemon, whether because none is listening, it
+    /// stopped an old-protocol one, or it found one shutting down, the
+    /// client waits for a successor: see [`Client::await_successor`].
     pub async fn connect_or_spawn_with(paths: &Paths, bin: &Path) -> Result<Client> {
         match Client::open_and_hello(paths, ANSWER_WAIT).await {
             Ok(c) => return Ok(c),
@@ -319,28 +324,72 @@ impl Client {
             }
             Err(Handshake::Refused(_, e)) => return Err(e.into()),
             Err(Handshake::TimedOut(e) | Handshake::WrongDataDir(e)) => return Err(e),
-            // Nothing listening: start a daemon below.
-            Err(Handshake::Open(_)) => {}
+            // Nothing listening, but a daemon may be on its way.
+            Err(Handshake::Open(_)) => {
+                if let Some(c) = Client::await_successor(paths).await? {
+                    return Ok(c);
+                }
+            }
         }
         Client::spawn_and_connect(paths, bin).await
     }
 
-    /// Try for up to [`SUCCESSOR_WAIT`] to reach a daemon of our protocol
-    /// that replaced one going away. `None` when none answered in time.
+    /// Wait for a daemon that replaces one going away, so as not to race a
+    /// supervisor with an unsupervised daemon. `None` when the client
+    /// should start one itself.
+    ///
+    /// While a daemon holds the lock for our socket without answering (it
+    /// is finishing in-flight requests after removing its socket), wait up
+    /// to [`DRAIN_WAIT`] for it to release the lock. Then, only if the last
+    /// daemon to hold the lock was supervised, keep trying for up to
+    /// [`SUCCESSOR_WAIT`] to reach the one its supervisor starts next.
+    /// Without a supervisor (the record says `on-demand`, or there is none)
+    /// return at once. A lock held for another socket is a misconfiguration
+    /// that [`Client::spawn_and_connect`] reports, so it is not waited for.
     async fn await_successor(paths: &Paths) -> Result<Option<Client>> {
+        let ours = |rec: &LockRecord| {
+            lexical(&rec.socket) == lexical(&paths.socket) || same_dir(&rec.socket, &paths.socket)
+        };
+        let drain_deadline = Instant::now() + DRAIN_WAIT;
+        while paths.lock_held() {
+            if !paths.lock_record().is_some_and(|r| ours(&r)) {
+                return Ok(None);
+            }
+            let left = drain_deadline.saturating_duration_since(Instant::now());
+            if let Some(c) = Client::try_successor(paths, left.max(RETRY_INTERVAL)).await? {
+                return Ok(Some(c));
+            }
+            if Instant::now() >= drain_deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+        if !paths
+            .lock_record()
+            .is_some_and(|r| r.supervised && ours(&r))
+        {
+            return Ok(None);
+        }
         let deadline = Instant::now() + SUCCESSOR_WAIT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match Client::open_and_hello(paths, left.max(RETRY_INTERVAL)).await {
-                Ok(c) => return Ok(Some(c)),
-                Err(Handshake::WrongDataDir(e)) => return Err(e),
-                // Nothing there yet, or the old daemon still going away.
-                Err(Handshake::Open(_) | Handshake::Refused(..) | Handshake::TimedOut(_)) => {}
+            if let Some(c) = Client::try_successor(paths, left.max(RETRY_INTERVAL)).await? {
+                return Ok(Some(c));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    /// One attempt to reach a daemon of our protocol within `limit`. `None`
+    /// when nothing answered it, or only a daemon going away did.
+    async fn try_successor(paths: &Paths, limit: Duration) -> Result<Option<Client>> {
+        match Client::open_and_hello(paths, limit).await {
+            Ok(c) => Ok(Some(c)),
+            Err(Handshake::WrongDataDir(e)) => Err(e),
+            Err(Handshake::Open(_) | Handshake::Refused(..) | Handshake::TimedOut(_)) => Ok(None),
         }
     }
 

@@ -300,7 +300,9 @@ pub enum DaemonAction {
     /// Serve in the foreground (what autostart runs).
     Run {
         /// If another daemon is running, wait for it to exit and then
-        /// serve, instead of exiting at once (for a systemd unit).
+        /// serve, instead of exiting at once (for a systemd unit). Also
+        /// marks the daemon supervised, so clients that find it gone wait
+        /// briefly for its restart rather than starting their own.
         #[arg(long)]
         wait_for_lock: bool,
     },

@@ -50,6 +50,9 @@ user unit at `~/.config/systemd/user/agentmail.service`:
 ```ini
 [Unit]
 Description=agentmail local agent mail daemon
+# Restart however often the daemon is stopped, e.g. by several clients
+# upgrading at once; see below.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=%h/.cargo/bin/agentmail daemon run --wait-for-lock
@@ -76,7 +79,7 @@ SIGINT: it removes its socket, drops open connections (blocked clients get
 `daemon connection lost`) and releases the lock once in-flight requests
 finish. Every acknowledged write is already durable, so `systemctl stop` loses
 nothing. A second SIGTERM or SIGINT during that wait exits at once with
-status 1.
+status 1, first killing any `git` commands those requests still run.
 
 With `--wait-for-lock`, a unit started while another daemon (say, one an
 agent started on demand) holds the lock waits for that daemon to exit and
@@ -86,8 +89,11 @@ once and leaves the other daemon serving, and a unit doing that shows as
 
 `Restart=always` brings the daemon back whenever it exits, including on
 `agentmail daemon stop` and when a client of a newer version stops an older
-daemon after an upgrade; such a client waits briefly for the restarted daemon
-rather than starting its own. So with the unit enabled:
+daemon after an upgrade. `StartLimitIntervalSec=0` lifts systemd's default
+start rate limit (5 starts in 10s), which would otherwise leave the unit
+`failed` after a burst of such stops; if you leave it out and that happens,
+`systemctl --user reset-failed agentmail` and start it again. So with the unit
+enabled:
 
 - stop the daemon with `systemctl --user stop agentmail` (and `disable` it to
   keep it stopped across logins); `agentmail daemon stop` only restarts it;
@@ -95,7 +101,24 @@ rather than starting its own. So with the unit enabled:
   agentmail`.
 
 Clients still start a daemon on demand whenever none is reachable, e.g.
-while the unit is stopped.
+while the unit is stopped. To avoid racing systemd, a daemon run with
+`--wait-for-lock` notes in its lock file that it is supervised. A client
+that finds no daemon answering first waits for one that is shutting down to
+finish its in-flight requests (up to 5s), then, if the last daemon was
+supervised, gives systemd up to 2s to start the next one before starting a
+daemon of its own. Without a supervisor neither wait applies beyond the
+shutdown, so on-demand start stays immediate. The first client after
+`systemctl --user stop` therefore takes about 2s longer to start its
+daemon.
+
+A window remains: if systemd takes longer than that to bring the daemon
+back (a slow start, or a shutdown that outlasts the 5s wait), a client
+starts an on-demand daemon, and the unit's daemon waits behind it for as
+long as it runs, which is until it is stopped. The unit then still shows
+`active (running)`, but its log (`journalctl --user -u agentmail`) ends with
+`another daemon holds ... waiting for it to exit`. To recover, run
+`agentmail daemon stop`: the on-demand daemon exits and the unit's takes
+over.
 
 The systemd user manager does not read your shell profile. If you set
 `XDG_DATA_HOME`, `XDG_RUNTIME_DIR` (systemd sets this one itself),

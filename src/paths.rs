@@ -9,6 +9,60 @@ const DB_FILE: &str = "agentmail.redb";
 const SOCKET_FILE: &str = "agentmail.sock";
 const LOCK_FILE: &str = "agentmail.lock";
 
+/// What a daemon writes to the lock file once it holds the lock, read by
+/// clients deciding whether to wait for a successor after it has gone: one
+/// line `supervised` or `on-demand`, then one line with the socket it
+/// serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockRecord {
+    /// Run by a supervisor (`daemon run --wait-for-lock`), which starts a
+    /// new daemon when this one exits.
+    pub supervised: bool,
+    /// The socket the daemon serves.
+    pub socket: PathBuf,
+}
+
+impl LockRecord {
+    const SUPERVISED: &[u8] = b"supervised";
+    const ON_DEMAND: &[u8] = b"on-demand";
+
+    /// The lock file contents for this record.
+    pub fn encode(&self) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = if self.supervised {
+            Self::SUPERVISED
+        } else {
+            Self::ON_DEMAND
+        }
+        .to_vec();
+        out.push(b'\n');
+        out.extend_from_slice(self.socket.as_os_str().as_bytes());
+        out.push(b'\n');
+        out
+    }
+
+    /// Parse lock file contents; `None` unless they are exactly a record
+    /// (an empty file, as left by an older daemon, is none).
+    pub fn decode(bytes: &[u8]) -> Option<LockRecord> {
+        use std::os::unix::ffi::OsStrExt;
+        let body = bytes.strip_suffix(b"\n")?;
+        let mut lines = body.split(|b| *b == b'\n');
+        let supervised = match lines.next()? {
+            Self::SUPERVISED => true,
+            Self::ON_DEMAND => false,
+            _ => return None,
+        };
+        let socket = lines.next().filter(|s| !s.is_empty())?;
+        if lines.next().is_some() {
+            return None;
+        }
+        Some(LockRecord {
+            supervised,
+            socket: PathBuf::from(std::ffi::OsStr::from_bytes(socket)),
+        })
+    }
+}
+
 /// Where agentmail keeps its state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -102,6 +156,12 @@ impl Paths {
         }
     }
 
+    /// The record the last daemon to take the lock left in the lock file,
+    /// if any.
+    pub fn lock_record(&self) -> Option<LockRecord> {
+        LockRecord::decode(&std::fs::read(&self.lock).ok()?)
+    }
+
     /// Put everything, socket included, in `dir`. Used by tests.
     pub fn in_dir(dir: &Path) -> Paths {
         Paths {
@@ -116,6 +176,49 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_record_round_trips_and_rejects_anything_else() {
+        for supervised in [true, false] {
+            let rec = LockRecord {
+                supervised,
+                socket: PathBuf::from("/run/user/1000/agentmail.sock"),
+            };
+            assert_eq!(LockRecord::decode(&rec.encode()), Some(rec));
+        }
+        assert_eq!(
+            LockRecord::decode(b"supervised\n/s\n"),
+            Some(LockRecord {
+                supervised: true,
+                socket: PathBuf::from("/s"),
+            })
+        );
+        for bad in [
+            &b""[..],
+            b"supervised\n",
+            b"supervised\n/s",
+            b"supervised\n\n",
+            b"maybe\n/s\n",
+            b"supervised\n/s\nextra\n",
+        ] {
+            assert_eq!(LockRecord::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn lock_record_reads_the_lock_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        assert_eq!(paths.lock_record(), None);
+        std::fs::write(&paths.lock, b"").unwrap();
+        assert_eq!(paths.lock_record(), None);
+        let rec = LockRecord {
+            supervised: true,
+            socket: paths.socket.clone(),
+        };
+        std::fs::write(&paths.lock, rec.encode()).unwrap();
+        assert_eq!(paths.lock_record(), Some(rec));
+    }
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::PathBuf;

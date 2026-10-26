@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 
 use self::handler::{Begun, Handler};
 use self::hub::{Hub, Wait, involves};
-use crate::paths::Paths;
+use crate::paths::{LockRecord, Paths};
 use crate::protocol::{
     ClientError, Envelope, ErrorCode, Event, MAX_REQUEST_BYTES, PROTOCOL_VERSION, Request, Response,
 };
@@ -83,7 +83,8 @@ pub struct DaemonConfig {
     /// When another daemon holds the lock, wait for it to be released and
     /// then serve, instead of returning at once. For a supervised daemon
     /// (`daemon run --wait-for-lock`), which must not exit just because an
-    /// on-demand daemon was already running.
+    /// on-demand daemon was already running. The daemon's [`LockRecord`]
+    /// then marks it supervised.
     pub wait_for_lock: bool,
 }
 
@@ -107,16 +108,41 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
-async fn open_store(path: &Path) -> Result<Store> {
+/// Open the store at `path`, retrying for up to [`STORE_OPEN_WAIT`] (a
+/// previous daemon in this process may still be releasing it). `None` when
+/// `stop` resolves first; it is checked between attempts, so an attempt
+/// already running finishes first. Never polls `stop` again once it has
+/// resolved.
+async fn open_store<F: Future<Output = ()>>(
+    path: &Path,
+    mut stop: Pin<&mut F>,
+) -> Result<Option<Store>> {
     let deadline = Instant::now() + STORE_OPEN_WAIT;
     loop {
         let p = path.to_path_buf();
         let res = tokio::task::spawn_blocking(move || Store::open(&p)).await?;
         match res {
-            Ok(store) => return Ok(store),
+            Ok(store) => return Ok(Some(store)),
             Err(e) if Instant::now() >= deadline => return Err(e),
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(_) => tokio::select! {
+                biased;
+                () = stop.as_mut() => return Ok(None),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            },
         }
+    }
+}
+
+/// Write `record` to the lock file we hold, for clients to read once we
+/// are gone (see [`LockRecord`]). Best effort: without it clients just do
+/// not wait for a supervisor.
+fn write_lock_record(lock: &File, path: &Path, record: &LockRecord) {
+    use std::os::unix::fs::FileExt;
+    let res = lock
+        .set_len(0)
+        .and_then(|()| lock.write_all_at(&record.encode(), 0));
+    if let Err(e) = res {
+        eprintln!("agentmail daemon: writing {}: {e}", path.display());
     }
 }
 
@@ -243,8 +269,9 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
 ///
 /// Once it has resolved, a second SIGTERM or SIGINT exits the process at
 /// once with status 1, without waiting for in-flight requests: the way out
-/// of a shutdown that is stuck. Acknowledged writes are durable either way,
-/// and the lock goes with the process.
+/// of a shutdown that is stuck. The commands those requests run (`git`)
+/// are killed first rather than orphaned. Acknowledged writes are durable
+/// either way, and the lock goes with the process.
 pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
@@ -263,6 +290,7 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
                 "agentmail daemon: second signal; exiting without waiting for \
                  in-flight requests"
             );
+            handler::kill_running_commands();
             std::process::exit(1);
         });
     })
@@ -281,7 +309,13 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 /// can own it while we hold the lock) and accept. Every fallible startup
 /// step runs before the socket appears, so a daemon that fails to start
 /// never leaves a socket without a listener behind. A `stop` that resolves
-/// during startup ends it before the socket is bound.
+/// during startup, including while the store open is retried, ends it
+/// cleanly before the socket is bound.
+///
+/// Once it holds the lock the daemon records in the lock file whether it
+/// is supervised (`wait_for_lock`) and which socket it serves (see
+/// [`LockRecord`]), so clients that find it gone know whether to wait for
+/// a supervisor to start the next one.
 pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> Result<()> {
     let paths = cfg.paths;
     let mut stop = std::pin::pin!(stop);
@@ -308,8 +342,18 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     if !locked {
         return Ok(());
     }
+    write_lock_record(
+        &lock,
+        &paths.lock,
+        &LockRecord {
+            supervised: cfg.wait_for_lock,
+            socket: paths.socket.clone(),
+        },
+    );
 
-    let store = open_store(&paths.db).await?;
+    let Some(store) = open_store(&paths.db, stop.as_mut()).await? else {
+        return Ok(());
+    };
     // Stopped while starting: leave before publishing a socket that would
     // only close again. The store is ours alone, so the lock can go with it.
     if fired(stop.as_mut()) {
