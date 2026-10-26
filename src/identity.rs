@@ -58,17 +58,22 @@ pub fn session_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<Sessio
 /// opencode bash tool, reparented to init) still carries the variable, but
 /// is no longer part of that session. A real opencode session always has
 /// its `opencode` process above its shell and MCP children.
+///
+/// A value the harness process carries itself (`environ`, its environment
+/// as it was started) does not count either: it was inherited from an
+/// outer session (opencode started from another opencode's bash tool), and
+/// the harness passes it on to everything it starts, not only its shell
+/// commands. This is the rule [`launched_from_harness_shell`] applies.
 pub fn session_for(
     var: impl Fn(&str) -> Option<OsString>,
-    nearest: Option<Harness>,
+    nearest: Option<(ProcId, Harness)>,
+    environ: impl Fn(u32, &str) -> Option<OsString>,
 ) -> Option<SessionKey> {
-    match nearest {
-        None | Some(Harness::Other) => None,
-        Some(h) => SESSION_VARS
-            .into_iter()
-            .find(|(_, vh)| *vh == h)
-            .and_then(|(name, harness)| read_session(&var, name, harness)),
-    }
+    let (proc, h) = nearest?;
+    let (name, harness) = SESSION_VARS.into_iter().find(|(_, vh)| *vh == h)?;
+    let session = read_session(&var, name, harness)?;
+    let inherited = environ(proc.pid, name).is_some_and(|v| v == session.id.as_str());
+    (!inherited).then_some(session)
 }
 
 /// [`session_for`] this process: its real environment and harness ancestor.
@@ -77,6 +82,7 @@ pub fn env_session() -> Option<SessionKey> {
         |k| std::env::var_os(k),
         std::process::id(),
         procinfo::find_harness_ancestor,
+        procinfo::env_var,
     )
 }
 
@@ -86,9 +92,10 @@ fn session_in(
     var: impl Fn(&str) -> Option<OsString>,
     pid: u32,
     find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+    environ: impl Fn(u32, &str) -> Option<OsString>,
 ) -> Option<SessionKey> {
     session_from_env(&var)?;
-    session_for(var, find_harness(pid).map(|(_, h)| h))
+    session_for(var, find_harness(pid), environ)
 }
 
 /// The caller for a CLI invocation:
@@ -114,16 +121,18 @@ pub fn cli_caller(as_human: bool) -> Caller {
         |k| std::env::var_os(k),
         std::process::id(),
         procinfo::find_harness_ancestor,
+        procinfo::env_var,
     )
 }
 
-/// [`cli_caller`] with the environment, own pid and harness-ancestor lookup
-/// injected.
+/// [`cli_caller`] with the environment, own pid, harness-ancestor lookup
+/// and other processes' environments injected.
 fn caller_from(
     as_human: bool,
     var: impl Fn(&str) -> Option<OsString>,
     pid: u32,
     find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+    environ: impl Fn(u32, &str) -> Option<OsString>,
 ) -> Caller {
     if as_human {
         return Caller::Human;
@@ -137,7 +146,7 @@ fn caller_from(
         return Caller::Human;
     }
     if let Some(session) =
-        session_in(&var, pid, find_harness).filter(|k| k.harness.shares_process())
+        session_in(&var, pid, find_harness, environ).filter(|k| k.harness.shares_process())
     {
         return Caller::Session { session };
     }
@@ -342,6 +351,11 @@ mod tests {
         register_proc_with(me, explicit_pid, find_harness, |_| true)
     }
 
+    /// Other processes' environments, all empty.
+    fn no_environ(_: u32, _: &str) -> Option<OsString> {
+        None
+    }
+
     /// A harness-ancestor lookup that finds none.
     fn none(_: u32) -> Option<(ProcId, Harness)> {
         None
@@ -357,7 +371,7 @@ mod tests {
     fn identity_address_env_gives_address() {
         let me = std::process::id();
         assert_eq!(
-            caller_from(false, env(&[(ENV_ADDRESS, "x")]), me, none),
+            caller_from(false, env(&[(ENV_ADDRESS, "x")]), me, none, no_environ),
             Caller::Address {
                 address: "x".into()
             }
@@ -365,22 +379,28 @@ mod tests {
         // It beats AGENTMAIL_HUMAN, but not an explicit --as human.
         let both = env(&[(ENV_ADDRESS, "x"), (ENV_HUMAN, "1")]);
         assert_eq!(
-            caller_from(false, &both, me, none),
+            caller_from(false, &both, me, none, no_environ),
             Caller::Address {
                 address: "x".into()
             }
         );
-        assert_eq!(caller_from(true, &both, me, none), Caller::Human);
+        assert_eq!(
+            caller_from(true, &both, me, none, no_environ),
+            Caller::Human
+        );
     }
 
     #[test]
     fn identity_human_env_or_flag_gives_human() {
         let me = std::process::id();
         assert_eq!(
-            caller_from(false, env(&[(ENV_HUMAN, "1")]), me, none),
+            caller_from(false, env(&[(ENV_HUMAN, "1")]), me, none, no_environ),
             Caller::Human
         );
-        assert_eq!(caller_from(true, env(&[]), me, none), Caller::Human);
+        assert_eq!(
+            caller_from(true, env(&[]), me, none, no_environ),
+            Caller::Human
+        );
     }
 
     #[test]
@@ -392,7 +412,7 @@ mod tests {
             env(&[(ENV_ADDRESS, ""), (ENV_HUMAN, "0")]),
             env(&[(ENV_HUMAN, "true")]),
         ] {
-            match caller_from(false, vars, me, none) {
+            match caller_from(false, vars, me, none, no_environ) {
                 Caller::Procs { procs } => {
                     assert!(!procs.is_empty());
                     assert_eq!(Some(procs[0].pid), procinfo::parent_pid(me));
@@ -442,7 +462,7 @@ mod tests {
         let opencode_harness = under(Harness::Opencode);
         let session = env(&[(ENV_OPENCODE_SESSION, "s1")]);
         assert_eq!(
-            caller_from(false, &session, me, &opencode_harness),
+            caller_from(false, &session, me, &opencode_harness, no_environ),
             Caller::Session {
                 session: opencode("s1")
             }
@@ -450,18 +470,18 @@ mod tests {
         // An explicit address, the human env and --as human all beat it.
         let addr = env(&[(ENV_OPENCODE_SESSION, "s1"), (ENV_ADDRESS, "x")]);
         assert_eq!(
-            caller_from(false, &addr, me, &opencode_harness),
+            caller_from(false, &addr, me, &opencode_harness, no_environ),
             Caller::Address {
                 address: "x".into()
             }
         );
         let human = env(&[(ENV_OPENCODE_SESSION, "s1"), (ENV_HUMAN, "1")]);
         assert_eq!(
-            caller_from(false, &human, me, &opencode_harness),
+            caller_from(false, &human, me, &opencode_harness, no_environ),
             Caller::Human
         );
         assert_eq!(
-            caller_from(true, &session, me, &opencode_harness),
+            caller_from(true, &session, me, &opencode_harness, no_environ),
             Caller::Human
         );
     }
@@ -473,11 +493,11 @@ mod tests {
         // opencode; its shells are not that session.
         let me = std::process::id();
         let detached = env(&[(ENV_OPENCODE_SESSION, "s1")]);
-        match caller_from(false, &detached, me, none) {
+        match caller_from(false, &detached, me, none, no_environ) {
             Caller::Procs { procs } => assert_eq!(procs, procinfo::ancestors(me)),
             other => panic!("expected Procs, got {other:?}"),
         }
-        assert_eq!(session_in(&detached, me, none), None);
+        assert_eq!(session_in(&detached, me, none, no_environ), None);
     }
 
     #[test]
@@ -485,7 +505,7 @@ mod tests {
         let me = std::process::id();
         let session = env(&[(ENV_OPENCODE_SESSION, "s1")]);
         assert_eq!(
-            caller_from(false, &session, me, under(Harness::Opencode)),
+            caller_from(false, &session, me, under(Harness::Opencode), no_environ),
             Caller::Session {
                 session: opencode("s1")
             }
@@ -498,7 +518,13 @@ mod tests {
         // OPENCODE_SESSION_ID; its own commands are not that session.
         let me = std::process::id();
         let inherited = env(&[(ENV_OPENCODE_SESSION, "outer")]);
-        match caller_from(false, &inherited, me, under(Harness::ClaudeCode)) {
+        match caller_from(
+            false,
+            &inherited,
+            me,
+            under(Harness::ClaudeCode),
+            no_environ,
+        ) {
             Caller::Procs { procs } => assert_eq!(procs, procinfo::ancestors(me)),
             other => panic!("expected Procs, got {other:?}"),
         }
@@ -506,7 +532,7 @@ mod tests {
         // counts, and kiro resolves by process.
         let both = env(&[(ENV_OPENCODE_SESSION, "outer"), (ENV_KIRO_SESSION, "k1")]);
         assert!(matches!(
-            caller_from(false, &both, me, under(Harness::Kiro)),
+            caller_from(false, &both, me, under(Harness::Kiro), no_environ),
             Caller::Procs { .. }
         ));
     }
@@ -518,11 +544,11 @@ mod tests {
         let me = std::process::id();
         let kiro = env(&[(ENV_KIRO_SESSION, "k1")]);
         assert!(matches!(
-            caller_from(false, &kiro, me, under(Harness::Kiro)),
+            caller_from(false, &kiro, me, under(Harness::Kiro), no_environ),
             Caller::Procs { .. }
         ));
         assert!(matches!(
-            caller_from(false, &kiro, me, none),
+            caller_from(false, &kiro, me, none, no_environ),
             Caller::Procs { .. }
         ));
     }
@@ -534,22 +560,73 @@ mod tests {
             id: id.into(),
         };
         let both = env(&[(ENV_OPENCODE_SESSION, "o1"), (ENV_KIRO_SESSION, "k1")]);
+        let p = procinfo::proc_id(std::process::id()).unwrap();
+        let at = |h: Harness| Some((p, h));
         // No harness ancestor: the variables are inherited, not ours.
-        assert_eq!(session_for(&both, None), None);
-        assert_eq!(session_for(&both, Some(Harness::Other)), None);
+        assert_eq!(session_for(&both, None, no_environ), None);
+        assert_eq!(session_for(&both, at(Harness::Other), no_environ), None);
         assert_eq!(
-            session_for(&both, Some(Harness::Opencode)),
+            session_for(&both, at(Harness::Opencode), no_environ),
             Some(opencode("o1"))
         );
-        assert_eq!(session_for(&both, Some(Harness::Kiro)), Some(kiro("k1")));
-        assert_eq!(session_for(&both, Some(Harness::ClaudeCode)), None);
+        assert_eq!(
+            session_for(&both, at(Harness::Kiro), no_environ),
+            Some(kiro("k1"))
+        );
+        assert_eq!(
+            session_for(&both, at(Harness::ClaudeCode), no_environ),
+            None
+        );
         let outer = env(&[(ENV_OPENCODE_SESSION, "o1")]);
-        assert_eq!(session_for(&outer, Some(Harness::Kiro)), None);
+        assert_eq!(session_for(&outer, at(Harness::Kiro), no_environ), None);
         // The lookup runs only when a session variable is set.
         let me = std::process::id();
         let panics = |_: u32| -> Option<(ProcId, Harness)> { panic!("looked up") };
-        assert_eq!(session_in(env(&[]), me, panics), None);
-        assert_eq!(session_in(&outer, me, under(Harness::ClaudeCode)), None);
+        assert_eq!(session_in(env(&[]), me, panics, no_environ), None);
+        assert_eq!(
+            session_in(&outer, me, under(Harness::ClaudeCode), no_environ),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_session_for_ignores_a_value_the_harness_carries() {
+        // opencode B started from opencode A's bash tool carries A's
+        // OPENCODE_SESSION_ID and passes it on to everything it starts
+        // (its plugin's Bun.spawn, an LSP): that is not one of B's
+        // sessions. B's own shell commands carry a different value.
+        let p = procinfo::proc_id(std::process::id()).unwrap();
+        let carries = |value: &'static str| {
+            move |pid: u32, name: &str| -> Option<OsString> {
+                (pid == p.pid && name == ENV_OPENCODE_SESSION).then(|| value.into())
+            }
+        };
+        let outer = env(&[(ENV_OPENCODE_SESSION, "outer")]);
+        let inner = env(&[(ENV_OPENCODE_SESSION, "inner")]);
+        let at = Some((p, Harness::Opencode));
+        assert_eq!(session_for(&outer, at, carries("outer")), None);
+        assert_eq!(
+            session_for(&inner, at, carries("outer")),
+            Some(opencode("inner"))
+        );
+        // Only the harness process's own value counts: another process
+        // carrying it changes nothing.
+        let elsewhere =
+            |pid: u32, _: &str| -> Option<OsString> { (pid != p.pid).then(|| "outer".into()) };
+        assert_eq!(session_for(&outer, at, elsewhere), Some(opencode("outer")));
+        // The CLI caller follows it.
+        let me = std::process::id();
+        let opencode_harness = |_: u32| at;
+        match caller_from(false, &outer, me, opencode_harness, carries("outer")) {
+            Caller::Procs { procs } => assert_eq!(procs, procinfo::ancestors(me)),
+            other => panic!("expected Procs, got {other:?}"),
+        }
+        assert_eq!(
+            caller_from(false, &inner, me, opencode_harness, carries("outer")),
+            Caller::Session {
+                session: opencode("inner")
+            }
+        );
     }
 
     #[test]
@@ -559,6 +636,7 @@ mod tests {
             |k| std::env::var_os(k),
             std::process::id(),
             procinfo::find_harness_ancestor,
+            procinfo::env_var,
         );
         assert_eq!(cli_caller(false), expected);
         assert_eq!(cli_caller(true), Caller::Human);

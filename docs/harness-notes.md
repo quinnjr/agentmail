@@ -62,7 +62,12 @@ model credentials that an isolated config does not have).
   `OPENCODE_SESSION_ID` but is no longer part of that session, and a real
   opencode session always has an `opencode` process (`opencode serve
   --stdio` under `run --standalone`, 2.0.27) above its shell and MCP
-  children.
+  children. A value the harness process itself was started with does not
+  count either: opencode B started from opencode A's bash tool carries A's
+  `OPENCODE_SESSION_ID` and passes it on to everything it starts (its
+  plugin's `Bun.spawn`, an LSP), not only its own shell commands, which
+  carry B's session id instead. The MCP server applies the same rule when
+  deciding whether the harness started it.
 - **Shared opencode MCP server.** A tool call without an opencode
   session in `_meta` (opencode omits it when the call has no session)
   cannot `register` on a server started by opencode, so the shared server
@@ -73,10 +78,11 @@ model credentials that an isolated config does not have).
   outside any opencode gets past it, so no agent becomes the identity of
   the shared opencode process. This holds for opencode at PID 1 (a
   container's entry point) too: it cannot be bound, but its harness is
-  still read, so the server counts as shared and the refusal applies. A server that is not opencode's own (another
-  MCP client run from its bash tool, below) is not bound to opencode and
-  not shared. The refusal names the cause: the server was started by
-  opencode, which shares it between its sessions.
+  still read, so the server counts as shared and the refusal applies. A
+  server that is not opencode's own (another MCP client run from its bash
+  tool, below) is not bound to opencode and not shared. The refusal names
+  the cause: the server was started by opencode, which shares it between
+  its sessions.
 - **opencode MCP server behind a wrapper.** When opencode starts the
   server through a wrapper (opencode -> `sh -c` -> agentmail mcp), the
   server's parent is the wrapper, but a session `register` over MCP binds

@@ -68,6 +68,19 @@ impl Env {
         self.under_script(harness, r#""$0" "$@"; exit $?"#)
     }
 
+    /// `agentmail` run as a shell command of opencode session `id`: under a
+    /// fake `opencode` process, with OPENCODE_SESSION_ID set for the CLI
+    /// only, not for the opencode process itself (opencode sets it for the
+    /// commands its bash tool runs).
+    fn in_session_of(&self, id: &str) -> Command {
+        let mut c = self.under_script(
+            "opencode",
+            r#"OPENCODE_SESSION_ID="$1"; export OPENCODE_SESSION_ID; shift; "$0" "$@"; exit $?"#,
+        );
+        c.arg(id);
+        c
+    }
+
     /// The fake harness `harness` (a shell) running `script`, with the
     /// agentmail binary as `$0`, this environment and no identity.
     fn under_script(&self, harness: &str, script: &str) -> Command {
@@ -989,28 +1002,30 @@ fn closed_stdout_does_not_panic() {
 #[test]
 fn opencode_env_session_register_and_whoami() {
     let mut env = Env::new();
-    // Each command runs as opencode runs its shell commands: under the
-    // opencode process, with the session in the environment.
-    fn in_session_of(env: &Env, id: &str) -> Command {
-        let mut c = env.under("opencode");
-        c.env("OPENCODE_SESSION_ID", id);
-        c
-    }
-    let r1 = ok_json(in_session_of(&env, "s1").args(["register", "backend", "--json"]));
+    let r1 = ok_json(
+        env.in_session_of("s1")
+            .args(["register", "backend", "--json"]),
+    );
     let backend = r1["address"].as_str().unwrap().to_string();
-    let r2 = ok_json(in_session_of(&env, "s2").args(["register", "frontend", "--json"]));
+    let r2 = ok_json(
+        env.in_session_of("s2")
+            .args(["register", "frontend", "--json"]),
+    );
     let frontend = r2["address"].as_str().unwrap().to_string();
     assert_ne!(backend, frontend);
 
-    let me = ok_json(in_session_of(&env, "s1").args(["whoami", "--json"]));
+    let me = ok_json(env.in_session_of("s1").args(["whoami", "--json"]));
     assert_eq!(me["address"], backend.as_str(), "{me}");
     assert_eq!(me["agent"]["session"]["harness"], "opencode", "{me}");
     assert_eq!(me["agent"]["session"]["id"], "s1", "{me}");
-    let me = ok_json(in_session_of(&env, "s2").args(["whoami", "--json"]));
+    let me = ok_json(env.in_session_of("s2").args(["whoami", "--json"]));
     assert_eq!(me["address"], frontend.as_str(), "{me}");
 
     // The same session registering again keeps its address.
-    let again = ok_json(in_session_of(&env, "s1").args(["register", "backend", "--json"]));
+    let again = ok_json(
+        env.in_session_of("s1")
+            .args(["register", "backend", "--json"]),
+    );
     assert_eq!(again["address"], backend.as_str(), "{again}");
 
     // Without the session, a call under opencode resolves to neither
@@ -1036,9 +1051,9 @@ fn opencode_env_session_register_and_whoami() {
         "--body",
         "x",
     ]));
-    let inbox = ok_json(in_session_of(&env, "s1").args(["inbox", "--json"]));
+    let inbox = ok_json(env.in_session_of("s1").args(["inbox", "--json"]));
     assert!(inbox.to_string().contains("for s1"), "{inbox}");
-    let inbox = ok_json(in_session_of(&env, "s2").args(["inbox", "--json"]));
+    let inbox = ok_json(env.in_session_of("s2").args(["inbox", "--json"]));
     assert!(!inbox.to_string().contains("for s1"), "{inbox}");
 }
 
@@ -1048,8 +1063,7 @@ fn opencode_env_session_register_and_whoami() {
 fn inherited_opencode_session_is_ignored() {
     let env = Env::new();
     let r = ok_json(
-        env.under("opencode")
-            .env("OPENCODE_SESSION_ID", "s1")
+        env.in_session_of("s1")
             .args(["register", "backend", "--json"]),
     );
     let backend = r["address"].as_str().unwrap().to_string();
@@ -1074,12 +1088,59 @@ fn inherited_opencode_session_is_ignored() {
             .args(["register", "inner", "--json"]),
     );
     assert_ne!(inner["address"], backend.as_str(), "{inner}");
-    let me = ok_json(
-        env.under("opencode")
-            .env("OPENCODE_SESSION_ID", "s1")
-            .args(["whoami", "--json"]),
-    );
+    let me = ok_json(env.in_session_of("s1").args(["whoami", "--json"]));
     assert_eq!(me["address"], backend.as_str(), "{me}");
+}
+
+/// opencode B started from opencode A's bash tool carries A's
+/// OPENCODE_SESSION_ID itself and passes it on to everything it starts,
+/// not only its own bash tool's commands. A child of B carrying that same
+/// value (its plugin's `Bun.spawn`, an LSP) is not A's session; one of B's
+/// own shell commands, with B's session id, still is that session.
+#[test]
+fn opencode_session_carried_by_the_opencode_itself_is_ignored() {
+    let env = Env::new();
+    let outer = ok_json(env.in_session_of("outer").args(["register", "a", "--json"]));
+    let outer = outer["address"].as_str().unwrap().to_string();
+    // B's non-shell child: the value B itself was started with.
+    let nested = || {
+        let mut c = env.under("opencode");
+        c.env("OPENCODE_SESSION_ID", "outer");
+        c
+    };
+    let out = nested().args(["whoami", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("not registered"),
+        "{}",
+        text(&out.stderr)
+    );
+    // Registering there is refused as sessionless (B's process is shared),
+    // and does not touch A's session.
+    let out = nested().args(["register", "b", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let err = json(&out);
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shared between sessions"),
+        "{err}"
+    );
+    let me = ok_json(env.in_session_of("outer").args(["whoami", "--json"]));
+    assert_eq!(me["address"], outer.as_str(), "{me}");
+    // B's own bash tool command, in B's session `inner`: that session.
+    let in_b = || {
+        let mut c = env.in_session_of("inner");
+        c.env("OPENCODE_SESSION_ID", "outer");
+        c
+    };
+    let inner = ok_json(in_b().args(["register", "b", "--json"]));
+    let inner = inner["address"].as_str().unwrap().to_string();
+    assert_ne!(inner, outer);
+    let me = ok_json(in_b().args(["whoami", "--json"]));
+    assert_eq!(me["address"], inner.as_str(), "{me}");
+    assert_eq!(me["agent"]["session"]["id"], "inner", "{me}");
 }
 
 /// A process detached from opencode (a tmux server or `setsid` job started
@@ -1089,8 +1150,7 @@ fn inherited_opencode_session_is_ignored() {
 fn opencode_session_without_opencode_ancestor_is_ignored() {
     let env = Env::new();
     ok_json(
-        env.under("opencode")
-            .env("OPENCODE_SESSION_ID", "s1")
+        env.in_session_of("s1")
             .args(["register", "backend", "--json"]),
     );
     let out = env
@@ -1200,8 +1260,7 @@ fn register_harness_override_conflicting_with_session_is_refused() {
     let env = Env::new();
     for other in ["other", "claude-code", "kiro"] {
         let out = env
-            .under("opencode")
-            .env("OPENCODE_SESSION_ID", "s1")
+            .in_session_of("s1")
             .args(["register", "plain", "--json", "--harness", other])
             .output()
             .unwrap();
@@ -1214,11 +1273,13 @@ fn register_harness_override_conflicting_with_session_is_refused() {
     }
     let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
     assert_eq!(v, serde_json::json!([]), "{v}");
-    let r = ok_json(
-        env.under("opencode")
-            .env("OPENCODE_SESSION_ID", "s1")
-            .args(["register", "plain", "--json", "--harness", "opencode"]),
-    );
+    let r = ok_json(env.in_session_of("s1").args([
+        "register",
+        "plain",
+        "--json",
+        "--harness",
+        "opencode",
+    ]));
     let me = ok_json(
         env.as_agent(r["address"].as_str().unwrap())
             .args(["whoami", "--json"]),
