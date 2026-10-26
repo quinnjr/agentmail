@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use agentmail::model::{Agent, Harness, Presence, ProcId};
+use agentmail::model::{Agent, Harness, Presence, ProcId, SessionKey};
 use agentmail::store::{RegisterReq, Store, StoreError};
 use tempfile::TempDir;
 
@@ -49,6 +49,7 @@ fn req(name: &str, cwd: &str, proc_id: Option<ProcId>) -> RegisterReq {
         proc_id,
         fresh: false,
         wake: true,
+        session: None,
     }
 }
 
@@ -539,4 +540,113 @@ fn open_creates_missing_parent_dir() {
     let path = dir.path().join("nested").join("agentmail.redb");
     Store::open(&path).unwrap();
     assert!(Path::new(&path).exists());
+}
+
+fn session_req(name: &str, cwd: &str, proc_id: Option<ProcId>, id: &str) -> RegisterReq {
+    let mut r = req(name, cwd, proc_id);
+    r.harness = Harness::Opencode;
+    r.session = Some(SessionKey {
+        harness: Harness::Opencode,
+        id: id.into(),
+    });
+    r
+}
+
+#[test]
+fn sessions_sharing_a_proc_keep_their_bindings() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s1"),
+        1,
+    );
+    let (b, _) = register(
+        &s,
+        &procs,
+        session_req("frontend", "/w", Some(p(1)), "s2"),
+        2,
+    );
+    // A process-only registration from the same process does not unbind
+    // the session agents either.
+    let (c, _) = register(&s, &procs, req("docs", "/w", Some(p(1))), 3);
+    for addr in [&a.address, &b.address, &c.address] {
+        let agent = s.get_agent(addr).unwrap().unwrap();
+        assert_eq!(agent.proc_id, Some(p(1)), "{addr}");
+    }
+    let s1 = session_req("x", "/", None, "s1").session.unwrap();
+    assert_eq!(s.find_by_session(&s1).unwrap().unwrap().address, a.address);
+}
+
+#[test]
+fn session_binding_is_per_harness() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(
+        &s,
+        &procs,
+        session_req("backend", "/w", Some(p(1)), "s1"),
+        1,
+    );
+    let kiro = SessionKey {
+        harness: Harness::Kiro,
+        id: "s1".into(),
+    };
+    assert_eq!(s.find_by_session(&kiro).unwrap(), None);
+    let mut r = req("frontend", "/w", Some(p(1)));
+    r.session = Some(kiro.clone());
+    let (b, _) = register(&s, &procs, r, 2);
+    assert_ne!(a.address, b.address);
+    assert_eq!(
+        s.find_by_session(&kiro).unwrap().unwrap().address,
+        b.address
+    );
+}
+
+#[test]
+fn signoff_unbinds_session_and_reopen_keeps_bindings() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("agentmail.redb");
+    let procs = Procs::new(&[p(1)]);
+    let s1 = session_req("x", "/", None, "s1").session.unwrap();
+    let s2 = session_req("x", "/", None, "s2").session.unwrap();
+    {
+        let s = Store::open(&path).unwrap();
+        let (a, _) = register(
+            &s,
+            &procs,
+            session_req("backend", "/w", Some(p(1)), "s1"),
+            1,
+        );
+        register(
+            &s,
+            &procs,
+            session_req("frontend", "/w", Some(p(1)), "s2"),
+            2,
+        );
+        s.signoff(&a.address).unwrap();
+        assert_eq!(s.find_by_session(&s1).unwrap(), None);
+    }
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.find_by_session(&s1).unwrap(), None);
+    assert_eq!(
+        s.find_by_session(&s2).unwrap().unwrap().name,
+        "frontend".to_string()
+    );
+}
+
+#[test]
+fn plain_reregistration_reports_existing() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (first, _) = s
+        .register_and_release(req("backend", "/w", Some(p(1))), 1, &procs.alive())
+        .unwrap();
+    assert!(!first.existing && !first.reclaimed);
+    let (again, _) = s
+        .register_and_release(req("backend", "/w", Some(p(1))), 2, &procs.alive())
+        .unwrap();
+    assert_eq!(again.agent.address, first.agent.address);
+    assert!(again.existing && !again.reclaimed);
 }

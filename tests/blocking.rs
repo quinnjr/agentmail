@@ -55,6 +55,7 @@ async fn register_bound(c: &mut Client, name: &str, cwd: &Path, proc_id: ProcId)
         proc_id: Some(proc_id),
         fresh: true,
         wake: true,
+        session: None,
     };
     let data = c.call(&Caller::Human, req).await.unwrap();
     data["address"].as_str().unwrap().to_string()
@@ -723,6 +724,7 @@ async fn wait_for_mail_wakes_on_released_held_mail() {
                 proc_id: Some(h.id),
                 fresh: false,
                 wake: true,
+                session: None,
             },
         )
         .await

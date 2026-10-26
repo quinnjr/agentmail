@@ -58,6 +58,7 @@ fn register_as(name: &str, cwd: &Path, proc_id: Option<ProcId>, working_on: &str
         proc_id,
         fresh: true,
         wake: true,
+        session: None,
     }
 }
 

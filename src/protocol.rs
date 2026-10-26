@@ -28,11 +28,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AgentView, Harness, Message, ProcId};
+use crate::model::{AgentView, Harness, Message, ProcId, SessionKey};
 use crate::store::ThreadFilter;
 
 /// Bumped on every incompatible change to [`Envelope`] or [`Response`].
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Longest request line the daemon accepts, in bytes. Comfortably above a
 /// maximal body (256 KiB) even when every byte is JSON-escaped.
@@ -50,6 +50,10 @@ pub enum Caller {
     /// The calling process's ancestry, nearest first; the daemon picks the
     /// agent bound to one of them.
     Procs { procs: Vec<ProcId> },
+    /// A harness session (e.g. opencode's per-request session id). Resolves
+    /// only to the agent bound to that session; never falls back to
+    /// process ancestry, which the daemon cannot see for this caller.
+    Session { session: SessionKey },
 }
 
 /// A request. See the module docs for framing.
@@ -74,6 +78,11 @@ pub enum Request {
         fresh: bool,
         #[serde(default)]
         wake: bool,
+        /// Bind the address to this harness session too. Registering again
+        /// from a session that is already bound returns its agent (data
+        /// `existing: true`), updated; a different name is `InvalidInput`.
+        #[serde(default)]
+        session: Option<SessionKey>,
     },
     Whoami,
     Status {
@@ -326,6 +335,25 @@ mod tests {
             serde_json::to_value(Response::Ok { data: json!(1) }).unwrap(),
             json!({"status":"ok","data":1})
         );
+    }
+
+    #[test]
+    fn protocol_session_shapes() {
+        let caller = Caller::Session {
+            session: SessionKey {
+                harness: Harness::Opencode,
+                id: "ses_1".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&caller).unwrap(),
+            json!({"kind":"session","session":{"harness":"opencode","id":"ses_1"}})
+        );
+        let req: Request = serde_json::from_value(
+            json!({"op":"register","name":"a","harness":"other","cwd":"/w"}),
+        )
+        .unwrap();
+        assert!(matches!(req, Request::Register { session: None, .. }));
     }
 
     #[test]

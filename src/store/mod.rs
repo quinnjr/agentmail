@@ -14,7 +14,7 @@ mod agents;
 mod mail;
 mod questions;
 
-pub use agents::{Alive, RegisterReq};
+pub use agents::{Alive, RegisterReq, Registered};
 pub use mail::{MAX_BODY, NewMessage, ThreadFilter, ThreadSummary};
 pub(crate) use mail::{agent_repo_key, lexical, questions_closed_by};
 
@@ -35,6 +35,9 @@ pub(crate) const QUESTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 /// Index of the open (unanswered) rows of [`QUESTIONS`]: question id.
 /// Rebuilt from [`QUESTIONS`] on every [`Store::open`].
 pub(crate) const OPEN_QUESTIONS: TableDefinition<&str, ()> = TableDefinition::new("open_questions");
+/// Harness session bindings: `(harness, session id) -> address`. Holds
+/// only bindings of non-signed-off agents (signoff removes the row).
+pub(crate) const SESSIONS: TableDefinition<(&str, &str), &str> = TableDefinition::new("sessions");
 /// Store metadata, e.g. `schema_version`.
 pub(crate) const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
@@ -121,6 +124,7 @@ impl Store {
             txn.open_table(THREADS)?;
             txn.open_table(HELD)?;
             txn.open_table(QUESTIONS)?;
+            txn.open_table(SESSIONS)?;
             questions::rebuild_open_index(&txn)?;
             let mut meta = txn.open_table(META)?;
             let existing = meta.get(SCHEMA_VERSION_KEY)?.map(|v| v.value().to_string());

@@ -24,6 +24,7 @@ fn agent(store: &Store, name: &str, repo: Option<&str>) -> String {
         proc_id: None,
         fresh: true,
         wake: false,
+        session: None,
     };
     store.register(req, 1, &|_| false).unwrap().0.address
 }

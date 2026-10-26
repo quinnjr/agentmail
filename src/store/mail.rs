@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::questions::is_open;
 use super::{
-    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, RegisterReq, Store, StoreError,
-    THREADS, all_json, encode, get_json,
+    AGENTS, Alive, HELD, MAILBOX, MESSAGES, OPEN_QUESTIONS, RegisterReq, Registered, Store,
+    StoreError, THREADS, all_json, encode, get_json,
 };
 use crate::ids::{new_message_id, validate_name};
 use crate::model::{Agent, HUMAN, Kind, MAX_BODY_BYTES, Message, Presence};
@@ -531,23 +531,24 @@ impl Store {
     /// never committed without its held mail. Nothing is released when that
     /// path is not absolute, since held mail is only kept for absolute repos.
     ///
-    /// Returns the agent, the reclaim flag and the released messages.
+    /// Returns the registration and the released messages.
     pub fn register_and_release(
         &self,
         req: RegisterReq,
         now: i64,
         alive: Alive,
-    ) -> Result<(Agent, bool, Vec<Message>), StoreError> {
+    ) -> Result<(Registered, Vec<Message>), StoreError> {
         let txn = self.db.begin_write()?;
-        let (agent, reclaimed) = self.register_in(&txn, req, now, alive)?;
-        let released = if agent_repo_key(&agent).is_some() {
+        let registered = self.register_in(&txn, req, now, alive)?;
+        let agent = &registered.agent;
+        let released = if agent_repo_key(agent).is_some() {
             let home = agent.repo.as_deref().unwrap_or(&agent.cwd);
             self.release_held_in(&txn, home, &agent.name, &agent.address)?
         } else {
             Vec::new()
         };
         txn.commit()?;
-        Ok((agent, reclaimed, released))
+        Ok((registered, released))
     }
 
     /// [`Store::release_held`] inside the caller's write transaction, which
@@ -928,6 +929,7 @@ mod tests {
             proc_id: None,
             fresh: true,
             wake: false,
+            session: None,
         };
         store.register(req, 1, &|_| false).unwrap().0.address
     }

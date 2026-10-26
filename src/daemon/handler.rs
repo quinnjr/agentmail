@@ -573,6 +573,22 @@ impl Handler {
                 .find_by_procs(procs)
                 .map_err(store_err)?
                 .ok_or_else(|| ClientError::new(ErrorCode::NoIdentity, NOT_REGISTERED))?,
+            // Never falls back to process ancestry: the daemon cannot see
+            // the caller's processes, only its session.
+            Caller::Session { session } => self
+                .store
+                .find_by_session(session)
+                .map_err(store_err)?
+                .ok_or_else(|| {
+                    ClientError::new(
+                        ErrorCode::NoIdentity,
+                        format!(
+                            "no agent is registered for this {} session: run \
+                             `agentmail register <name>` (or use --as human)",
+                            session.harness.as_str()
+                        ),
+                    )
+                })?,
         };
         let now = now_ms();
         if now.saturating_sub(agent.last_seen) >= TOUCH_INTERVAL_MS {
@@ -1151,6 +1167,7 @@ impl Handler {
                 proc_id,
                 fresh,
                 wake,
+                session,
             } => self.register(RegisterReq {
                 name,
                 role,
@@ -1161,6 +1178,7 @@ impl Handler {
                 proc_id,
                 fresh,
                 wake,
+                session,
             }),
             Request::Whoami => {
                 let me = self.resolve_caller(caller)?;
@@ -1318,11 +1336,13 @@ impl Handler {
         req.repo = git_toplevel(&req.cwd);
         // One transaction: an error never follows a committed registration,
         // so a retry cannot mint an address the caller never learned.
-        let (agent, reclaimed, released) = self
+        let (registered, released) = self
             .store
             .register_and_release(req, now_ms(), &procinfo::is_alive)
             .map_err(store_err)?;
-        let view = self.view(agent, false);
+        let reclaimed = registered.reclaimed;
+        let existing = registered.existing;
+        let view = self.view(registered.agent, false);
         self.publish_presence(&view);
         for msg in &released {
             self.hub.publish(Event::Delivered {
@@ -1333,6 +1353,7 @@ impl Handler {
         Ok(json!({
             "address": view.agent.address,
             "reclaimed": reclaimed,
+            "existing": existing,
             "released": released.len(),
             "agent": to_json(&view)?,
         }))

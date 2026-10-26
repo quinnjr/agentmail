@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use redb::{ReadableTable, WriteTransaction};
 
-use super::{AGENTS, CONTACTS, Store, StoreError, all_json, encode, get_json};
+use super::{AGENTS, CONTACTS, SESSIONS, Store, StoreError, all_json, encode, get_json};
 use crate::ids::{new_address, validate_name};
-use crate::model::{Agent, HUMAN, Harness, MAX_WORKING_ON_CHARS, Presence, ProcId};
+use crate::model::{Agent, HUMAN, Harness, MAX_WORKING_ON_CHARS, Presence, ProcId, SessionKey};
 
 /// How many fresh addresses to try before giving up on a collision streak.
 const ADDRESS_ATTEMPTS: usize = 16;
@@ -30,6 +30,24 @@ pub struct RegisterReq {
     /// Always take a new address; never reclaim.
     pub fresh: bool,
     pub wake: bool,
+    /// The harness session to bind the address to, if any.
+    pub session: Option<SessionKey>,
+}
+
+/// The outcome of a registration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Registered {
+    pub agent: Agent,
+    /// The address was taken back from a different or absent binding.
+    pub reclaimed: bool,
+    /// The requesting session was already bound to this agent, which was
+    /// returned (updated) instead of registering anew.
+    pub existing: bool,
+}
+
+/// The [`SESSIONS`] key of `k`.
+fn session_key(k: &SessionKey) -> (&'static str, &str) {
+    (k.harness.as_str(), k.id.as_str())
 }
 
 fn check_utf8(field: &str, path: &Path) -> Result<(), StoreError> {
@@ -53,21 +71,37 @@ fn unknown(addr: &str) -> StoreError {
     StoreError::NotFound(format!("no agent with address {addr:?}"))
 }
 
-/// Whether `agent` may be rebound to a registration from `proc_id`.
+/// Whether `agent` may be rebound to `req`.
 ///
-/// An agent bound to a live process is only rebound by that same process (a
-/// repeat registration). Anything else bound to a live process, active or
-/// signed off, is never taken.
-fn reclaimable(agent: &Agent, proc_id: Option<ProcId>, alive: Alive) -> bool {
+/// An agent bound to a live process is only rebound by that same process
+/// and session (a repeat registration). Anything else bound to a live
+/// process, active or signed off, is never taken: in particular another
+/// session sharing the process (opencode runs every session in one).
+fn reclaimable(agent: &Agent, req: &RegisterReq, alive: Alive) -> bool {
     match agent.proc_id {
         None => true,
-        Some(bound) => Some(bound) == proc_id || !alive(&bound),
+        Some(bound) => is_own(agent, req) || !alive(&bound),
     }
 }
 
-/// Whether `agent` is already bound to the requesting process `proc_id`.
-fn is_own(agent: &Agent, proc_id: Option<ProcId>) -> bool {
-    agent.proc_id.is_some() && agent.proc_id == proc_id
+/// Whether `agent` is already bound to the requesting process and session.
+fn is_own(agent: &Agent, req: &RegisterReq) -> bool {
+    agent.proc_id.is_some() && agent.proc_id == req.proc_id && agent.session == req.session
+}
+
+/// Remove the binding of session `k` if it points at `addr`.
+fn unbind_session(
+    sessions: &mut redb::Table<(&'static str, &'static str), &'static str>,
+    k: &SessionKey,
+    addr: &str,
+) -> Result<(), StoreError> {
+    let points_here = sessions
+        .get(session_key(k))?
+        .is_some_and(|v| v.value() == addr);
+    if points_here {
+        sessions.remove(session_key(k))?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -87,8 +121,17 @@ impl Store {
     /// different or absent process; a re-registration that keeps the address
     /// already bound to `proc_id` is not a reclaim and reports false.
     ///
-    /// One address per harness process: any other agent bound to `proc_id`
-    /// is unbound (its `proc_id` cleared, so it shows as gone).
+    /// One address per harness process and session: any other agent bound
+    /// to `proc_id` with the same session (typically none) is unbound (its
+    /// `proc_id` cleared, so it shows as gone). Agents of other sessions
+    /// sharing the process keep their binding.
+    ///
+    /// Sessions: with `session = Some(k)` and a non-signed-off agent bound
+    /// to `k`, that agent is returned with `role`, `working_on`, `wake`,
+    /// `proc_id` and `last_seen` updated (not reclaimed, `existing`); its
+    /// name must match `req.name`, otherwise `InvalidInput`. Otherwise the
+    /// rules above apply and the result is bound to `k`, moving any earlier
+    /// session binding of a reclaimed agent off it.
     pub fn register(
         &self,
         req: RegisterReq,
@@ -96,9 +139,9 @@ impl Store {
         alive: Alive,
     ) -> Result<(Agent, bool), StoreError> {
         let txn = self.db.begin_write()?;
-        let result = self.register_in(&txn, req, now, alive)?;
+        let r = self.register_in(&txn, req, now, alive)?;
         txn.commit()?;
-        Ok(result)
+        Ok((r.agent, r.reclaimed))
     }
 
     /// [`Store::register`] inside the caller's write transaction, which the
@@ -109,8 +152,11 @@ impl Store {
         req: RegisterReq,
         now: i64,
         alive: Alive,
-    ) -> Result<(Agent, bool), StoreError> {
+    ) -> Result<Registered, StoreError> {
         validate_name(&req.name).map_err(StoreError::InvalidName)?;
+        if let Some(k) = &req.session {
+            k.validate().map_err(StoreError::InvalidInput)?;
+        }
         check_utf8("cwd", &req.cwd)?;
         if let Some(repo) = &req.repo {
             check_utf8("repo", repo)?;
@@ -120,6 +166,33 @@ impl Store {
         }
 
         let mut table = txn.open_table(AGENTS)?;
+        let mut sessions = txn.open_table(SESSIONS)?;
+        if let Some(k) = &req.session {
+            let bound = sessions.get(session_key(k))?.map(|v| v.value().to_string());
+            let bound: Option<Agent> = match bound {
+                Some(addr) => get_json(&table, &addr)?,
+                None => None,
+            };
+            if let Some(mut a) = bound.filter(|a| !a.signed_off && a.session.as_ref() == Some(k)) {
+                if a.name != req.name {
+                    return Err(StoreError::InvalidInput(format!(
+                        "session already registered as {}",
+                        a.address
+                    )));
+                }
+                a.role = req.role;
+                a.working_on = req.working_on;
+                a.wake = req.wake;
+                a.proc_id = req.proc_id;
+                a.last_seen = now;
+                table.insert(a.address.as_str(), encode(&a)?.as_slice())?;
+                return Ok(Registered {
+                    agent: a,
+                    reclaimed: false,
+                    existing: true,
+                });
+            }
+        }
         let agents: Vec<Agent> = all_json(&table)?;
         let reclaim = if req.fresh {
             None
@@ -127,22 +200,29 @@ impl Store {
             agents
                 .iter()
                 .filter(|a| a.name == req.name && a.cwd == req.cwd)
-                .filter(|a| reclaimable(a, req.proc_id, alive))
+                .filter(|a| reclaimable(a, &req, alive))
                 .max_by(|x, y| {
-                    let key = |a: &Agent| (is_own(a, req.proc_id), a.last_seen, a.registered_at);
+                    let key = |a: &Agent| (is_own(a, &req), a.last_seen, a.registered_at);
                     key(x).cmp(&key(y)).then_with(|| x.address.cmp(&y.address))
                 })
                 .cloned()
         };
 
-        let reclaimed = reclaim.as_ref().is_some_and(|a| !is_own(a, req.proc_id));
+        let own = reclaim.as_ref().is_some_and(|a| is_own(a, &req));
+        let reclaimed = reclaim.is_some() && !own;
+        // A plain re-registration from the bound process (no session) is
+        // the process-binding counterpart of a session's `existing`.
+        let existing = own && req.session.is_none();
+        let mut old_session = None;
         let agent = match reclaim {
             Some(mut a) => {
+                old_session = a.session.take();
                 a.role = req.role;
                 a.working_on = req.working_on;
                 a.harness = req.harness;
                 a.repo = req.repo;
                 a.proc_id = req.proc_id;
+                a.session = req.session;
                 a.wake = req.wake;
                 a.last_seen = now;
                 a.signed_off = false;
@@ -169,6 +249,7 @@ impl Store {
                     cwd: req.cwd,
                     repo: req.repo,
                     proc_id: req.proc_id,
+                    session: req.session,
                     wake: req.wake,
                     registered_at: now,
                     last_seen: now,
@@ -179,14 +260,27 @@ impl Store {
 
         if let Some(bound) = agent.proc_id {
             for mut other in agents {
-                if other.address != agent.address && other.proc_id == Some(bound) {
+                if other.address != agent.address
+                    && other.proc_id == Some(bound)
+                    && other.session == agent.session
+                {
                     other.proc_id = None;
                     table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
                 }
             }
         }
+        if let Some(old) = old_session.filter(|old| Some(old) != agent.session.as_ref()) {
+            unbind_session(&mut sessions, &old, &agent.address)?;
+        }
+        if let Some(k) = &agent.session {
+            sessions.insert(session_key(k), agent.address.as_str())?;
+        }
         table.insert(agent.address.as_str(), encode(&agent)?.as_slice())?;
-        Ok((agent, reclaimed))
+        Ok(Registered {
+            agent,
+            reclaimed,
+            existing,
+        })
     }
 
     /// Active while bound to a live process and not signed off; Gone otherwise.
@@ -234,6 +328,21 @@ impl Store {
         Ok(None)
     }
 
+    /// The non-signed-off agent bound to the harness session `key`.
+    pub fn find_by_session(&self, key: &SessionKey) -> Result<Option<Agent>, StoreError> {
+        let txn = self.read()?;
+        let sessions = txn.open_table(SESSIONS)?;
+        let Some(addr) = sessions
+            .get(session_key(key))?
+            .map(|v| v.value().to_string())
+        else {
+            return Ok(None);
+        };
+        let agents = txn.open_table(AGENTS)?;
+        let agent: Option<Agent> = get_json(&agents, &addr)?;
+        Ok(agent.filter(|a| !a.signed_off && a.session.as_ref() == Some(key)))
+    }
+
     /// Read-modify-write one agent in its own transaction.
     fn update_agent(
         &self,
@@ -268,12 +377,22 @@ impl Store {
         })
     }
 
-    /// Mark the agent gone. Its mail and contacts stay.
+    /// Mark the agent gone and free its session binding. Its mail and
+    /// contacts stay.
     pub fn signoff(&self, addr: &str) -> Result<(), StoreError> {
-        self.update_agent(addr, |a| {
-            a.signed_off = true;
-            Ok(())
-        })
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(AGENTS)?;
+            let mut agent: Agent = get_json(&table, addr)?.ok_or_else(|| unknown(addr))?;
+            agent.signed_off = true;
+            if let Some(k) = &agent.session {
+                let mut sessions = txn.open_table(SESSIONS)?;
+                unbind_session(&mut sessions, k, addr)?;
+            }
+            table.insert(addr, encode(&agent)?.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Add `contact` to `owner`'s contacts. `owner` is an agent or `human`;

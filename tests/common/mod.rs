@@ -128,6 +128,7 @@ pub fn register_req(name: &str, cwd: &Path) -> Request {
         proc_id: None,
         fresh: true,
         wake: true,
+        session: None,
     }
 }
 

@@ -390,6 +390,7 @@ impl AgentMailServer {
             proc_id,
             fresh: p.fresh,
             wake: p.wake,
+            session: None,
         };
         Ok(match self.request(req).await {
             Ok(data) => {

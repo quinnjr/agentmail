@@ -414,6 +414,7 @@ mod tests {
                 repo: Some(PathBuf::from("/w/shop")),
                 proc_id: None,
                 wake: true,
+                session: None,
                 registered_at: 0,
                 last_seen: 0,
                 signed_off: false,

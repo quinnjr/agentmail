@@ -330,6 +330,7 @@ mod tests {
             proc_id: None,
             fresh: true,
             wake: false,
+            session: None,
         };
         s.register(req, 1, &|_| false).unwrap().0.address
     }

@@ -776,6 +776,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 proc_id,
                 fresh,
                 wake: !no_wake,
+                session: None,
             };
             let d = s.call(req).await?;
             s.show(&d, |d| {

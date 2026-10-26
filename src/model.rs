@@ -19,13 +19,54 @@ pub const MAX_WORKING_ON_CHARS: usize = 280;
 pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 240;
 
 /// The coding-agent harness an agent runs in.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum Harness {
     ClaudeCode,
     Opencode,
     Kiro,
     Other,
+}
+
+impl Harness {
+    /// The wire name, e.g. `claude-code`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "claude-code",
+            Harness::Opencode => "opencode",
+            Harness::Kiro => "kiro",
+            Harness::Other => "other",
+        }
+    }
+}
+
+/// Longest harness session id, in characters.
+pub const MAX_SESSION_ID_CHARS: usize = 128;
+
+/// A harness session: the harness plus its own session id. Some harnesses
+/// (opencode) run every session in one shared process, so an agent can be
+/// bound to its session as well as to a process.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SessionKey {
+    pub harness: Harness,
+    /// 1 to [`MAX_SESSION_ID_CHARS`] characters, no control characters.
+    pub id: String,
+}
+
+impl SessionKey {
+    /// Check the id's length and characters.
+    pub fn validate(&self) -> Result<(), String> {
+        let n = self.id.chars().count();
+        if n == 0 || n > MAX_SESSION_ID_CHARS {
+            return Err(format!(
+                "session id must be 1 to {MAX_SESSION_ID_CHARS} characters, got {n}"
+            ));
+        }
+        if self.id.chars().any(char::is_control) {
+            return Err(format!("session id {:?} has control characters", self.id));
+        }
+        Ok(())
+    }
 }
 
 /// A process identified by PID plus start time, so PID reuse is detected.
@@ -55,6 +96,11 @@ pub struct Agent {
     pub repo: Option<PathBuf>,
     /// The harness process this address is bound to.
     pub proc_id: Option<ProcId>,
+    /// The harness session this address is bound to, if any. The store's
+    /// session index is authoritative: after signoff the field may still
+    /// name the last session, but it no longer resolves.
+    #[serde(default)]
+    pub session: Option<SessionKey>,
     /// Whether the agent wants to be woken for new mail.
     pub wake: bool,
     pub registered_at: i64,
@@ -144,6 +190,39 @@ mod tests {
         assert_wire(Kind::Note, "note");
         assert_wire(Kind::Question, "question");
         assert_wire(Kind::Answer, "answer");
+        for h in [
+            Harness::ClaudeCode,
+            Harness::Opencode,
+            Harness::Kiro,
+            Harness::Other,
+        ] {
+            assert_eq!(json!(h), json!(h.as_str()));
+        }
+    }
+
+    #[test]
+    fn model_session_key_validation() {
+        let k = |id: &str| SessionKey {
+            harness: Harness::Opencode,
+            id: id.into(),
+        };
+        assert!(k("ses_abc").validate().is_ok());
+        assert!(k(&"é".repeat(128)).validate().is_ok());
+        assert!(k("").validate().is_err());
+        assert!(k(&"x".repeat(129)).validate().is_err());
+        assert!(k("a\tb").validate().is_err());
+        assert!(k("a\u{7f}").validate().is_err());
+    }
+
+    #[test]
+    fn model_agent_without_session_field_decodes() {
+        let v = json!({
+            "address": "a-abcd1234", "name": "a", "role": null, "working_on": null,
+            "harness": "other", "cwd": "/w", "repo": null, "proc_id": null,
+            "wake": false, "registered_at": 0, "last_seen": 0, "signed_off": false
+        });
+        let a: Agent = serde_json::from_value(v).unwrap();
+        assert_eq!(a.session, None);
     }
 
     #[cfg(unix)]
@@ -161,6 +240,7 @@ mod tests {
             cwd: PathBuf::from(OsStr::from_bytes(b"/w/\xff")),
             repo: None,
             proc_id: None,
+            session: None,
             wake: false,
             registered_at: 0,
             last_seen: 0,
@@ -183,6 +263,10 @@ mod tests {
             proc_id: Some(ProcId {
                 pid: 1,
                 start_time: 2,
+            }),
+            session: Some(SessionKey {
+                harness: Harness::Opencode,
+                id: "ses_1".into(),
             }),
             wake: true,
             registered_at: 3,

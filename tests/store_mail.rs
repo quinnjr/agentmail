@@ -25,6 +25,7 @@ fn agent(store: &Store, name: &str, repo: Option<&str>) -> String {
         proc_id: None,
         fresh: true,
         wake: false,
+        session: None,
     };
     store.register(req, 1, &|_| false).unwrap().0.address
 }
@@ -45,6 +46,7 @@ fn live_agent(store: &Store, name: &str, repo: &str, pid: u32) -> String {
         proc_id: Some(ProcId { pid, start_time: 1 }),
         fresh: true,
         wake: false,
+        session: None,
     };
     store.register(req, 1, &|_| true).unwrap().0.address
 }
@@ -961,6 +963,7 @@ fn threads_repo_filter_matches_cwd_without_repo() {
         proc_id: None,
         fresh: true,
         wake: false,
+        session: None,
     };
     let a = s.register(req, 1, &|_| false).unwrap().0.address;
     let t = s.insert_message(note(&a, &[HUMAN], "Cwd", "1"), 1).unwrap();
@@ -982,6 +985,7 @@ fn release_held_to_agent_with_relative_cwd_is_a_repo_mismatch() {
         proc_id: None,
         fresh: true,
         wake: false,
+        session: None,
     };
     let f = s.register(req, 1, &|_| false).unwrap().0.address;
     let err = s
@@ -1106,6 +1110,7 @@ fn register_req(name: &str, cwd: &str, repo: Option<&str>) -> agentmail::store::
         proc_id: None,
         fresh: true,
         wake: false,
+        session: None,
     }
 }
 
@@ -1134,14 +1139,15 @@ fn register_and_release_delivers_held_mail_in_one_step() {
         )
         .unwrap();
 
-    let (f, reclaimed, released) = s
+    let (f, released) = s
         .register_and_release(
             register_req("frontend", "/repo/sub", Some("/repo")),
             3,
             NOT_ALIVE,
         )
         .unwrap();
-    assert!(!reclaimed);
+    assert!(!f.reclaimed && !f.existing);
+    let f = f.agent;
     assert_eq!(ids(&released), vec![m.id.as_str()]);
     assert_eq!(released[0].to, vec![f.address.clone()]);
     assert_eq!(s.get_agent(&f.address).unwrap().unwrap(), f);
@@ -1150,14 +1156,14 @@ fn register_and_release_delivers_held_mail_in_one_step() {
         vec![m.id.as_str()]
     );
 
-    let (d, _, released) = s
+    let (d, released) = s
         .register_and_release(register_req("docs", "/w", None), 4, NOT_ALIVE)
         .unwrap();
     assert_eq!(ids(&released), vec![m2.id.as_str()]);
-    assert_eq!(released[0].to, vec![d.address.clone()]);
+    assert_eq!(released[0].to, vec![d.agent.address.clone()]);
 
     // Released once only.
-    let (_, _, released) = s
+    let (_, released) = s
         .register_and_release(
             register_req("frontend", "/repo", Some("/repo")),
             5,
@@ -1170,11 +1176,11 @@ fn register_and_release_delivers_held_mail_in_one_step() {
 #[test]
 fn register_and_release_with_relative_cwd_registers_and_releases_nothing() {
     let (_d, s) = store();
-    let (f, _, released) = s
+    let (f, released) = s
         .register_and_release(register_req("frontend", "relative/dir", None), 1, NOT_ALIVE)
         .unwrap();
     assert!(released.is_empty());
-    assert!(s.get_agent(&f.address).unwrap().is_some());
+    assert!(s.get_agent(&f.agent.address).unwrap().is_some());
 }
 
 #[test]

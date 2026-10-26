@@ -1032,6 +1032,7 @@ mod tests {
                     repo: None,
                     proc_id: None,
                     wake: false,
+                    session: None,
                     registered_at: 0,
                     last_seen: 0,
                     signed_off: false,
@@ -1210,6 +1211,7 @@ mod tests {
                 proc_id: None,
                 fresh: true,
                 wake: false,
+                session: None,
             };
             let (agent, _) = store.register(req, 1, &|_| false).unwrap();
             let msg = NewMessage {
