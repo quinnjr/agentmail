@@ -138,6 +138,32 @@ fn unbind_session(
     Ok(())
 }
 
+/// Bind session `k` to `addr` unless its row names another agent still
+/// bound to `k` (not signed off, `session == Some(k)`): a session pair names
+/// at most one non-signed-off agent. A row left pointing at an agent that
+/// no longer holds `k` is stale and is overwritten. Returns whether `k` is
+/// now bound to `addr`.
+fn bind_session(
+    table: &redb::Table<&'static str, &'static [u8]>,
+    sessions: &mut redb::Table<(&'static str, &'static str), &'static str>,
+    k: &SessionKey,
+    addr: &str,
+) -> Result<bool, StoreError> {
+    let holder = sessions.get(session_key(k))?.map(|v| v.value().to_string());
+    let free = match holder {
+        None => true,
+        Some(h) if h == addr => true,
+        Some(h) => {
+            let held: Option<Agent> = get_json(table, &h)?;
+            !held.is_some_and(|o| !o.signed_off && o.session.as_ref() == Some(k))
+        }
+    };
+    if free {
+        sessions.insert(session_key(k), addr)?;
+    }
+    Ok(free)
+}
+
 /// One process-level address per process: unbind (clear `proc_id` of)
 /// every other agent bound to `agent`'s process, except agents of shared
 /// sessions ([`shared_session`]), which belong to their session.
@@ -171,15 +197,18 @@ fn claim_process(
     };
     for (i, mut other) in displaced.into_iter().enumerate() {
         other.proc_id = None;
-        if let Some(k) = other.session.take() {
+        let session = other.session.take();
+        // Written before the heir binding so `other` no longer holds it.
+        table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
+        if let Some(k) = session {
             if Some(i) == heir {
-                sessions.insert(session_key(&k), agent.address.as_str())?;
-                agent.session = Some(k);
+                if bind_session(table, sessions, &k, &agent.address)? {
+                    agent.session = Some(k);
+                }
             } else {
                 unbind_session(sessions, &k, &other.address)?;
             }
         }
-        table.insert(other.address.as_str(), encode(&other)?.as_slice())?;
     }
     Ok(())
 }
@@ -197,7 +226,9 @@ impl Store {
     /// and contacts are kept; `role`, `working_on`, `harness`, `repo`,
     /// `wake`, `proc_id`, `session` and `last_seen` are replaced and
     /// `signed_off` is cleared. A session-less re-registration of an agent
-    /// bound to its process's own session keeps that session.
+    /// bound to its process's own session keeps that session, unless the
+    /// agent signed off (signoff freed it). A session is bound only when no
+    /// other non-signed-off agent holds it; otherwise the result has none.
     ///
     /// The returned flag is true only when the address was taken back from a
     /// different or absent process; a re-registration that keeps the address
@@ -309,6 +340,7 @@ impl Store {
         let mut old_session = None;
         let mut agent = match reclaim {
             Some(mut a) => {
+                let was_signed_off = a.signed_off;
                 old_session = a.session.take();
                 a.role = req.role;
                 a.working_on = req.working_on;
@@ -316,9 +348,11 @@ impl Store {
                 a.repo = req.repo;
                 a.proc_id = req.proc_id;
                 // The process's own session stays bound when the process
-                // registers again without naming it.
+                // registers again without naming it, unless the agent signed
+                // off: signoff freed that session, which another agent may
+                // have bound since.
                 a.session = match req.session {
-                    None if own => old_session.clone(),
+                    None if own && !was_signed_off => old_session.clone(),
                     s => s,
                 };
                 a.wake = req.wake;
@@ -360,8 +394,10 @@ impl Store {
             unbind_session(&mut sessions, &old, &agent.address)?;
         }
         claim_process(&mut table, &mut sessions, &agents, &mut agent)?;
-        if let Some(k) = &agent.session {
-            sessions.insert(session_key(k), agent.address.as_str())?;
+        if let Some(k) = agent.session.take()
+            && bind_session(&table, &mut sessions, &k, &agent.address)?
+        {
+            agent.session = Some(k);
         }
         table.insert(agent.address.as_str(), encode(&agent)?.as_slice())?;
         Ok(Registered {

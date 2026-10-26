@@ -978,3 +978,53 @@ fn session_harness_must_match_registration_harness() {
     ));
     assert!(s.list_agents().unwrap().is_empty());
 }
+
+#[test]
+fn signed_off_reregistration_does_not_revive_its_old_session() {
+    // After signoff, a session-less re-registration of the process's own
+    // agent goes through the normal rules: it must not take back a
+    // session another live agent has bound since.
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let (a, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), Some("k1")), 1);
+    s.signoff(&a.address).unwrap();
+    let (b, _) = register(&s, &procs, kiro_req("frontend", None, Some("k1")), 2);
+    assert_ne!(a.address, b.address);
+    assert_eq!(
+        s.find_by_session(&kiro_key("k1")).unwrap().unwrap().address,
+        b.address
+    );
+    let (c, _) = register(&s, &procs, kiro_req("backend", Some(p(1)), None), 3);
+    assert_eq!(c.address, a.address);
+    assert_eq!(c.session, None);
+    assert_eq!(s.get_agent(&a.address).unwrap().unwrap().session, None);
+    assert_eq!(
+        s.find_by_session(&kiro_key("k1")).unwrap().unwrap().address,
+        b.address
+    );
+    let b_now = s.get_agent(&b.address).unwrap().unwrap();
+    assert_eq!(b_now.session, Some(kiro_key("k1")));
+    assert!(!b_now.signed_off);
+}
+
+#[test]
+fn signed_off_claude_reregistration_does_not_revive_its_old_session() {
+    let (_d, s) = store();
+    let procs = Procs::new(&[p(1)]);
+    let key = SessionKey {
+        harness: Harness::ClaudeCode,
+        id: "c1".into(),
+    };
+    let claude_req = |name: &str, proc_id: Option<ProcId>| {
+        let mut r = req(name, "/w", proc_id);
+        r.session = Some(key.clone());
+        r
+    };
+    let (a, _) = register(&s, &procs, claude_req("backend", Some(p(1))), 1);
+    s.signoff(&a.address).unwrap();
+    let (b, _) = register(&s, &procs, claude_req("frontend", None), 2);
+    let (c, _) = register(&s, &procs, req("backend", "/w", Some(p(1))), 3);
+    assert_eq!(c.address, a.address);
+    assert_eq!(c.session, None);
+    assert_eq!(s.find_by_session(&key).unwrap().unwrap().address, b.address);
+}
