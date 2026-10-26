@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -121,6 +121,17 @@ db_error_from!(
     serde_json::Error,
 );
 
+/// The database was written by a build with a schema this one does not
+/// know. Permanent: opening it again cannot succeed.
+#[derive(Debug, thiserror::Error)]
+#[error("{path} has schema version {found}, this build supports {SCHEMA_VERSION}")]
+pub struct UnsupportedSchema {
+    /// The database file.
+    pub path: String,
+    /// The schema version it records.
+    pub found: String,
+}
+
 /// Handle to the agentmail database.
 pub struct Store {
     db: Database,
@@ -154,10 +165,13 @@ impl Store {
                     migrate_mailbox_v1(&txn)?;
                     meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)?;
                 }
-                Some(v) => bail!(
-                    "{} has schema version {v}, this build supports {SCHEMA_VERSION}",
-                    path.display()
-                ),
+                Some(v) => {
+                    return Err(UnsupportedSchema {
+                        path: path.display().to_string(),
+                        found: v.to_string(),
+                    }
+                    .into());
+                }
             }
             txn.open_table(AGENTS)?;
             txn.open_table(CONTACTS)?;

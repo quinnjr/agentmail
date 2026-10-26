@@ -113,7 +113,8 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Open the store at `path`, retrying for up to [`STORE_OPEN_WAIT`] (a
-/// previous daemon in this process may still be releasing it). `None` when
+/// previous daemon in this process may still be releasing it); an
+/// [`crate::store::UnsupportedSchema`] fails at once. `None` when
 /// `stop` resolves first; it is checked between attempts, so an attempt
 /// already running finishes first. Never polls `stop` again once it has
 /// resolved.
@@ -127,6 +128,8 @@ async fn open_store<F: Future<Output = ()>>(
         let res = tokio::task::spawn_blocking(move || Store::open(&p)).await?;
         match res {
             Ok(store) => return Ok(Some(store)),
+            // Retrying cannot help a database of an unknown schema.
+            Err(e) if e.is::<crate::store::UnsupportedSchema>() => return Err(e),
             Err(e) if Instant::now() >= deadline => return Err(e),
             Err(_) => tokio::select! {
                 biased;

@@ -140,11 +140,12 @@ fn daemon_bin_from(env: Option<OsString>) -> Result<PathBuf> {
 
 /// Why a daemon spawned at or after `since` failed to start, as it recorded
 /// in [`Paths::startup_error`]. An older record is from an earlier attempt
-/// and says nothing about this one.
-fn fresh_startup_error(paths: &Paths, since: SystemTime) -> Option<String> {
+/// and says nothing about this one. `slack` is how much older than `since`
+/// the record may look and still count (see [`STARTUP_ERROR_SLACK`]).
+fn fresh_startup_error(paths: &Paths, since: SystemTime, slack: Duration) -> Option<String> {
     let path = paths.startup_error();
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-    if modified < since.checked_sub(STARTUP_ERROR_SLACK).unwrap_or(since) {
+    if modified < since.checked_sub(slack).unwrap_or(since) {
         return None;
     }
     let text = std::fs::read_to_string(&path).ok()?;
@@ -567,6 +568,15 @@ impl Client {
                 Err(Handshake::TimedOut(e)) => last_err = e,
                 Err(Handshake::WrongDataDir(e)) => return Err(e),
             }
+            // A start-up failure recorded since our first spawn is final:
+            // report it now rather than respawning daemons that fail the
+            // same way until the deadline. Without slack, so a record
+            // from just before our spawn (which a daemon starting now
+            // removes) cannot cut short a start that will succeed; one
+            // stamped early by a coarse file clock waits for the deadline.
+            if let Some(why) = fresh_startup_error(paths, first_spawn, Duration::ZERO) {
+                return Err(anyhow!("the agentmail daemon failed to start: {why}"));
+            }
             if Instant::now() >= deadline {
                 let held = paths.lock_held();
                 let ours = held
@@ -578,7 +588,9 @@ impl Client {
                     .is_some_and(|e| e.code == ErrorCode::VersionMismatch);
                 let msg = if other_version {
                     Client::other_version(paths)
-                } else if let Some(why) = fresh_startup_error(paths, first_spawn) {
+                } else if let Some(why) =
+                    fresh_startup_error(paths, first_spawn, STARTUP_ERROR_SLACK)
+                {
                     // A daemon we spawned recorded why it could not start
                     // (it has no stderr); one respawned since may still
                     // hold the lock as it fails the same way. That reason

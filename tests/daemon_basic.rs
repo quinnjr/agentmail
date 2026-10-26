@@ -1027,10 +1027,15 @@ async fn autostart_reports_why_the_daemon_failed_to_start() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
     set_schema_version(&paths, "999");
+    let started = Instant::now();
     let err = Client::connect_or_spawn_with(&paths, &bin())
         .await
         .err()
         .expect("autostart succeeded against an unsupported schema");
+    // Reported as soon as the spawned daemon records it, not after the
+    // client's full spawn wait (3 s) of respawning doomed daemons.
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
     let msg = format!("{err:#}");
     assert!(msg.contains("schema version 999"), "{msg}");
     assert!(!msg.contains("still shutting down"), "{msg}");
@@ -1087,6 +1092,26 @@ async fn a_stale_start_up_error_is_not_reported() {
     let msg = format!("{err:#}");
     assert!(!msg.contains("an old failure"), "{msg}");
     assert!(msg.contains("did not start"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_just_older_start_up_error_does_not_cut_short_a_good_start() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    std::fs::write(paths.startup_error(), "a failure just before").unwrap();
+    // Older than the spawn, but within the slack the deadline check allows.
+    let recent = std::time::SystemTime::now() - Duration::from_millis(300);
+    std::fs::File::options()
+        .write(true)
+        .open(paths.startup_error())
+        .unwrap()
+        .set_modified(recent)
+        .unwrap();
+    Client::connect_or_spawn_with(&paths, &bin())
+        .await
+        .expect("a stale start-up error stopped a good start");
+    assert!(!paths.startup_error().exists(), "stale start-up error kept");
+    assert!(Client::shutdown(&paths).await.unwrap());
 }
 
 #[tokio::test]

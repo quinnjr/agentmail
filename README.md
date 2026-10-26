@@ -39,6 +39,7 @@ Files:
 | socket | `$XDG_RUNTIME_DIR/agentmail.sock`, else `$XDG_DATA_HOME/agentmail/agentmail.sock` (mode 0600) |
 | daemon lock | `agentmail.lock` in the data directory: held by the running daemon, and records whether the last daemon was supervised (`--wait-for-lock`), its pid and its socket |
 | waiter lock | `agentmail.waiter` in the data directory: held by a `--wait-for-lock` daemon while it waits for the daemon lock, with the same record |
+| start-up error | `daemon.err` in the data directory: why the last spawned daemon failed to start, for the CLI to report; removed once a daemon starts |
 
 `AGENTMAIL_DATA_DIR` (the data directory) and `AGENTMAIL_SOCKET` override
 these, e.g. to run an isolated instance for tests.
@@ -266,7 +267,7 @@ it, run against a schema-2 database, gives a clear reason only from
 .../agentmail.redb has schema version 2, this build supports 1
 ```
 
-Its CLI commands, MCP server and hooks, which start the daemon on demand,
+Its CLI commands and MCP server, which start the daemon on demand,
 instead report a misleading error such as `the daemon holding
 .../agentmail.lock is still shutting down (finishing in-flight requests); try
 again once it has exited: No such file or directory`, and never mention the
