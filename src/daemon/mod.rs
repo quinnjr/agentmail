@@ -257,6 +257,39 @@ async fn wait_for_lock(lock: &File, path: &Path) -> Result<bool> {
     }
 }
 
+/// Take the lock on the waiter file ([`Paths::waiter`]) and write `record`
+/// to it, so clients know a supervised daemon waits for the daemon lock.
+/// The lock lasts as long as the returned file is open. Best effort: `None`
+/// when the file cannot be locked (say, another supervised daemon waits
+/// already), and clients then just do not know about us.
+async fn announce_waiter(paths: &Paths, record: &LockRecord) -> Option<File> {
+    let path = paths.waiter();
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path);
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("agentmail daemon: opening {}: {e}", path.display());
+            return None;
+        }
+    };
+    match take_lock(&file, &path).await {
+        Ok(true) => {
+            write_lock_record(&file, &path, record);
+            Some(file)
+        }
+        Ok(false) => None,
+        Err(e) => {
+            eprintln!("agentmail daemon: {e:#}");
+            None
+        }
+    }
+}
+
 /// Whether `stop` has already resolved. Polls it once; only call it again
 /// while it returned false.
 fn fired<F: Future<Output = ()>>(stop: Pin<&mut F>) -> bool {
@@ -322,7 +355,13 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 /// Once it holds the lock the daemon records in the lock file whether it
 /// is supervised (`wait_for_lock`) and which socket it serves (see
 /// [`LockRecord`]), so clients that find it gone know whether to wait for
-/// a supervisor to start the next one.
+/// a supervisor to start the next one. While it waits for the lock, a
+/// daemon with `wait_for_lock` holds [`Paths::waiter`] and records itself
+/// there, so clients that stop the daemon it waits behind wait for it.
+///
+/// However the serve loop ends, `stop` keeps being polled while in-flight
+/// requests finish, so a [`shutdown_signal`] during that wait arms its
+/// second-signal exit as it does when a signal started the shutdown.
 pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> Result<()> {
     let paths = cfg.paths;
     let mut stop = std::pin::pin!(stop);
@@ -334,29 +373,30 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         .truncate(false)
         .open(&paths.lock)
         .with_context(|| format!("opening {}", paths.lock.display()))?;
+    let record = LockRecord {
+        supervised: cfg.wait_for_lock,
+        socket: paths.socket.clone(),
+    };
     let locked = async {
         if cfg.wait_for_lock {
-            wait_for_lock(&lock, &paths.lock).await
+            // Announce ourselves while we wait, and until the lock record
+            // says we hold the lock.
+            let waiter = announce_waiter(&paths, &record).await;
+            (wait_for_lock(&lock, &paths.lock).await, waiter)
         } else {
-            take_lock(&lock, &paths.lock).await
+            (take_lock(&lock, &paths.lock).await, None)
         }
     };
-    let locked = tokio::select! {
+    let (locked, waiter) = tokio::select! {
         biased;
         () = &mut stop => return Ok(()),
-        locked = locked => locked?,
+        locked = locked => locked,
     };
-    if !locked {
+    if !locked? {
         return Ok(());
     }
-    write_lock_record(
-        &lock,
-        &paths.lock,
-        &LockRecord {
-            supervised: cfg.wait_for_lock,
-            socket: paths.socket.clone(),
-        },
-    );
+    write_lock_record(&lock, &paths.lock, &record);
+    drop(waiter);
 
     let Some(store) = open_store(&paths.db, stop.as_mut()).await? else {
         return Ok(());
@@ -384,6 +424,8 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     let data_dir: Arc<Path> = Arc::from(paths.data_dir.as_path());
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
+    // Whether `stop` has resolved, after which it must not be polled again.
+    let mut stopped = false;
     let mut conns = JoinSet::new();
     let mut check = tokio::time::interval(SOCKET_CHECK_INTERVAL);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -404,7 +446,10 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
                 }
             },
             _ = stop_rx.changed() => break,
-            () = &mut stop => break,
+            () = &mut stop => {
+                stopped = true;
+                break;
+            }
             _ = check.tick() => {
                 if file_id(&paths.socket) != Some(socket_id) {
                     break;
@@ -419,9 +464,18 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         let _ = std::fs::remove_file(&paths.socket);
     }
     drop(listener);
-    conns.shutdown().await;
-    drop(handler);
-    release_store(store_ref, lock, STORE_RELEASE_WARN).await;
+    let mut drain = std::pin::pin!(async move {
+        conns.shutdown().await;
+        drop(handler);
+        release_store(store_ref, lock, STORE_RELEASE_WARN).await;
+    });
+    if !stopped {
+        tokio::select! {
+            () = drain.as_mut() => return Ok(()),
+            () = stop.as_mut() => {}
+        }
+    }
+    drain.await;
     Ok(())
 }
 

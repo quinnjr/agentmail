@@ -50,21 +50,51 @@ const RECORD_REREAD_INTERVAL: Duration = Duration::from_millis(10);
 /// record that does not decode is read again a few times before it counts
 /// as none.
 async fn settled_lock_record(paths: &Paths) -> Option<LockRecord> {
+    settled_record(|| paths.lock_record(), || paths.lock_held()).await
+}
+
+/// The record of a supervised daemon waiting for the lock (see
+/// [`Paths::waiter`]), if one waits; read like [`settled_lock_record`].
+async fn settled_waiter_record(paths: &Paths) -> Option<LockRecord> {
+    if !paths.waiter_held() {
+        return None;
+    }
+    settled_record(|| paths.waiter_record(), || paths.waiter_held()).await
+}
+
+async fn settled_record(
+    read: impl Fn() -> Option<LockRecord>,
+    held: impl Fn() -> bool,
+) -> Option<LockRecord> {
     for _ in 1..RECORD_READS {
-        if let Some(rec) = paths.lock_record() {
+        if let Some(rec) = read() {
             return Some(rec);
         }
-        if !paths.lock_held() {
+        if !held() {
             return None;
         }
         tokio::time::sleep(RECORD_REREAD_INTERVAL).await;
     }
-    paths.lock_record()
+    read()
 }
 
 /// Whether `rec` is the record of a daemon serving the socket of `paths`.
+///
+/// The socket itself may be gone (a draining daemon removes it first), so
+/// spellings that differ are compared by file name and resolved parent
+/// directory, which outlives the socket.
 fn serves_our_socket(paths: &Paths, rec: &LockRecord) -> bool {
-    lexical(&rec.socket) == lexical(&paths.socket) || same_dir(&rec.socket, &paths.socket)
+    let (ours, theirs) = (lexical(&paths.socket), lexical(&rec.socket));
+    if ours == theirs {
+        return true;
+    }
+    match (
+        ours.parent().zip(ours.file_name()),
+        theirs.parent().zip(theirs.file_name()),
+    ) {
+        (Some((a, name_a)), Some((b, name_b))) => name_a == name_b && same_dir(a, b),
+        _ => false,
+    }
 }
 
 /// A connection to the daemon that has completed the `Hello` handshake.
@@ -365,15 +395,18 @@ impl Client {
 
     /// Wait for a daemon that replaces one going away, so as not to race a
     /// supervisor with an unsupervised daemon. `None` when the client
-    /// should start one itself.
+    /// should start one itself; an error when the successor speaks another
+    /// protocol version.
     ///
     /// While a daemon holds the lock for our socket without answering (it
     /// is finishing in-flight requests after removing its socket), wait up
     /// to [`DRAIN_WAIT`] for it to release the lock. Then, only if the last
     /// daemon to hold the lock was supervised, keep trying for up to
-    /// [`SUCCESSOR_WAIT`] to reach the one its supervisor starts next.
-    /// Without a supervisor (the record says `on-demand`, or there is none)
-    /// return at once. A lock held for another socket is a misconfiguration
+    /// [`SUCCESSOR_WAIT`] to reach the one its supervisor starts next. The
+    /// same holds when a supervised daemon for our socket is waiting for the
+    /// lock (see [`Paths::waiter`]): it takes over from an on-demand daemon.
+    /// Without a supervisor (the record says `on-demand`, or there is none,
+    /// and no supervised daemon waits) return at once. A lock held for another socket is a misconfiguration
     /// that [`Client::spawn_and_connect`] reports, so it is not waited for.
     async fn await_successor(paths: &Paths) -> Result<Option<Client>> {
         let drain_deadline = Instant::now() + DRAIN_WAIT;
@@ -393,9 +426,16 @@ impl Client {
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
-        if !settled_lock_record(paths)
+        // A supervised daemon waiting for the lock lets go of the waiter
+        // file only once its record is in the lock file, so look there
+        // first.
+        let waiter = settled_waiter_record(paths)
             .await
-            .is_some_and(|r| r.supervised && serves_our_socket(paths, &r))
+            .is_some_and(|r| serves_our_socket(paths, &r));
+        if !waiter
+            && !settled_lock_record(paths)
+                .await
+                .is_some_and(|r| r.supervised && serves_our_socket(paths, &r))
         {
             return Ok(None);
         }
@@ -413,13 +453,29 @@ impl Client {
     }
 
     /// One attempt to reach a daemon of our protocol within `limit`. `None`
-    /// when nothing answered it, or only a daemon going away did.
+    /// when nothing answered it, or only a daemon going away did. A daemon
+    /// of another protocol version is an error: it serves, and waiting
+    /// longer will not change its version.
     async fn try_successor(paths: &Paths, limit: Duration) -> Result<Option<Client>> {
         match Client::open_and_hello(paths, limit).await {
             Ok(c) => Ok(Some(c)),
             Err(Handshake::WrongDataDir(e)) => Err(e),
+            Err(Handshake::Refused(_, e)) if e.code == ErrorCode::VersionMismatch => {
+                Err(anyhow::Error::new(e).context(Client::other_version(paths)))
+            }
             Err(Handshake::Open(_) | Handshake::Refused(..) | Handshake::TimedOut(_)) => Ok(None),
         }
+    }
+
+    /// The message for a daemon at our socket that speaks another protocol
+    /// version and stays.
+    fn other_version(paths: &Paths) -> String {
+        format!(
+            "the daemon at {} speaks another protocol version; is another \
+             agentmail binary serving it (e.g. a systemd unit's ExecStart, or \
+             AGENTMAIL_BIN)? Run the same agentmail everywhere",
+            paths.socket.display()
+        )
     }
 
     async fn spawn_and_connect(paths: &Paths, bin: &Path) -> Result<Client> {
@@ -444,7 +500,12 @@ impl Client {
                     && settled_lock_record(paths)
                         .await
                         .is_some_and(|r| serves_our_socket(paths, &r));
-                let msg = if ours {
+                let other_version = last_err
+                    .downcast_ref::<ClientError>()
+                    .is_some_and(|e| e.code == ErrorCode::VersionMismatch);
+                let msg = if other_version {
+                    Client::other_version(paths)
+                } else if ours {
                     // It serves our socket but no longer listens: it is
                     // still finishing in-flight requests.
                     format!(
@@ -630,6 +691,117 @@ mod tests {
         });
         assert_eq!(settled_lock_record(&paths).await, Some(rec));
         fix.join().unwrap();
+    }
+
+    /// A daemon that has removed its socket (it is draining) still counts
+    /// as serving ours when the two spell the socket's directory through
+    /// different symlinks.
+    #[test]
+    fn serves_our_socket_resolves_a_symlinked_directory_without_the_socket() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("run");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut paths = Paths::in_dir(tmp.path());
+        paths.socket = link.join("agentmail.sock");
+        let rec = |socket: PathBuf| LockRecord {
+            supervised: false,
+            socket,
+        };
+        assert!(!paths.socket.exists());
+        assert!(serves_our_socket(&paths, &rec(real.join("agentmail.sock"))));
+        assert!(serves_our_socket(
+            &paths,
+            &rec(link.join("./agentmail.sock"))
+        ));
+        assert!(!serves_our_socket(&paths, &rec(real.join("other.sock"))));
+        assert!(!serves_our_socket(
+            &paths,
+            &rec(tmp.path().join("agentmail.sock"))
+        ));
+    }
+
+    /// A listener at `paths.socket` that answers every `Hello` with
+    /// `VersionMismatch` and ignores everything else, like a daemon of
+    /// another protocol version that will not go away.
+    fn other_version_daemon(paths: &Paths) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(_)) = lines.next_line().await {
+                        let resp = Response::Err {
+                            code: ErrorCode::VersionMismatch,
+                            message: "other version".into(),
+                            candidates: Vec::new(),
+                        };
+                        let mut out = serde_json::to_vec(&resp).unwrap();
+                        out.push(b'\n');
+                        if w.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// When the daemon holding the lock for our socket answers, but speaks
+    /// another protocol version, autostart says so rather than that it is
+    /// still shutting down.
+    #[tokio::test]
+    async fn autostart_reports_a_daemon_of_another_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(tmp.path());
+        let rec = LockRecord {
+            supervised: true,
+            socket: paths.socket.clone(),
+        };
+        std::fs::write(&paths.lock, rec.encode()).unwrap();
+        let lock = std::fs::File::open(&paths.lock).unwrap();
+        crate::test_util::eventually(|| lock.try_lock()).unwrap();
+        let fake = other_version_daemon(&paths);
+        // `true daemon run` exits at once, as a daemon finding the lock held
+        // would.
+        let err = Client::spawn_and_connect(&paths, Path::new("/bin/true"))
+            .await
+            .err()
+            .expect("connected to a daemon of another version");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("another protocol version"), "{msg}");
+        assert!(!msg.contains("still shutting down"), "{msg}");
+        fake.abort();
+    }
+
+    /// A successor that speaks another protocol version ends the wait for
+    /// one at once, with an error that says so.
+    #[tokio::test]
+    async fn a_successor_of_another_version_is_an_error_at_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(tmp.path());
+        let rec = LockRecord {
+            supervised: true,
+            socket: paths.socket.clone(),
+        };
+        std::fs::write(&paths.lock, rec.encode()).unwrap();
+        let fake = other_version_daemon(&paths);
+        let began = Instant::now();
+        let err = Client::await_successor(&paths)
+            .await
+            .err()
+            .expect("a successor of another version is not ours");
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "waited {:?}",
+            began.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("another protocol version"), "{msg}");
+        fake.abort();
     }
 
     #[test]

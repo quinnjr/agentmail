@@ -88,12 +88,17 @@ default (`control-group`), `systemctl stop` and `restart` send SIGTERM to
 every process in the unit at once, including the `git` commands in-flight
 requests run to find an agent's repository. Those requests would then
 finish without one, and `register` would record the agent with no repo.
-With `mixed`, only the daemon gets SIGTERM, and whatever is left in the unit
-is killed only if the daemon has not exited by `TimeoutStopSec`.
+With `mixed`, only the daemon gets SIGTERM; any process left in the unit is
+sent SIGKILL once the daemon exits, or at `TimeoutStopSec` if it has not. The
+daemon reaps its `git` commands before it exits, so normally nothing is left.
 
 With `--wait-for-lock`, a unit started while another daemon (say, one an
 agent started on demand) holds the lock waits for that daemon to exit and
-then takes over, instead of exiting. Without the flag `daemon run` exits 0 at
+then takes over, instead of exiting. While it waits it holds a lock on
+`agentmail.waiter` in the data directory, so a client that stops the other
+daemon (`agentmail daemon stop`, or a newer client replacing an older daemon)
+waits for the unit's daemon to take over rather than starting another
+on-demand daemon it would have to wait behind. Without the flag `daemon run` exits 0 at
 once and leaves the other daemon serving, and a unit doing that shows as
 `inactive (dead)`: systemd supervises nothing until it is started again.
 
@@ -115,11 +120,13 @@ while the unit is stopped. To avoid racing systemd, a daemon run with
 `--wait-for-lock` notes in its lock file that it is supervised. A client
 that finds no daemon answering first waits for one that is shutting down to
 finish its in-flight requests (up to 5s), then, if the last daemon was
-supervised, gives systemd up to 2s to start the next one before starting a
-daemon of its own. Without a supervisor neither wait applies beyond the
-shutdown, so on-demand start stays immediate. The first client after
-`systemctl --user stop` therefore takes about 2s longer to start its
-daemon.
+supervised or a supervised one is waiting for the lock, gives it up to 2s to
+take over before starting a daemon of its own. Without a supervisor neither
+wait applies beyond the shutdown, so on-demand start stays immediate. The
+first client after `systemctl --user stop` therefore takes about 2s longer to
+start its daemon. If the daemon that takes over speaks another protocol
+version (the unit's `ExecStart` runs a different `agentmail` than the
+client), the client says so at once instead of waiting.
 
 A window remains: if systemd takes longer than that to bring the daemon
 back (a slow start, or a shutdown that outlasts the 5s wait), a client

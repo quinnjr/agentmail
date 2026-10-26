@@ -2099,3 +2099,58 @@ async fn autostart_reports_a_daemon_still_shutting_down() {
     }
     drop(lock);
 }
+
+/// A unit daemon (`--wait-for-lock`) waiting behind an on-demand daemon
+/// takes over once a client stops that one, e.g. as a newer client stops
+/// an older daemon: the client waits for the unit's daemon rather than
+/// starting another on-demand daemon that the unit would wait behind.
+#[tokio::test]
+async fn client_waits_for_a_unit_daemon_waiting_behind_an_on_demand_one() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let mut on_demand = Foreground::spawn(&paths, &["daemon", "run"], None);
+    drop(on_demand.serving(&paths).await);
+    let mut unit = Foreground::spawn(&paths, &["daemon", "run", "--wait-for-lock"], None);
+    tokio::time::sleep(GIVE_UP_WINDOW).await;
+    assert!(unit.running(), "gave up on the held lock");
+    assert_eq!(paths.lock_record(), Some(record(&paths, false)));
+
+    assert!(Client::shutdown(&paths).await.unwrap());
+    // Starting a daemon of its own would fail: there is no such binary.
+    let mut c = Client::connect_or_spawn_with(&paths, Path::new("/nonexistent/agentmail"))
+        .await
+        .expect("the client did not wait for the unit's daemon");
+    assert_eq!(hello_pid(&mut c).await, u64::from(unit.0.id()));
+    drop(c);
+    let (status, err) = on_demand.exit_within(PROCESS_WAIT).await;
+    assert!(status.success(), "{status:?}: {err}");
+    assert_eq!(paths.lock_record(), Some(record(&paths, true)));
+    unit.terminate().await;
+}
+
+/// A drain that a `Shutdown` request started honours signals like one a
+/// signal started: a second signal exits at once.
+#[tokio::test]
+async fn second_signal_during_a_requested_shutdown_exits_without_waiting() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let (path, started) = stalling_git(dir.path());
+
+    let mut child = Foreground::spawn(&paths, &["daemon", "run"], Some(&path));
+    let c = child.serving(&paths).await;
+    let (slow, _git) = stall_in_git(c, dir.path(), &started).await;
+
+    assert!(Client::shutdown(&paths).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    child.signal(libc::SIGINT);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        child.running(),
+        "shutdown did not wait for the in-flight request"
+    );
+    child.signal(libc::SIGINT);
+    let (status, err) = child.exit_within(Duration::from_millis(500)).await;
+    assert_eq!(status.code(), Some(1), "{status:?}: {err}");
+    assert!(err.contains("second signal"), "{err}");
+    let _ = slow.await;
+}

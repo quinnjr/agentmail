@@ -8,11 +8,15 @@ use anyhow::{Result, bail};
 const DB_FILE: &str = "agentmail.redb";
 const SOCKET_FILE: &str = "agentmail.sock";
 const LOCK_FILE: &str = "agentmail.lock";
+const WAITER_FILE: &str = "agentmail.waiter";
 
 /// What a daemon writes to the lock file once it holds the lock, read by
 /// clients deciding whether to wait for a successor after it has gone: one
 /// line `supervised` or `on-demand`, then one line with the socket it
-/// serves.
+/// serves, a backslash and a newline in it written as `\\` and `\n`.
+///
+/// A supervised daemon waiting for the lock (see [`Paths::waiter`]) writes
+/// the same record to the waiter file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockRecord {
     /// Run by a supervisor (`daemon run --wait-for-lock`), which starts a
@@ -36,7 +40,13 @@ impl LockRecord {
         }
         .to_vec();
         out.push(b'\n');
-        out.extend_from_slice(self.socket.as_os_str().as_bytes());
+        for &b in self.socket.as_os_str().as_bytes() {
+            match b {
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b => out.push(b),
+            }
+        }
         out.push(b'\n');
         out
     }
@@ -56,10 +66,35 @@ impl LockRecord {
         if lines.next().is_some() {
             return None;
         }
+        let mut path = Vec::with_capacity(socket.len());
+        let mut bytes = socket.iter();
+        while let Some(&b) = bytes.next() {
+            path.push(match b {
+                b'\\' => match bytes.next()? {
+                    b'\\' => b'\\',
+                    b'n' => b'\n',
+                    _ => return None,
+                },
+                b => b,
+            });
+        }
         Some(LockRecord {
             supervised,
-            socket: PathBuf::from(std::ffi::OsStr::from_bytes(socket)),
+            socket: PathBuf::from(std::ffi::OsStr::from_bytes(&path)),
         })
+    }
+}
+
+/// Whether some process holds the `flock` on the file at `path`; see
+/// [`Paths::lock_held`].
+fn held(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
     }
 }
 
@@ -146,20 +181,34 @@ impl Paths {
     /// it for an instant; a starting daemon retries briefly, so this cannot
     /// make it give up.
     pub fn lock_held(&self) -> bool {
-        let Ok(file) = std::fs::File::open(&self.lock) else {
-            return false;
-        };
-        match file.try_lock() {
-            Ok(()) => false,
-            Err(std::fs::TryLockError::WouldBlock) => true,
-            Err(std::fs::TryLockError::Error(_)) => false,
-        }
+        held(&self.lock)
     }
 
     /// The record the last daemon to take the lock left in the lock file,
     /// if any.
     pub fn lock_record(&self) -> Option<LockRecord> {
         LockRecord::decode(&std::fs::read(&self.lock).ok()?)
+    }
+
+    /// The waiter file, next to [`Paths::lock`]. A supervised daemon
+    /// (`daemon run --wait-for-lock`) holds a lock on it, and has written its
+    /// [`LockRecord`] to it, for as long as it waits for the daemon lock, so
+    /// a client that stops the daemon it waits behind knows a successor is
+    /// on its way. It lets go only once it holds the daemon lock and has
+    /// recorded itself there.
+    pub fn waiter(&self) -> PathBuf {
+        self.data_dir.join(WAITER_FILE)
+    }
+
+    /// Whether a supervised daemon waits for the daemon lock: some process
+    /// holds the lock on [`Paths::waiter`]. Probes like [`Paths::lock_held`].
+    pub fn waiter_held(&self) -> bool {
+        held(&self.waiter())
+    }
+
+    /// The record in the waiter file, if any.
+    pub fn waiter_record(&self) -> Option<LockRecord> {
+        LockRecord::decode(&std::fs::read(self.waiter()).ok()?)
     }
 
     /// Put everything, socket included, in `dir`. Used by tests.
@@ -180,11 +229,18 @@ mod tests {
     #[test]
     fn lock_record_round_trips_and_rejects_anything_else() {
         for supervised in [true, false] {
-            let rec = LockRecord {
-                supervised,
-                socket: PathBuf::from("/run/user/1000/agentmail.sock"),
-            };
-            assert_eq!(LockRecord::decode(&rec.encode()), Some(rec));
+            for socket in [
+                "/run/user/1000/agentmail.sock",
+                "/tmp/a\nb/agentmail.sock",
+                "/tmp/a\\nb/agentmail.sock",
+                "/tmp/\\\n\\/s\n",
+            ] {
+                let rec = LockRecord {
+                    supervised,
+                    socket: PathBuf::from(socket),
+                };
+                assert_eq!(LockRecord::decode(&rec.encode()), Some(rec), "{socket:?}");
+            }
         }
         assert_eq!(
             LockRecord::decode(b"supervised\n/s\n"),
@@ -200,6 +256,9 @@ mod tests {
             b"supervised\n\n",
             b"maybe\n/s\n",
             b"supervised\n/s\nextra\n",
+            // A lone backslash, or one before anything but `\` or `n`.
+            b"supervised\n/s\\\n",
+            b"supervised\n/s\\x\n",
         ] {
             assert_eq!(LockRecord::decode(bad), None, "{bad:?}");
         }
@@ -363,5 +422,6 @@ mod tests {
         assert_eq!(p.db, PathBuf::from("/t/agentmail.redb"));
         assert_eq!(p.socket, PathBuf::from("/t/agentmail.sock"));
         assert_eq!(p.lock, PathBuf::from("/t/agentmail.lock"));
+        assert_eq!(p.waiter(), PathBuf::from("/t/agentmail.waiter"));
     }
 }
