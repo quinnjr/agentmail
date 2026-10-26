@@ -150,17 +150,21 @@ fn caller_from(
 ///
 /// 1. `explicit_pid` that is one of our own ancestors (the MCP server passes
 ///    its parent) and is not itself a known harness process, whose own
-///    nearest harness ancestor is a kiro process: that kiro process. kiro V3
-///    runs its MCP servers from a `node` helper, and binding the helper
-///    would record [`Harness::Other`]. The kiro must sit above
-///    `explicit_pid`: a pid that names a process above kiro (say the
-///    terminal that launched it) is bound exactly. Only kiro gets this: an
-///    unknown MCP client run from a Claude Code or opencode shell must bind
-///    itself, not the harness it happens to run under, or two agents would
-///    share one process binding.
+///    nearest harness ancestor is a kiro or opencode process: that harness
+///    process. kiro V3 runs its MCP servers from a `node` helper (below
+///    `kiro-cli-chat`), and binding the helper would record
+///    [`Harness::Other`]; opencode may start its server through a wrapper
+///    (`sh -c`), and a session-bound opencode agent's process is the
+///    opencode process itself, whichever path registered it. The harness
+///    must sit above `explicit_pid`: a pid that names a process above it
+///    (say the terminal that launched it) is bound exactly. Claude Code
+///    does not get this: an unknown MCP client run from a Claude Code shell
+///    must bind itself, not the harness it happens to run under, or two
+///    agents would share one process binding. opencode is safe, as its
+///    sessionless registrations are refused (the server is shared).
 /// 2. Any other `explicit_pid` (`register --pid`, or a parent that is a
-///    harness, has no kiro above it, or sits above kiro): exactly that
-///    process, with the harness its command name suggests.
+///    harness, has no kiro or opencode above it, or sits above it): exactly
+///    that process, with the harness its command name suggests.
 /// 3. Otherwise the nearest ancestor that is a known harness process.
 /// 4. Otherwise the grandparent, i.e. the parent of the shell running the
 ///    CLI, as [`Harness::Other`].
@@ -191,7 +195,8 @@ fn register_proc_with(
         let harness = procinfo::comm(pid).map_or(Harness::Other, |c| procinfo::detect_harness(&c));
         if harness == Harness::Other
             && procinfo::ancestors(me).contains(&p)
-            && let Some(found) = find_harness(pid).filter(|(h, k)| usable(h) && *k == Harness::Kiro)
+            && let Some(found) = find_harness(pid)
+                .filter(|(h, k)| usable(h) && (*k == Harness::Kiro || k.shares_process()))
         {
             return Some(found);
         }
@@ -553,21 +558,27 @@ mod tests {
     }
 
     #[test]
-    fn identity_register_proc_explicit_ancestor_ignores_other_harnesses() {
-        // An unknown MCP client run from a Claude Code or opencode shell:
-        // its server's parent (the shell here) sits levels below that
-        // harness, and still binds itself.
+    fn identity_register_proc_explicit_ancestor_ignores_claude_code() {
+        // An unknown MCP client run from a Claude Code shell: its server's
+        // parent (the shell here) sits levels below Claude Code, and still
+        // binds itself.
         let (child, grandchild) = spawn_grandchild();
         let shell = child.id();
-        let found: Vec<_> = [Harness::ClaudeCode, Harness::Opencode]
-            .into_iter()
-            .map(|h| register_proc_with(grandchild, Some(shell), under(h)))
-            .collect();
+        let found = register_proc_with(grandchild, Some(shell), under(Harness::ClaudeCode));
         let shell_id = procinfo::proc_id(shell);
         reap(child, grandchild);
-        for f in found {
-            assert_eq!(f, shell_id.map(|p| (p, Harness::Other)));
-        }
+        assert_eq!(found, shell_id.map(|p| (p, Harness::Other)));
+    }
+
+    #[test]
+    fn identity_register_proc_explicit_ancestor_binds_opencode() {
+        // opencode running its MCP server through a wrapper: the wrapper
+        // (the shell here) is not bound, the opencode above it is.
+        let (child, grandchild) = spawn_grandchild();
+        let me = procinfo::proc_id(std::process::id()).unwrap();
+        let found = register_proc_with(grandchild, Some(child.id()), under(Harness::Opencode));
+        reap(child, grandchild);
+        assert_eq!(found, Some((me, Harness::Opencode)));
     }
 
     #[test]

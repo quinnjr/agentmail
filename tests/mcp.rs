@@ -631,13 +631,14 @@ async fn opencode_meta_session_isolates_callers() {
 }
 
 /// opencode may start the server through a wrapper (`sh -c`): the server
-/// binds the wrapper, yet is still shared between opencode's sessions, so
-/// a sessionless `register` is refused and leaves no identity behind.
+/// binds the opencode process above the wrapper, and is shared between
+/// opencode's sessions, so a sessionless `register` is refused and leaves
+/// no identity behind.
 #[tokio::test(flavor = "multi_thread")]
 async fn opencode_via_wrapper_refuses_sessionless_register() {
     let env = Env::new();
     // opencode -> sh (the wrapper) -> agentmail mcp.
-    let (client, _) = env
+    let (client, opencode) = env
         .mcp_under("opencode", "/bin/sh -c '$MCP; true'; true")
         .await;
 
@@ -655,6 +656,10 @@ async fn opencode_via_wrapper_refuses_sessionless_register() {
         r["address"].as_str().unwrap().starts_with("backend-"),
         "{r}"
     );
+    // Bound to the opencode process, not the wrapper: the same process
+    // `agentmail register` in that session's shell binds.
+    let me = ok(&call_in_session(&client, "s1", "whoami", json!({})).await);
+    assert_eq!(me["agent"]["proc_id"]["pid"], opencode, "{me}");
     let r = call(&client, "whoami", json!({})).await;
     assert!(text(&r).contains("NoIdentity"), "{}", text(&r));
 
@@ -676,6 +681,32 @@ async fn bind_prefers_harness_ancestor() {
     let me = ok(&call(&client, "whoami", json!({})).await);
     assert_eq!(me["agent"]["harness"], "kiro", "{me}");
     // Bound to the kiro-cli process itself, not the intermediate shell.
+    assert_eq!(me["agent"]["proc_id"]["pid"], kiro, "{me}");
+
+    client.cancel().await.unwrap();
+}
+
+/// The real kiro chain: `kiro-cli` -> `kiro-cli-chat` -> the engine's
+/// `node` -> agentmail mcp. `kiro-cli-chat` is not a harness name, so the
+/// binding skips it and reaches `kiro-cli`.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_skips_kiro_cli_chat() {
+    let env = Env::new();
+    let chat = env.dir.path().join("kiro-cli-chat");
+    std::os::unix::fs::symlink("/bin/sh", &chat).unwrap();
+    let node = env.dir.path().join("node");
+    std::os::unix::fs::symlink("/bin/sh", &node).unwrap();
+    // kiro-cli -> kiro-cli-chat -> node -> agentmail mcp.
+    let script = format!(
+        "'{}' -c \"'{}' -c '$MCP; true'; true\"; true",
+        chat.display(),
+        node.display()
+    );
+    let (client, kiro) = env.mcp_under("kiro-cli", &script).await;
+
+    ok(&call(&client, "register", json!({"name": "kiroagent"})).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["harness"], "kiro", "{me}");
     assert_eq!(me["agent"]["proc_id"]["pid"], kiro, "{me}");
 
     client.cancel().await.unwrap();

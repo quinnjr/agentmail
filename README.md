@@ -364,7 +364,10 @@ processes, so they find their address through the harness process they share
   storing its PID and start time (which guards against PID reuse). kiro-cli
   starts its MCP servers from a `node` helper, so when the parent is not a
   harness and a `kiro-cli` sits above it, the nearest `kiro-cli` is bound
-  instead.
+  instead. opencode may start its MCP server through a wrapper (`sh -c`);
+  the opencode process above the wrapper is bound in the same way, so a
+  session's agent is bound to opencode whether it registered over MCP or
+  from the shell.
 - opencode runs every session in one process and shares one MCP server
   between them, so it binds sessions, not processes. A tool call carrying
   `_meta["ai.opencode/sessionID"]` acts as that session, and `register` binds
