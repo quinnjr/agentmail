@@ -242,10 +242,10 @@ impl AgentMailServer {
     pub fn new(paths: Paths) -> AgentMailServer {
         let parent = procinfo::parent_pid(std::process::id());
         let bind = identity::register_proc(parent);
-        let caller = initial_caller(
-            std::env::var(ENV_ADDRESS).ok(),
-            parent.and_then(procinfo::proc_id),
-        );
+        // The same usable parent `register` binds to (never init or a
+        // subreaper the server was reparented to), so lookup and
+        // registration agree.
+        let caller = initial_caller(std::env::var(ENV_ADDRESS).ok(), bind.map(|(p, _)| p));
         AgentMailServer {
             paths,
             caller: Arc::new(Mutex::new(caller)),
@@ -615,6 +615,25 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         names.sort();
-        assert_eq!(names.len(), 15);
+        assert_eq!(
+            names,
+            [
+                "agents",
+                "answer",
+                "ask",
+                "await_answer",
+                "contacts",
+                "inbox",
+                "read",
+                "register",
+                "reply",
+                "search",
+                "send",
+                "signoff",
+                "status",
+                "wait_for_mail",
+                "whoami",
+            ]
+        );
     }
 }

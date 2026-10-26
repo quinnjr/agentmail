@@ -288,3 +288,116 @@ async fn mcp_server_end_to_end() {
 
     client.cancel().await.unwrap();
 }
+
+/// The tools the end-to-end test does not reach, and the argument checks.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_server_status_agents_search_signoff() {
+    let mut env = Env::new();
+    let client = env.mcp().await;
+
+    // An unknown harness is refused before anything is registered.
+    let r = call(
+        &client,
+        "register",
+        json!({"name": "backend", "harness": "bogus"}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true));
+    let t = text(&r);
+    assert!(t.contains("InvalidInput"), "{t}");
+    assert!(t.contains("bogus"), "{t}");
+
+    // A valid override is recorded, and `wake` defaults to true.
+    let reg = ok(&call(
+        &client,
+        "register",
+        json!({"name": "backend", "working_on": "the API", "harness": "opencode"}),
+    )
+    .await);
+    let backend = reg["address"].as_str().unwrap().to_string();
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["address"], backend.as_str(), "{me}");
+    assert_eq!(me["agent"]["harness"], "opencode", "{me}");
+    assert_eq!(me["agent"]["wake"], true, "{me}");
+
+    // `status` updates the working-on summary.
+    ok(&call(&client, "status", json!({"working_on": "the schema"})).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["working_on"], "the schema", "{me}");
+
+    // `agents` filters by name prefix and repo.
+    let frontend = env.cli_agent("frontend");
+    let list = ok(&call(&client, "agents", json!({"name": "back"})).await);
+    let found = list.as_array().unwrap();
+    assert_eq!(found.len(), 1, "{list}");
+    assert_eq!(found[0]["address"], backend.as_str());
+    assert_eq!(found[0]["working_on"], "the schema");
+    let work = env.work.to_string_lossy().to_string();
+    let list = ok(&call(&client, "agents", json!({"repo": work})).await);
+    assert!(list.to_string().contains(&backend), "{list}");
+    assert!(list.to_string().contains(&frontend), "{list}");
+    let elsewhere = env.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let list = ok(&call(
+        &client,
+        "agents",
+        json!({"repo": elsewhere.to_string_lossy()}),
+    )
+    .await);
+    assert_eq!(list.as_array().unwrap().len(), 0, "{list}");
+
+    // `search` finds a message by its subject.
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &frontend)
+        .args([
+            "send",
+            "--to",
+            &backend,
+            "--subject",
+            "hello there",
+            "--body",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = ok(&call(&client, "search", json!({"query": "hello there"})).await);
+    assert!(hits.to_string().contains("hello there"), "{hits}");
+    let none = ok(&call(&client, "search", json!({"query": "zzz-no-such"})).await);
+    assert!(!none.to_string().contains("hello there"), "{none}");
+
+    // Adding or removing a contact needs an address.
+    for action in ["add", "remove"] {
+        let r = call(&client, "contacts", json!({"action": action})).await;
+        assert_eq!(r.is_error, Some(true), "{action}");
+        assert!(text(&r).contains("InvalidInput"), "{}", text(&r));
+    }
+    ok(&call(
+        &client,
+        "contacts",
+        json!({"action": "add", "address": frontend}),
+    )
+    .await);
+    ok(&call(
+        &client,
+        "contacts",
+        json!({"action": "remove", "address": frontend}),
+    )
+    .await);
+    let contacts = ok(&call(&client, "contacts", json!({})).await);
+    assert!(!contacts.to_string().contains(&frontend), "{contacts}");
+
+    // After `signoff` the agent is listed only with `all`.
+    ok(&call(&client, "signoff", json!({})).await);
+    let list = ok(&call(&client, "agents", json!({"name": "backend"})).await);
+    assert_eq!(list.as_array().unwrap().len(), 0, "{list}");
+    let list = ok(&call(&client, "agents", json!({"name": "backend", "all": true})).await);
+    assert!(list.to_string().contains(&backend), "{list}");
+
+    client.cancel().await.unwrap();
+}
