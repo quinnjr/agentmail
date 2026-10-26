@@ -213,11 +213,15 @@ async fn mcp_server_end_to_end() {
     assert_eq!(msgs.len(), 1, "{inbox}");
     assert_eq!(msgs[0]["subject"], "hello there");
     assert_eq!(msgs[0]["from"], frontend.as_str());
+    // Summaries only: the body comes from `read`, which marks it read.
+    assert!(msgs[0].get("body").is_none(), "{inbox}");
+    assert_eq!(msgs[0]["preview"], "hi", "{inbox}");
+    assert_eq!(msgs[0]["body_len"], 2, "{inbox}");
 
     // Read and reply through MCP; the CLI agent sees the reply.
     let id = msgs[0]["id"].as_str().unwrap().to_string();
     let read = ok(&call(&client, "read", json!({"id": id})).await);
-    assert!(read.to_string().contains("hi"), "{read}");
+    assert!(read.to_string().contains("\"body\":\"hi\""), "{read}");
     ok(&call(
         &client,
         "reply",
@@ -437,6 +441,58 @@ async fn mcp_register_wake_and_fresh() {
     let me = ok(&call(&client, "whoami", json!({})).await);
     assert_eq!(me["address"], second.as_str(), "{me}");
     assert_eq!(me["agent"]["wake"], true, "{me}");
+
+    client.cancel().await.unwrap();
+}
+
+/// A blocking tool does not hold up the others on the same session.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_blocking_tools_do_not_block_others() {
+    let mut env = Env::new();
+    let client = env.mcp().await;
+    let reg = ok(&call(&client, "register", json!({"name": "backend"})).await);
+    let backend = reg["address"].as_str().unwrap().to_string();
+    let frontend = env.cli_agent("frontend");
+
+    let peer = client.peer().clone();
+    let started = std::time::Instant::now();
+    let wait = tokio::spawn(async move {
+        let args = json!({"timeout_secs": 5}).as_object().cloned().unwrap();
+        let r = peer
+            .call_tool(CallToolRequestParams::new("wait_for_mail").with_arguments(args))
+            .await
+            .unwrap();
+        (r, started.elapsed())
+    });
+    // Let the wait reach the daemon first.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let t = std::time::Instant::now();
+    let inbox = ok(&call(&client, "inbox", json!({})).await);
+    assert_eq!(inbox, json!([]), "{inbox}");
+    ok(&call(&client, "whoami", json!({})).await);
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "other tools waited {:?}",
+        t.elapsed()
+    );
+    assert!(!wait.is_finished(), "wait_for_mail returned early");
+
+    let out = env
+        .cmd()
+        .env("AGENTMAIL_ADDRESS", &frontend)
+        .args(["send", "--to", &backend, "--subject", "ping", "--body", "x"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (r, elapsed) = wait.await.unwrap();
+    let w = ok(&r);
+    assert_eq!(w["status"], "mail", "{w}");
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
 
     client.cancel().await.unwrap();
 }

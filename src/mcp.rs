@@ -231,6 +231,29 @@ fn json_result(v: &Value, is_error: bool) -> CallToolResult {
     }
 }
 
+/// How much of each body `inbox` shows, in characters.
+const INBOX_PREVIEW_CHARS: usize = 200;
+
+/// `inbox` returns summaries: each message's `body` is replaced by a short
+/// `preview` and its `body_len` in bytes, so checking mail before every
+/// step does not pull full bodies into the agent's context. `read` returns
+/// the body (and marks it read).
+fn summarize_inbox(mut v: Value) -> Value {
+    if let Some(msgs) = v.as_array_mut() {
+        for m in msgs.iter_mut().filter_map(Value::as_object_mut) {
+            if let Some(Value::String(body)) = m.remove("body") {
+                let mut preview: String = body.chars().take(INBOX_PREVIEW_CHARS).collect();
+                if preview.len() < body.len() {
+                    preview.push('…');
+                }
+                m.insert("preview".into(), Value::String(preview));
+                m.insert("body_len".into(), json!(body.len()));
+            }
+        }
+    }
+    v
+}
+
 /// A daemon error as a tool error: `{"error":{code,message,candidates}}`.
 fn error_result(e: &ClientError) -> CallToolResult {
     json_result(&json!({ "error": e }), true)
@@ -522,13 +545,16 @@ impl AgentMailServer {
     }
 
     #[tool(
-        description = "Your mail: open questions to you first, then unread messages (all messages with `all`). Check it before each new step of your work."
+        description = "Your mail as summaries: open questions to you first, then unread messages (all messages with `all`). Each entry has a short `preview` and `body_len`; use `read` for the body, which also marks it read. Check it before each new step of your work."
     )]
     async fn inbox(
         &self,
         Parameters(p): Parameters<InboxParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::Inbox { all: p.all }).await
+        Ok(match self.request(Request::Inbox { all: p.all }).await {
+            Ok(data) => json_result(&summarize_inbox(data), false),
+            Err(e) => error_result(&e),
+        })
     }
 
     #[tool(description = "Read one message, or a whole thread by its thread id, and mark it read.")]
@@ -620,6 +646,28 @@ mod tests {
         assert_eq!(v["error"]["code"], "AmbiguousRecipient");
         assert_eq!(v["error"]["message"], "pick");
         assert!(v["error"]["candidates"].is_array());
+    }
+
+    #[test]
+    fn mcp_inbox_summaries_drop_the_body() {
+        let long = "é".repeat(INBOX_PREVIEW_CHARS + 50);
+        let inbox = json!([
+            {"id": "a", "subject": "s", "body": "short", "from_contact": true},
+            {"id": "b", "subject": "t", "body": long},
+        ]);
+        let v = summarize_inbox(inbox);
+        let msgs = v.as_array().unwrap();
+        assert!(msgs.iter().all(|m| m.get("body").is_none()), "{v}");
+        assert_eq!(msgs[0]["preview"], "short");
+        assert_eq!(msgs[0]["body_len"], 5);
+        assert_eq!(msgs[0]["subject"], "s");
+        assert_eq!(msgs[0]["from_contact"], true);
+        let preview = msgs[1]["preview"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), INBOX_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'), "{preview}");
+        assert_eq!(msgs[1]["body_len"], long.len());
+        // Anything that is not a list of messages passes through.
+        assert_eq!(summarize_inbox(json!({"ok": true})), json!({"ok": true}));
     }
 
     #[test]
