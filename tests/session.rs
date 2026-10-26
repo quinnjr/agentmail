@@ -549,9 +549,17 @@ async fn hook_status_unregistered_is_no_identity() {
     assert_eq!(err.code, ErrorCode::NoIdentity);
     // A signed-off session is unregistered too.
     let h = FakeHarness::spawn();
-    register(&mut c, "backend", d.dir.path(), Some(h.id), "s1", "api").await;
+    let reg = register(&mut c, "backend", d.dir.path(), Some(h.id), "s1", "api").await;
+    let a = address(&reg);
     c.call(&session("s1"), Request::Signoff).await.unwrap();
     let err = c.call(&session("s1"), hook_status(true)).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NoIdentity);
+    // Even when addressed directly (AGENTMAIL_ADDRESS), so the hook stays
+    // silent and its wake loop ends.
+    let err = c
+        .call(&Caller::Address { address: a }, hook_status(true))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::NoIdentity);
     // The human has no hook status.
     let err = c

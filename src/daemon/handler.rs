@@ -1337,6 +1337,18 @@ impl Handler {
             .get_agent(&me)
             .map_err(store_err)?
             .ok_or_else(|| ClientError::new(ErrorCode::NotFound, format!("no agent {me:?}")))?;
+        // A signed-off agent has no hook status, however it was named: an
+        // `AGENTMAIL_ADDRESS` caller resolves signed-off agents too, and the
+        // hook must go silent and end its wake loop, as for a session.
+        if agent.signed_off {
+            return Err(ClientError::new(
+                ErrorCode::NoIdentity,
+                format!(
+                    "{me:?} has signed off: run `agentmail register <name>` \
+                     (or use --as human)"
+                ),
+            ));
+        }
         // One store snapshot, so `unread` always counts every `urgent` one.
         let snap = self
             .store
