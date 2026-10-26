@@ -63,13 +63,17 @@ model credentials that an isolated config does not have).
   opencode session always has an `opencode` process (`opencode serve
   --stdio` under `run --standalone`, 2.0.27) above its shell and MCP
   children.
-- **Shared opencode MCP server.** A tool call without `_meta` (opencode
-  omits it when the call has no session) cannot `register` on a server
-  bound to opencode, so the shared server never caches an address.
-  Likewise `agentmail register` under an opencode process without
-  `OPENCODE_SESSION_ID` is refused (only `--pid` naming a process outside
-  that opencode gets past it), so no agent becomes the identity of the
-  shared opencode process. A server that is not opencode's own (another
+- **Shared opencode MCP server.** A tool call without an opencode
+  session in `_meta` (opencode omits it when the call has no session)
+  cannot `register` on a server started by opencode, so the shared server
+  never caches an address. Likewise `agentmail register` bound to an
+  opencode process without an opencode session is refused: no
+  `OPENCODE_SESSION_ID`, or only another harness's session (a kiro shell
+  running `register --pid <opencode pid>`). Only `--pid` naming a process
+  outside any opencode gets past it, so no agent becomes the identity of
+  the shared opencode process. This holds for opencode at PID 1 (a
+  container's entry point) too: it cannot be bound, but its harness is
+  still read, so the server counts as shared and the refusal applies. A server that is not opencode's own (another
   MCP client run from its bash tool, below) is not bound to opencode and
   not shared. The refusal names the cause: the server was started by
   opencode, which shares it between its sessions.

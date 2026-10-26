@@ -255,9 +255,49 @@ fn register_proc_with(
     find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
     redirect: impl Fn(&(ProcId, Harness)) -> bool,
 ) -> Option<(ProcId, Harness)> {
-    let usable = |p: &ProcId| p.pid > 1;
+    binding_with(me, explicit_pid, find_harness, redirect, |p| p.pid > 1)
+}
+
+/// The harness of the process [`register_proc`] picks, PID 1 included.
+/// A harness at PID 1 (opencode as a container's entry point) cannot be
+/// bound to, but whether its process is shared between sessions must
+/// still be known, so a sessionless `register` under it is refused.
+pub fn register_harness(explicit_pid: Option<u32>) -> Harness {
+    binding_with(
+        std::process::id(),
+        explicit_pid,
+        procinfo::find_harness_ancestor,
+        |_| true,
+        |_| true,
+    )
+    .map_or(Harness::Other, |(_, h)| h)
+}
+
+/// The harness of the process [`mcp_bind`] picks, PID 1 included (see
+/// [`register_harness`]).
+pub fn mcp_harness(parent: Option<u32>) -> Harness {
+    let me = std::process::id();
+    binding_with(
+        me,
+        parent,
+        procinfo::find_harness_ancestor,
+        started_by_harness(me),
+        |_| true,
+    )
+    .map_or(Harness::Other, |(_, h)| h)
+}
+
+/// [`register_proc_with`] with `usable` deciding which processes may be
+/// picked.
+fn binding_with(
+    me: u32,
+    explicit_pid: Option<u32>,
+    find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+    redirect: impl Fn(&(ProcId, Harness)) -> bool,
+    usable: impl Fn(&ProcId) -> bool,
+) -> Option<(ProcId, Harness)> {
     if let Some(pid) = explicit_pid {
-        let p = procinfo::proc_id(pid).filter(usable)?;
+        let p = procinfo::proc_id(pid).filter(&usable)?;
         let harness = procinfo::comm(pid).map_or(Harness::Other, |c| procinfo::detect_harness(&c));
         if harness == Harness::Other
             && procinfo::ancestors(me).contains(&p)
@@ -276,7 +316,7 @@ fn register_proc_with(
     procinfo::ancestors(me)
         .get(1)
         .copied()
-        .filter(usable)
+        .filter(&usable)
         .map(|p| (p, Harness::Other))
 }
 
@@ -840,6 +880,25 @@ mod tests {
             found,
             Some((procinfo::proc_id(me).unwrap(), Harness::Other))
         );
+    }
+
+    #[test]
+    fn identity_harness_lookup_sees_a_harness_at_pid_1() {
+        // opencode at PID 1 (a container's entry point) cannot be bound to,
+        // but its harness is still known, directly or through a wrapper
+        // shell below it, so its shared process is recognized.
+        let (child, grandchild) = spawn_grandchild();
+        let init = procinfo::proc_id(1);
+        let at_init = |_| init.map(|p| (p, Harness::Opencode));
+        let all = |_: &ProcId| true;
+        let found = binding_with(grandchild, None, at_init, |_| true, all);
+        let via_shell = binding_with(grandchild, Some(child.id()), at_init, |_| true, all);
+        let bound = redirecting(grandchild, None, at_init);
+        reap(child, grandchild);
+        assert_eq!(found, init.map(|p| (p, Harness::Opencode)));
+        assert_eq!(via_shell, init.map(|p| (p, Harness::Opencode)));
+        assert_ne!(bound.map(|(p, _)| p.pid), Some(1));
+        assert_ne!(bound.map(|(_, h)| h), Some(Harness::Opencode));
     }
 
     #[test]

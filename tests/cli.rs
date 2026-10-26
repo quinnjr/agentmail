@@ -1225,3 +1225,35 @@ fn register_harness_override_conflicting_with_session_is_refused() {
     );
     assert_eq!(me["agent"]["harness"], "opencode", "{me}");
 }
+
+/// A process shared by every opencode session cannot be taken over by a
+/// registration carrying another harness's session: in a kiro shell
+/// (KIRO_SESSION_ID set), `--pid` naming an unrelated opencode process is
+/// refused, or the agent would become the caller of every sessionless call
+/// under that opencode. No agent is created.
+#[test]
+fn register_other_session_bound_to_opencode_is_refused() {
+    let mut env = Env::new();
+    let fake = env.dir.path().join("opencode");
+    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+    // The trailing `exit` keeps the shell (named opencode) from exec'ing.
+    let opencode = StdCommand::new(&fake)
+        .args(["-c", "sleep 300; exit"])
+        .spawn()
+        .unwrap();
+    let pid = opencode.id().to_string();
+    env.sleeps.push(opencode);
+    let out = env
+        .under("kiro-cli")
+        .env("KIRO_SESSION_ID", "k1")
+        .args(["register", "intruder", "--json", "--pid", &pid])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let err = json(&out);
+    assert_eq!(err["error"]["code"], "InvalidInput", "{err}");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("shared between sessions"), "{message}");
+    let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
+    assert_eq!(v, serde_json::json!([]), "{v}");
+}

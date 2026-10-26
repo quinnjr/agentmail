@@ -802,21 +802,27 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             // counts, not one inherited from an outer harness.
             let session = identity::env_session();
             // A harness that runs every session in one process (opencode)
-            // has no identity of its own: binding its process without a
-            // session would make the agent the caller of every session's
-            // sessionless calls. `--harness` does not change the binding,
-            // and `--pid` naming a non-harness ancestor (the shell) is
-            // redirected to the opencode process, so only `--pid` naming a
-            // process outside this opencode gets past this.
-            if session.is_none() && detected.shares_process() {
+            // has no identity of its own: binding its process without one
+            // of its sessions would make the agent the caller of every
+            // session's sessionless calls. A session of another harness
+            // (kiro's, with `--pid` naming an opencode process) does not
+            // count. The harness is the one of the process picked, PID 1
+            // included: opencode as a container's entry point cannot be
+            // bound, but is still shared. `--harness` does not change the
+            // binding, and `--pid` naming a non-harness ancestor (the
+            // shell) is redirected to the opencode process, so only
+            // `--pid` naming a process outside any opencode gets past this.
+            let sharing = identity::register_harness(pid);
+            if sharing.shares_process() && session.as_ref().is_none_or(|k| k.harness != sharing) {
                 return Err(ClientError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "this {h} process is shared between sessions and \
-                         OPENCODE_SESSION_ID is not set, so it cannot register; \
-                         run register from an {h} session's shell, or bind a \
-                         process outside this {h} with --pid",
-                        h = detected.as_str()
+                        "this {h} process is shared between sessions and the \
+                         registration carries no {h} session (OPENCODE_SESSION_ID \
+                         is not set), so it cannot register; run register from \
+                         an {h} session's shell, or bind a process outside this \
+                         {h} with --pid",
+                        h = sharing.as_str()
                     ),
                 )
                 .into());

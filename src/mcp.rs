@@ -258,8 +258,9 @@ pub struct AgentMailServer {
     /// The harness process `register` binds to (the parent, or the nearest
     /// harness above it), if usable.
     bind: Option<(ProcId, Harness)>,
-    /// The harness whose sessions share this server, if any: the bound
-    /// process's harness. [`identity::mcp_bind`] binds the opencode process
+    /// The harness whose sessions share this server, if any: the harness
+    /// of the process `bind` picks, even when that process cannot be bound
+    /// (PID 1, see [`identity::mcp_harness`]). [`identity::mcp_bind`] binds the opencode process
     /// when opencode started the server, directly or through a wrapper
     /// such as `sh -c`, and the client's own process when another MCP
     /// client run from opencode's shell did, which is then not shared. A
@@ -343,7 +344,11 @@ impl AgentMailServer {
         let address = std::env::var(ENV_ADDRESS).ok();
         let address_env = address.as_deref().is_some_and(|a| !a.is_empty());
         let caller = initial_caller(address, bind.map(|(p, _)| p));
-        let shared = bind.map(|(_, h)| h).filter(|h| h.shares_process());
+        // Shared or not is decided by the harness of the process picked,
+        // even one that cannot be bound (opencode at PID 1, as a
+        // container's entry point): `bind` is then None, but a
+        // sessionless call must still not register.
+        let shared = Some(identity::mcp_harness(parent)).filter(|h| h.shares_process());
         AgentMailServer {
             paths,
             address_env,
@@ -493,7 +498,10 @@ impl AgentMailServer {
         // A server shared between sessions (opencode's) has no identity of
         // its own: a call made outside any session cannot register, or the
         // process-level caller would act as that agent for every session.
-        if let (None, Some(shared)) = (&s.0, self.shared) {
+        // Only a session of the sharing harness counts.
+        if let Some(shared) = self.shared
+            && s.0.as_ref().is_none_or(|k| k.harness != shared)
+        {
             return Ok(invalid(no_session_message(shared, "register")));
         }
         // A session names its harness, whatever process the server found,
@@ -903,6 +911,53 @@ mod tests {
         };
         s.remember_registered(&none, &registered);
         assert_eq!(s.caller(&none), Caller::Procs { procs: vec![] });
+    }
+
+    #[tokio::test]
+    async fn mcp_shared_server_without_binding_refuses_sessionless_register() {
+        // opencode at PID 1 cannot be bound (`bind` is None) but still
+        // shares the server: a call without an opencode session (none, or
+        // another harness's) cannot register, and nothing is cached.
+        let paths = Paths::from_vars(|k| {
+            (k == "AGENTMAIL_DATA_DIR" || k == "AGENTMAIL_SOCKET")
+                .then(|| std::ffi::OsString::from("/nonexistent"))
+        })
+        .unwrap();
+        let s = AgentMailServer {
+            paths,
+            address_env: false,
+            caller: Arc::new(Mutex::new(Caller::Procs { procs: vec![] })),
+            bind: None,
+            shared: Some(Harness::Opencode),
+            tool_router: AgentMailServer::tool_router(),
+        };
+        let params = || {
+            Parameters(RegisterParams {
+                name: "intruder".into(),
+                role: None,
+                working_on: None,
+                harness: None,
+                fresh: false,
+                wake: true,
+            })
+        };
+        let kiro = Some(SessionKey {
+            harness: Harness::Kiro,
+            id: "k1".into(),
+        });
+        for session in [None, kiro] {
+            let r = s.register(params(), CallSession(session)).await.unwrap();
+            assert_eq!(r.is_error, Some(true));
+            let t = &r.content[0].as_text().unwrap().text;
+            let v: Value = serde_json::from_str(t).unwrap();
+            assert_eq!(v["error"]["code"], "InvalidInput", "{v}");
+            let message = v["error"]["message"].as_str().unwrap();
+            assert!(message.contains("shares it between"), "{message}");
+            assert_eq!(
+                s.caller(&CallSession(None)),
+                Caller::Procs { procs: vec![] }
+            );
+        }
     }
 
     #[test]
