@@ -194,7 +194,28 @@ async fn take_lock(lock: &File, path: &Path) -> Result<bool> {
 }
 
 /// Run the daemon until a client sends `Shutdown` or the socket file is
-/// removed or replaced.
+/// removed or replaced. See [`serve_until`].
+pub async fn serve(cfg: DaemonConfig) -> Result<()> {
+    serve_until(cfg, std::future::pending()).await
+}
+
+/// Resolve on the first SIGTERM or SIGINT. Both handlers are installed
+/// before this returns, so a signal sent once it has returned is never
+/// missed.
+pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut int = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    })
+}
+
+/// Run the daemon like [`serve`], but also stop when `stop` resolves (e.g.
+/// [`shutdown_signal`]), taking the same clean path as a `Shutdown` request.
 ///
 /// Startup: create the data directory (mode 0700) and take an exclusive
 /// lock on `paths.lock`, retrying briefly so a momentary probe of the lock
@@ -205,7 +226,7 @@ async fn take_lock(lock: &File, path: &Path) -> Result<bool> {
 /// can own it while we hold the lock) and accept. Every fallible startup
 /// step runs before the socket appears, so a daemon that fails to start
 /// never leaves a socket without a listener behind.
-pub async fn serve(cfg: DaemonConfig) -> Result<()> {
+pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> Result<()> {
     let paths = cfg.paths;
     create_private_dir(&paths.data_dir)?;
     let lock = OpenOptions::new()
@@ -236,6 +257,7 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let mut conns = JoinSet::new();
+    let mut stop = std::pin::pin!(stop);
     let mut check = tokio::time::interval(SOCKET_CHECK_INTERVAL);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -255,6 +277,7 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
                 }
             },
             _ = stop_rx.changed() => break,
+            () = &mut stop => break,
             _ = check.tick() => {
                 if file_id(&paths.socket) != Some(socket_id) {
                     break;

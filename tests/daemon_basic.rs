@@ -1450,3 +1450,108 @@ async fn shutdown_closed_without_reply_counts_as_acknowledged() {
     assert!(Client::shutdown(&paths).await.unwrap());
     assert_eq!(fake.await.unwrap(), vec!["hello", "shutdown"]);
 }
+
+/// A `daemon run` child process, killed and reaped on drop so a failing
+/// test never leaves a daemon behind.
+struct Foreground(std::process::Child);
+
+impl Foreground {
+    fn signal(&self, signal: libc::c_int) {
+        // SAFETY: kill(2) on our own child's pid, which is not yet reaped.
+        assert_eq!(unsafe { libc::kill(self.0.id() as libc::pid_t, signal) }, 0);
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run `daemon run` in the foreground the way a systemd unit does, and wait
+/// until it answers.
+async fn foreground_daemon(paths: &Paths) -> (Foreground, Client) {
+    let child = Foreground(
+        std::process::Command::new(bin())
+            .args(["daemon", "run"])
+            .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
+            .env("AGENTMAIL_SOCKET", &paths.socket)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut c) = Client::connect(paths).await {
+            hello_pid(&mut c).await;
+            return (child, c);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreground daemon never answered"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn exits_cleanly_on(signal: libc::c_int) {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let (mut child, mut c) = foreground_daemon(&paths).await;
+    let a = register(&mut c, "frontend", dir.path()).await;
+    let b = register(&mut c, "backend", dir.path()).await;
+    let sent = c
+        .call(&agent(&a), send_req(&[&b], "s", "kept"))
+        .await
+        .unwrap();
+
+    // A client blocked in a long wait must be released, not left hanging.
+    let mut waiter = Client::connect(&paths).await.unwrap();
+    let wait = tokio::spawn(async move {
+        waiter
+            .call(&agent(&a), Request::WaitForMail { timeout_secs: 60 })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    child.signal(signal);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "daemon ignored signal {signal}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(status.success(), "signal {signal} exit: {status:?}");
+    assert!(
+        !paths.socket.exists(),
+        "signal {signal} leaves the socket behind"
+    );
+
+    let waited = tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .expect("blocked client still hanging after shutdown")
+        .unwrap();
+    assert_eq!(waited.unwrap_err().code, ErrorCode::ConnectionLost);
+
+    // The lock is released and the mail is intact for the next daemon.
+    let (child, mut c) = foreground_daemon(&paths).await;
+    let inbox = c
+        .call(&agent(&b), Request::Inbox { all: false })
+        .await
+        .unwrap();
+    assert_eq!(ids(&inbox), vec![sent["id"].as_str().unwrap().to_string()]);
+    child.signal(libc::SIGTERM);
+}
+
+#[tokio::test]
+async fn sigterm_shuts_down_cleanly() {
+    exits_cleanly_on(libc::SIGTERM).await;
+}
+
+#[tokio::test]
+async fn sigint_shuts_down_cleanly() {
+    exits_cleanly_on(libc::SIGINT).await;
+}

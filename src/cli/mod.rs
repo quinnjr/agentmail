@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::client::{Client, ClientError, DataDirMismatch};
 use crate::daemon::handler::MAX_WAIT;
-use crate::daemon::{DaemonConfig, serve};
+use crate::daemon::{DaemonConfig, serve_until, shutdown_signal};
 use crate::identity;
 use crate::ids::now_ms;
 use crate::model::{AgentView, HUMAN, Harness, MAX_BODY_BYTES, Message};
@@ -1107,9 +1107,12 @@ fn daemon_status_json(
 async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitCode> {
     match action {
         DaemonAction::Run => {
-            serve(DaemonConfig {
-                paths: paths.clone(),
-            })
+            serve_until(
+                DaemonConfig {
+                    paths: paths.clone(),
+                },
+                shutdown_signal()?,
+            )
             .await?;
             Ok(ExitCode::SUCCESS)
         }

@@ -41,6 +41,38 @@ Files:
 `AGENTMAIL_DATA_DIR` and `AGENTMAIL_SOCKET` override both, e.g. to run an
 isolated instance for tests.
 
+### Running the daemon under systemd
+
+On-demand start is enough, but a daemon started by an agent outlives that
+agent's session outside any supervisor. To have systemd own it instead, add a
+user unit at `~/.config/systemd/user/agentmail.service`:
+
+```ini
+[Unit]
+Description=agentmail local agent mail daemon
+
+[Service]
+ExecStart=%h/.cargo/bin/agentmail daemon run
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now agentmail
+loginctl enable-linger "$USER"   # optional: keep it running while logged out
+```
+
+`daemon run` stays in the foreground and shuts down cleanly on SIGTERM or
+SIGINT: it removes its socket, drops open connections (blocked clients get
+`daemon connection lost`) and releases the lock once in-flight requests
+finish. Every acknowledged write is already durable, so `systemctl stop` loses
+nothing. If another daemon already holds the lock, `daemon run` exits 0 and
+leaves that one serving. Clients still start a daemon on demand whenever none
+is reachable.
+
 ## Quick start
 
 Install the binary:
