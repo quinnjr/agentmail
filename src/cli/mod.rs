@@ -137,6 +137,7 @@ pub enum Command {
             value_parser = parse_recipient
         )]
         to: Vec<String>,
+        /// The thread's subject line.
         #[arg(long, allow_hyphen_values = true)]
         subject: String,
         /// Ask for live interruption where the harness supports it.
@@ -154,8 +155,10 @@ pub enum Command {
         id: String,
         #[command(flatten)]
         body: BodyArgs,
+        /// Ask for live interruption where the harness supports it.
         #[arg(long)]
         urgent: bool,
+        /// A file path pointing at shared docs or code (repeatable).
         #[arg(long = "ref", value_name = "PATH")]
         refs: Vec<String>,
         /// Close the question this replies to (same as `answer`).
@@ -164,6 +167,7 @@ pub enum Command {
     },
     /// Ask a question and wait for its answer. Exits 3 if none comes in time.
     Ask {
+        /// Recipients: full addresses or names, comma-separated or repeated.
         #[arg(
             long,
             required = true,
@@ -172,12 +176,15 @@ pub enum Command {
             value_parser = parse_recipient
         )]
         to: Vec<String>,
+        /// The thread's subject line.
         #[arg(long, allow_hyphen_values = true)]
         subject: String,
         #[command(flatten)]
         body: BodyArgs,
+        /// A file path pointing at shared docs or code (repeatable).
         #[arg(long = "ref", value_name = "PATH")]
         refs: Vec<String>,
+        /// Ask for live interruption where the harness supports it.
         #[arg(long)]
         urgent: bool,
         /// How long to wait, e.g. `240s`, `10m`.
@@ -186,22 +193,28 @@ pub enum Command {
     },
     /// Keep waiting for the answer to your question. Exits 3 if none comes.
     Await {
+        /// The question's id (full, or the inbox's short id).
         question_id: String,
+        /// How long to wait, e.g. `240s`, `10m`.
         #[arg(long, default_value = DEFAULT_TIMEOUT, value_parser = parse_duration)]
         timeout: Duration,
     },
     /// Answer a question (same as `reply --answer`).
     Answer {
+        /// The question's id (full, or the inbox's short id).
         question_id: String,
         #[command(flatten)]
         body: BodyArgs,
+        /// Ask for live interruption where the harness supports it.
         #[arg(long)]
         urgent: bool,
+        /// A file path pointing at shared docs or code (repeatable).
         #[arg(long = "ref", value_name = "PATH")]
         refs: Vec<String>,
     },
     /// Block until new mail arrives. Exits 3 on timeout.
     Wait {
+        /// How long to wait, e.g. `240s`, `10m`.
         #[arg(long, default_value = DEFAULT_TIMEOUT, value_parser = parse_duration)]
         timeout: Duration,
     },
@@ -271,9 +284,15 @@ pub enum ContactAction {
     /// List your contacts.
     List,
     /// Add a contact by full address.
-    Add { address: String },
+    Add {
+        /// The contact's full address, e.g. `backend-k3v9x2qa`.
+        address: String,
+    },
     /// Remove a contact.
-    Remove { address: String },
+    Remove {
+        /// The contact's full address.
+        address: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -1355,6 +1374,30 @@ mod tests {
         let e = ambiguous_id("abcd", &found[..2]);
         assert!(e.message.contains("(ID0000, ID0001)"), "{}", e.message);
         assert!(!e.message.contains(" and "), "{}", e.message);
+    }
+
+    #[test]
+    fn cli_every_argument_has_help_text() {
+        fn check(cmd: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                if id == "help" || id == "version" {
+                    continue;
+                }
+                if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                    missing.push(format!("{path} {id}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                check(sub, &format!("{path} {}", sub.get_name()), missing);
+            }
+        }
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        cmd.build();
+        let mut missing = Vec::new();
+        check(&cmd, "agentmail", &mut missing);
+        assert!(missing.is_empty(), "arguments without help: {missing:?}");
     }
 
     #[test]

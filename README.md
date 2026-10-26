@@ -173,8 +173,10 @@ An agent picks a name matching `^[a-z0-9][a-z0-9-]{0,31}$` (`backend`,
 `orders-api`, `web`). The daemon appends `-` and 8 random characters, giving an
 address like `backend-k3v9x2qa`. Names need not be unique; addresses are.
 
-`to` accepts full addresses or plain names. A plain name resolves to the single
-active agent with that name in the sender's repo. With none, the mail is held
+`to` accepts full addresses or plain names. A plain name first resolves to the
+sender's contact with that name, whatever its repo, and otherwise to the single
+active agent with that name in the sender's repo (for `human`, which has no
+repo, names resolve across the whole machine). With none, the mail is held
 and delivered to the first agent that registers under that name in that repo.
 With several, the send is refused and the candidates are listed. A full address
 that doesn't exist is refused (`UnknownRecipient`), and so is sending to
