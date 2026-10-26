@@ -222,11 +222,6 @@ impl Paths {
         held(&self.waiter())
     }
 
-    /// The record in the waiter file, if any.
-    pub fn waiter_record(&self) -> Option<LockRecord> {
-        LockRecord::decode(&std::fs::read(self.waiter()).ok()?)
-    }
-
     /// Put everything, socket included, in `dir`. Used by tests.
     pub fn in_dir(dir: &Path) -> Paths {
         Paths {

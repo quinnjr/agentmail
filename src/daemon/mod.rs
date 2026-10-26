@@ -311,7 +311,9 @@ pub async fn serve(cfg: DaemonConfig) -> Result<()> {
 /// before this returns, so a signal sent once it has returned is never
 /// missed.
 ///
-/// Once it has resolved, a second SIGTERM or SIGINT exits the process at
+/// On resolving it logs that a signal arrived and in-flight requests are
+/// finishing, so the journal shows why the daemon stops. Once it has
+/// resolved, a second SIGTERM or SIGINT exits the process at
 /// once with status 1, without waiting for in-flight requests: the way out
 /// of a shutdown that is stuck. The commands those requests run (`git`)
 /// are killed first rather than orphaned. Acknowledged writes are durable
@@ -325,6 +327,7 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>> {
             _ = term.recv() => {}
             _ = int.recv() => {}
         }
+        eprintln!("agentmail daemon: signal received; finishing in-flight requests");
         tokio::spawn(async move {
             tokio::select! {
                 _ = term.recv() => {}
@@ -970,41 +973,50 @@ mod tests {
         drop(stuck_peers);
     }
 
-    /// Rewriting the lock record never leaves the file empty or partial
-    /// for a client reading it meanwhile.
+    /// Rewriting the lock record, over one of the same length or another,
+    /// never leaves the file empty for a client reading it meanwhile. (Over
+    /// a longer record a reader may see a torn one; clients read again in
+    /// that case.)
     #[test]
-    fn rewriting_the_lock_record_never_shows_a_partial_one() {
+    fn rewriting_the_lock_record_never_leaves_the_file_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = Paths::in_dir(dir.path());
-        let rec = LockRecord {
+        let short = LockRecord {
             supervised: false,
             pid: std::process::id(),
             socket: paths.socket.clone(),
         };
-        std::fs::write(&paths.lock, rec.encode()).unwrap();
+        let long = LockRecord {
+            supervised: true,
+            pid: std::process::id(),
+            socket: dir
+                .path()
+                .join("a-much-longer-socket-name-than-the-other.sock"),
+        };
+        assert_ne!(short.encode().len(), long.encode().len());
+        std::fs::write(&paths.lock, short.encode()).unwrap();
         let lock = OpenOptions::new().write(true).open(&paths.lock).unwrap();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer = std::thread::spawn({
             let done = done.clone();
             let path = paths.lock.clone();
-            let rec = rec.clone();
             move || {
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    write_lock_record(&lock, &path, &rec);
+                for rec in [&short, &long].into_iter().cycle() {
+                    if done.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    write_lock_record(&lock, &path, rec);
                 }
             }
         });
         let until = Instant::now() + Duration::from_millis(300);
-        let mut bad = None;
-        while bad.is_none() && Instant::now() < until {
-            let seen = std::fs::read(&paths.lock).unwrap();
-            if LockRecord::decode(&seen).is_none() {
-                bad = Some(seen);
-            }
+        let mut empty = false;
+        while !empty && Instant::now() < until {
+            empty = std::fs::read(&paths.lock).unwrap().is_empty();
         }
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
-        assert_eq!(bad, None, "read a partial lock record");
+        assert!(!empty, "read an empty lock file");
     }
 
     fn presence(address: &str) -> Event {

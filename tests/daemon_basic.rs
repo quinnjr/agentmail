@@ -1581,6 +1581,20 @@ impl Foreground {
         (status, self.1.finish())
     }
 
+    /// Wait until this daemon writes `needle` to stderr, failing at once
+    /// if it exits first.
+    async fn said(&mut self, needle: &str) {
+        let deadline = Instant::now() + PROCESS_WAIT;
+        while !self.1.contains(needle) {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                let (_, err) = self.exit_within(Duration::ZERO).await;
+                panic!("daemon exited before saying {needle:?}: {status:?}: {err}");
+            }
+            assert!(Instant::now() < deadline, "daemon never said {needle:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Wait until this daemon (run with `--wait-for-lock`) says it waits
     /// for the lock, which it does only once it is past the point where a
     /// daemon without the flag gives up; then check it is still running.
@@ -1796,6 +1810,9 @@ async fn stall_in_git(
     (slow, KillOnDrop(pid.trim().parse().unwrap()))
 }
 
+/// What the daemon logs when a first signal starts or joins a shutdown.
+const FIRST_SIGNAL: &str = "signal received; finishing in-flight requests";
+
 /// A second signal while shutdown waits for an in-flight request exits at
 /// once with status 1, so a stuck shutdown never needs `kill -9`. It kills
 /// the commands those requests run rather than orphaning them.
@@ -1810,7 +1827,14 @@ async fn second_signal_exits_without_waiting() {
     let (slow, git) = stall_in_git(c, dir.path(), &started).await;
 
     child.signal(libc::SIGTERM);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until the first signal is handled (the daemon removes its
+    // socket as soon as it stops), so the second is not merged into it.
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while paths.socket.exists() {
+        assert!(Instant::now() < deadline, "socket never removed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    child.said(FIRST_SIGNAL).await;
     assert!(
         child.running(),
         "shutdown did not wait for the in-flight request"
@@ -2256,9 +2280,9 @@ async fn second_signal_during_a_requested_shutdown_exits_without_waiting() {
 
     assert!(Client::shutdown(&paths).await.unwrap());
     child.signal(libc::SIGINT);
-    // Time for the first signal to be handled, so the second is not
-    // merged into it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the first signal is handled, so the second is not merged
+    // into it.
+    child.said(FIRST_SIGNAL).await;
     assert!(
         child.running(),
         "shutdown did not wait for the in-flight request"
