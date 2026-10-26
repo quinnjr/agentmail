@@ -12,8 +12,13 @@ const WAITER_FILE: &str = "agentmail.waiter";
 
 /// What a daemon writes to the lock file once it holds the lock, read by
 /// clients deciding whether to wait for a successor after it has gone: one
-/// line `supervised` or `on-demand`, then one line with the socket it
-/// serves, a backslash and a newline in it written as `\\` and `\n`.
+/// line `supervised` or `on-demand`, one line with its process id, then one
+/// line with the socket it serves, a backslash and a newline in it written
+/// as `\\` and `\n`.
+///
+/// Only daemons of this version write it. One from before holds the lock
+/// without touching the file, so while it runs the file holds whatever an
+/// earlier daemon left there, or nothing.
 ///
 /// A supervised daemon waiting for the lock (see [`Paths::waiter`]) writes
 /// the same record to the waiter file.
@@ -22,6 +27,9 @@ pub struct LockRecord {
     /// Run by a supervisor (`daemon run --wait-for-lock`), which starts a
     /// new daemon when this one exits.
     pub supervised: bool,
+    /// The daemon's process id, which tells a successor's record from its
+    /// own.
+    pub pid: u32,
     /// The socket the daemon serves.
     pub socket: PathBuf,
 }
@@ -39,6 +47,8 @@ impl LockRecord {
             Self::ON_DEMAND
         }
         .to_vec();
+        out.push(b'\n');
+        out.extend_from_slice(self.pid.to_string().as_bytes());
         out.push(b'\n');
         for &b in self.socket.as_os_str().as_bytes() {
             match b {
@@ -62,6 +72,11 @@ impl LockRecord {
             Self::ON_DEMAND => false,
             _ => return None,
         };
+        let pid = lines.next()?;
+        if pid.is_empty() || !pid.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let pid = std::str::from_utf8(pid).ok()?.parse().ok()?;
         let socket = lines.next().filter(|s| !s.is_empty())?;
         if lines.next().is_some() {
             return None;
@@ -80,6 +95,7 @@ impl LockRecord {
         }
         Some(LockRecord {
             supervised,
+            pid,
             socket: PathBuf::from(std::ffi::OsStr::from_bytes(&path)),
         })
     }
@@ -240,28 +256,38 @@ mod tests {
             ] {
                 let rec = LockRecord {
                     supervised,
+                    pid: 4_000_000,
                     socket: PathBuf::from(socket),
                 };
                 assert_eq!(LockRecord::decode(&rec.encode()), Some(rec), "{socket:?}");
             }
         }
         assert_eq!(
-            LockRecord::decode(b"supervised\n/s\n"),
+            LockRecord::decode(b"supervised\n42\n/s\n"),
             Some(LockRecord {
                 supervised: true,
+                pid: 42,
                 socket: PathBuf::from("/s"),
             })
         );
         for bad in [
             &b""[..],
             b"supervised\n",
-            b"supervised\n/s",
-            b"supervised\n\n",
-            b"maybe\n/s\n",
-            b"supervised\n/s\nextra\n",
+            b"supervised\n42\n",
+            b"supervised\n42\n/s",
+            b"supervised\n42\n\n",
+            b"maybe\n42\n/s\n",
+            b"supervised\n42\n/s\nextra\n",
+            // The record of a daemon from before process ids were recorded.
+            b"supervised\n/s\n",
+            // A process id that is not one.
+            b"supervised\n\n/s\n",
+            b"supervised\n-1\n/s\n",
+            b"supervised\n+1\n/s\n",
+            b"supervised\n99999999999\n/s\n",
             // A lone backslash, or one before anything but `\` or `n`.
-            b"supervised\n/s\\\n",
-            b"supervised\n/s\\x\n",
+            b"supervised\n42\n/s\\\n",
+            b"supervised\n42\n/s\\x\n",
         ] {
             assert_eq!(LockRecord::decode(bad), None, "{bad:?}");
         }
@@ -276,6 +302,7 @@ mod tests {
         assert_eq!(paths.lock_record(), None);
         let rec = LockRecord {
             supervised: true,
+            pid: 42,
             socket: paths.socket.clone(),
         };
         std::fs::write(&paths.lock, rec.encode()).unwrap();

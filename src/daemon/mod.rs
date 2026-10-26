@@ -51,8 +51,9 @@ const LOCK_WAIT_POLL: Duration = Duration::from_millis(100);
 const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
 /// How often to log while shutdown waits for in-flight database work.
 const STORE_RELEASE_WARN: Duration = Duration::from_secs(5);
-/// How long the daemon tries to deliver a `Shutdown` acknowledgement to a
-/// client that does not read it before it goes on shutting down.
+/// How long the daemon tries to deliver its `Shutdown` acknowledgements,
+/// all of them together, to clients that do not read them before it goes
+/// on shutting down.
 const SHUTDOWN_ACK_WAIT: Duration = Duration::from_secs(1);
 
 /// The longest path a Unix socket can be bound at: `sun_path` holds 108
@@ -378,6 +379,7 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         .with_context(|| format!("opening {}", paths.lock.display()))?;
     let record = LockRecord {
         supervised: cfg.wait_for_lock,
+        pid: std::process::id(),
         socket: paths.socket.clone(),
     };
     let locked = async {
@@ -484,10 +486,7 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
         acks.push(w);
     }
     drop(stop_rx);
-    for mut w in acks {
-        let ok = Response::Ok { data: Value::Null };
-        let _ = tokio::time::timeout(SHUTDOWN_ACK_WAIT, write_response(&mut w, &ok)).await;
-    }
+    acknowledge_shutdowns(acks, SHUTDOWN_ACK_WAIT).await;
     let mut drain = std::pin::pin!(async move {
         conns.shutdown().await;
         drop(handler);
@@ -501,6 +500,20 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     }
     drain.await;
     Ok(())
+}
+
+/// Acknowledge each `Shutdown` on its writer in `acks`, all at once, and
+/// give up on those still unsent after `limit`: however many clients do
+/// not read their reply, they hold up the shutdown only that long.
+async fn acknowledge_shutdowns<W: AsyncWrite + Unpin>(acks: Vec<W>, limit: Duration) {
+    let ok = Response::Ok { data: Value::Null };
+    let writes = acks.into_iter().map(|mut w| {
+        let ok = &ok;
+        async move {
+            let _ = write_response(&mut w, ok).await;
+        }
+    });
+    let _ = tokio::time::timeout(limit, futures_util::future::join_all(writes)).await;
 }
 
 /// Wait until the store is closed, then release the lock.
@@ -928,6 +941,35 @@ mod tests {
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, duplex};
 
+    /// Clients that asked for `Shutdown` but do not read the reply hold up
+    /// the acknowledgements, together, for no longer than the limit, and
+    /// do not keep the others from theirs.
+    #[tokio::test]
+    async fn shutdown_acks_share_one_deadline() {
+        let limit = Duration::from_millis(300);
+        // Writers whose peers never read: nothing past one byte gets out.
+        let mut stuck_peers = Vec::new();
+        let mut acks = Vec::new();
+        for _ in 0..5 {
+            let (w, peer) = duplex(1);
+            acks.push(w);
+            stuck_peers.push(peer);
+        }
+        let (w, reader) = duplex(4096);
+        acks.push(w);
+
+        let began = Instant::now();
+        acknowledge_shutdowns(acks, limit).await;
+        let took = began.elapsed();
+        assert!(took < limit * 3, "took {took:?}");
+
+        let mut line = String::new();
+        BufReader::new(reader).read_line(&mut line).await.unwrap();
+        let resp: Response = serde_json::from_str(&line).unwrap();
+        assert!(matches!(resp, Response::Ok { .. }), "{line}");
+        drop(stuck_peers);
+    }
+
     /// Rewriting the lock record never leaves the file empty or partial
     /// for a client reading it meanwhile.
     #[test]
@@ -936,6 +978,7 @@ mod tests {
         let paths = Paths::in_dir(dir.path());
         let rec = LockRecord {
             supervised: false,
+            pid: std::process::id(),
             socket: paths.socket.clone(),
         };
         std::fs::write(&paths.lock, rec.encode()).unwrap();

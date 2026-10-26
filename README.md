@@ -125,7 +125,14 @@ supervised or a supervised one is waiting for the lock, gives it up to 2s to
 take over before starting a daemon of its own. Without a supervisor neither
 wait applies beyond the shutdown, so on-demand start stays immediate. The
 first client after `systemctl --user stop` therefore takes about 2s longer to
-start its daemon. If the daemon that takes over speaks another protocol
+start its daemon. Only daemons of this version write the lock file's record
+(with their process id); a daemon from an earlier version leaves whatever
+an earlier daemon wrote there. So right after upgrading, while a daemon of
+the old version still runs, a client may wait those 2s needlessly (if a unit
+daemon once recorded itself and has since been disabled), or not wait for a
+supervisor; restart the daemon once after upgrading
+(`systemctl --user restart agentmail`, or `agentmail daemon stop`) to be
+done with it. If the daemon that takes over speaks another protocol
 version (the unit's `ExecStart` runs a different `agentmail` than the
 client), the client says so at once instead of waiting.
 

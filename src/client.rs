@@ -48,9 +48,12 @@ const RECORD_REREAD_INTERVAL: Duration = Duration::from_millis(10);
 /// has just taken the lock may be caught rewriting it, the new record
 /// followed by the tail of a longer old one; so while the lock is held, a
 /// record that does not decode is read again a few times before it counts
-/// as none.
-async fn settled_lock_record(paths: &Paths) -> Option<LockRecord> {
-    settled_record(|| paths.lock_record(), || paths.lock_held()).await
+/// as none. An empty file counts as none at once: a daemon never empties
+/// it, and one from before records were written holds the lock without
+/// writing any.
+pub async fn settled_lock_record(paths: &Paths) -> Option<LockRecord> {
+    let read = || std::fs::read(&paths.lock).ok();
+    settled_record(read, || paths.lock_held(), true).await
 }
 
 /// The record of a supervised daemon waiting for the lock (see
@@ -59,15 +62,25 @@ async fn settled_waiter_record(paths: &Paths) -> Option<LockRecord> {
     if !paths.waiter_held() {
         return None;
     }
-    settled_record(|| paths.waiter_record(), || paths.waiter_held()).await
+    let read = || std::fs::read(paths.waiter()).ok();
+    settled_record(read, || paths.waiter_held(), false).await
 }
 
+/// The record that `read` returns the bytes of, read again while `held`
+/// and it does not decode; see [`settled_lock_record`]. With `empty_is_none`
+/// an empty file is none at once. (A waiter file is empty for an instant
+/// after a daemon first creates and locks it, so it is read again.)
 async fn settled_record(
-    read: impl Fn() -> Option<LockRecord>,
+    read: impl Fn() -> Option<Vec<u8>>,
     held: impl Fn() -> bool,
+    empty_is_none: bool,
 ) -> Option<LockRecord> {
     for _ in 1..RECORD_READS {
-        if let Some(rec) = read() {
+        let bytes = read()?;
+        if empty_is_none && bytes.is_empty() {
+            return None;
+        }
+        if let Some(rec) = LockRecord::decode(&bytes) {
             return Some(rec);
         }
         if !held() {
@@ -75,7 +88,7 @@ async fn settled_record(
         }
         tokio::time::sleep(RECORD_REREAD_INTERVAL).await;
     }
-    read()
+    LockRecord::decode(&read()?)
 }
 
 /// Whether `rec` is the record of a daemon serving the socket of `paths`.
@@ -711,6 +724,7 @@ mod tests {
         let paths = Paths::in_dir(dir.path());
         let rec = LockRecord {
             supervised: false,
+            pid: std::process::id(),
             socket: paths.socket.clone(),
         };
         let mut torn = rec.encode();
@@ -733,6 +747,24 @@ mod tests {
         fix.join().unwrap();
     }
 
+    /// A held lock with an empty lock file is a daemon from before lock
+    /// records; there is nothing to wait for, so it is not read again.
+    #[tokio::test]
+    async fn an_empty_lock_file_is_no_record_at_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        std::fs::write(&paths.lock, b"").unwrap();
+        let lock = std::fs::File::open(&paths.lock).unwrap();
+        lock.try_lock().unwrap();
+        let began = Instant::now();
+        assert_eq!(settled_lock_record(&paths).await, None);
+        assert!(
+            began.elapsed() < RECORD_REREAD_INTERVAL,
+            "read again for {:?}",
+            began.elapsed()
+        );
+    }
+
     /// A daemon that has removed its socket (it is draining) still counts
     /// as serving ours when the two spell the socket's directory through
     /// different symlinks.
@@ -747,6 +779,7 @@ mod tests {
         paths.socket = link.join("agentmail.sock");
         let rec = |socket: PathBuf| LockRecord {
             supervised: false,
+            pid: std::process::id(),
             socket,
         };
         assert!(!paths.socket.exists());
@@ -799,6 +832,7 @@ mod tests {
         let paths = Paths::in_dir(tmp.path());
         let rec = LockRecord {
             supervised: true,
+            pid: std::process::id(),
             socket: paths.socket.clone(),
         };
         std::fs::write(&paths.lock, rec.encode()).unwrap();
@@ -825,6 +859,7 @@ mod tests {
         let paths = Paths::in_dir(tmp.path());
         let rec = LockRecord {
             supervised: true,
+            pid: std::process::id(),
             socket: paths.socket.clone(),
         };
         std::fs::write(&paths.lock, rec.encode()).unwrap();
@@ -874,6 +909,7 @@ mod tests {
         let paths = Paths::in_dir(tmp.path());
         let rec = LockRecord {
             supervised: true,
+            pid: std::process::id(),
             socket: paths.socket.clone(),
         };
         std::fs::write(&paths.lock, rec.encode()).unwrap();

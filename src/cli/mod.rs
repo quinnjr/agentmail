@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{Client, ClientError, DataDirMismatch};
+use crate::client::{Client, ClientError, DataDirMismatch, settled_lock_record};
 use crate::daemon::handler::MAX_WAIT;
 use crate::daemon::{DaemonConfig, serve_until, shutdown_signal};
 use crate::identity;
@@ -1182,6 +1182,13 @@ async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitC
             },
         },
         DaemonAction::Stop => {
+            // The daemon about to be stopped, by the pid it recorded (see
+            // `LockRecord`), if it holds the lock and recorded one.
+            let stopping = if paths.lock_held() {
+                settled_lock_record(paths).await.map(|r| r.pid)
+            } else {
+                None
+            };
             // Also stops a daemon of another protocol, but never one that
             // serves another data directory through the same socket.
             match Client::shutdown(paths).await {
@@ -1206,9 +1213,15 @@ async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitC
                 Err(e) => return Err(e),
             }
             // Wait until it has released the database and lock, so a
-            // following start gets a fresh daemon.
+            // following start gets a fresh daemon. A successor may take
+            // the lock before it is ever seen free (a supervised daemon
+            // waiting for it, or a supervisor restarting the daemon at
+            // once); it then records itself, so a record of another pid
+            // means the daemon we stopped is gone too.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while paths.lock_held() {
+            while paths.lock_held()
+                && !stopping.is_some_and(|pid| paths.lock_record().is_some_and(|r| r.pid != pid))
+            {
                 if Instant::now() >= deadline {
                     bail!("daemon did not stop within 5s");
                 }

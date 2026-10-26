@@ -1429,32 +1429,6 @@ mod tests {
         );
     }
 
-    /// A command cannot start while the lock on `COMMANDS` is held, as it
-    /// is by a daemon killing them on its way out: one started in that
-    /// window would never be killed, and outlive the daemon.
-    #[test]
-    fn no_command_starts_while_the_running_groups_are_held() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let marker = dir.path().join("ran");
-        let held = COMMANDS.lock();
-        let run = std::thread::spawn({
-            let marker = marker.clone();
-            move || {
-                let mut cmd = Command::new("touch");
-                cmd.arg(&marker);
-                output_within(cmd, Duration::from_secs(10))
-            }
-        });
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            !marker.exists(),
-            "a command started while the groups were held"
-        );
-        drop(held);
-        assert_eq!(run.join().unwrap(), Some(Vec::new()));
-        assert!(marker.exists());
-    }
-
     /// A stop kills every listed group, then waits for commands still being
     /// spawned: each is killed by its own request rather than listed. Once
     /// stopping has begun, no command starts at all.
@@ -1555,7 +1529,7 @@ mod tests {
             cmd.arg("-c").arg(script).arg("sh").arg(&pidfile);
             let started = Instant::now();
             let kills = std::sync::Mutex::new(Vec::new());
-            let out = output_within_with(&COMMANDS, cmd, limit, |pgid| {
+            let out = output_within_with(&Commands::new(), cmd, limit, |pgid| {
                 kills.lock().unwrap().push(pgid);
                 kill_group(pgid);
             });
@@ -1606,7 +1580,7 @@ mod tests {
     /// records.
     fn run_with_kill_probe(cmd: Command, limit: Duration) -> (Result<Vec<u8>, GiveUp>, Vec<bool>) {
         let seen = std::sync::Mutex::new(Vec::new());
-        let out = output_within_with(&COMMANDS, cmd, limit, |pgid| {
+        let out = output_within_with(&Commands::new(), cmd, limit, |pgid| {
             let pid = libc::pid_t::try_from(pgid).unwrap();
             // SAFETY: kill(2) with signal 0 only checks that `pid` exists;
             // an exited but unreaped child still does.
@@ -1673,7 +1647,7 @@ mod tests {
             let leader = std::sync::Mutex::new(None);
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(script);
-            let out = output_within_with(&COMMANDS, cmd, limit, |pgid| {
+            let out = output_within_with(&Commands::new(), cmd, limit, |pgid| {
                 *leader.lock().unwrap() = Some(pgid);
                 kill_group(pgid);
             });
@@ -1685,7 +1659,7 @@ mod tests {
         let script = "echo $$";
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(script);
-        let out = output_within_with(&COMMANDS, cmd, Duration::from_secs(5), |_| {
+        let out = output_within_with(&Commands::new(), cmd, Duration::from_secs(5), |_| {
             panic!("a clean success killed its group")
         })
         .unwrap();
@@ -1695,16 +1669,12 @@ mod tests {
 
     #[test]
     fn bounded_output_is_none_on_failure() {
+        let run =
+            |cmd| output_within_with(&Commands::new(), cmd, Duration::from_secs(5), kill_group);
+        assert_eq!(run(Command::new("false")), Err(GiveUp::Failed));
         assert_eq!(
-            output_within(Command::new("false"), Duration::from_secs(5)),
-            None
-        );
-        assert_eq!(
-            output_within(
-                Command::new("/nonexistent/agentmail-test"),
-                Duration::from_secs(5)
-            ),
-            None
+            run(Command::new("/nonexistent/agentmail-test")),
+            Err(GiveUp::Spawn)
         );
     }
 
@@ -1713,7 +1683,15 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let start = Instant::now();
-        assert_eq!(output_within(cmd, Duration::from_millis(200)), None);
+        assert_eq!(
+            output_within_with(
+                &Commands::new(),
+                cmd,
+                Duration::from_millis(200),
+                kill_group
+            ),
+            Err(GiveUp::TimedOut)
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "{:?}",

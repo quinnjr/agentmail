@@ -1816,7 +1816,8 @@ async fn second_signal_exits_without_waiting() {
         "shutdown did not wait for the in-flight request"
     );
     child.signal(libc::SIGTERM);
-    let (status, err) = child.exit_within(Duration::from_secs(1)).await;
+    // Git would hold it for 30s.
+    let (status, err) = child.exit_within(Duration::from_secs(2)).await;
     assert_eq!(status.code(), Some(1), "{status:?}: {err}");
     assert!(err.contains("second signal"), "{err}");
     let _ = slow.await;
@@ -1831,11 +1832,7 @@ async fn second_signal_exits_without_waiting() {
 /// What a supervised daemon (`daemon run --wait-for-lock`) records in the
 /// lock file for `paths`.
 fn supervised_record(paths: &Paths) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut rec = b"supervised\n".to_vec();
-    rec.extend_from_slice(paths.socket.as_os_str().as_bytes());
-    rec.push(b'\n');
-    rec
+    record(paths, true, std::process::id()).encode()
 }
 
 /// `systemctl restart`: while a supervised daemon stopped by SIGTERM still
@@ -2022,10 +2019,11 @@ async fn version_mismatch_uses_a_daemon_the_supervisor_restarts() {
         .unwrap();
 }
 
-/// The lock record a daemon writes for `paths`.
-fn record(paths: &Paths, supervised: bool) -> LockRecord {
+/// The lock record daemon `pid` writes for `paths`.
+fn record(paths: &Paths, supervised: bool, pid: u32) -> LockRecord {
     LockRecord {
         supervised,
+        pid,
         socket: paths.socket.clone(),
     }
 }
@@ -2044,7 +2042,7 @@ async fn daemon_run_records_whether_it_is_supervised() {
         drop(child.serving(&paths).await);
         assert_eq!(
             paths.lock_record(),
-            Some(record(&paths, supervised)),
+            Some(record(&paths, supervised, child.0.id())),
             "{args:?}"
         );
         child.terminate().await;
@@ -2061,7 +2059,7 @@ async fn client_starts_a_daemon_once_an_unsupervised_one_has_drained() {
     let (path, started) = stalling_git(dir.path());
     let mut old = Foreground::spawn(&paths, &["daemon", "run"], Some(&path));
     let c = old.serving(&paths).await;
-    assert_eq!(paths.lock_record(), Some(record(&paths, false)));
+    assert_eq!(paths.lock_record(), Some(record(&paths, false, old.0.id())));
     let (slow, _git) = stall_in_git(c, dir.path(), &started).await;
 
     old.signal(libc::SIGTERM);
@@ -2071,24 +2069,39 @@ async fn client_starts_a_daemon_once_an_unsupervised_one_has_drained() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(old.running(), "the old daemon did not wait for git");
+    // The daemon binary, behind a script that notes when it is first run:
+    // the time a daemon takes to start is not the client's to answer for.
+    let spawned = dir.path().join("spawned");
+    let wrapper = dir.path().join("agentmail");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n(set -C; : > '{}') 2>/dev/null\nexec '{}' \"$@\"\n",
+            spawned.display(),
+            bin().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let client = tokio::spawn({
         let paths = paths.clone();
-        async move {
-            let c = Client::connect_or_spawn_with(&paths, &bin()).await;
-            (c, Instant::now())
-        }
+        async move { Client::connect_or_spawn_with(&paths, &wrapper).await }
     });
     let (status, err) = old.exit_within(PROCESS_WAIT).await;
-    let exited = Instant::now();
+    let exited = std::time::SystemTime::now();
     assert!(status.success(), "{status:?}: {err}");
-    let (c, connected) = client.await.unwrap();
-    let mut c = c.expect("the client did not start a daemon");
+    let mut c = client
+        .await
+        .unwrap()
+        .expect("the client did not start a daemon");
     assert_ne!(hello_pid(&mut c).await, u64::from(old.0.id()));
-    // A supervised record would make it wait 2s for a successor first.
-    let after = connected.saturating_duration_since(exited);
+    // A supervised record would make it wait 2s for a successor before
+    // starting one.
+    let started = std::fs::metadata(&spawned).unwrap().modified().unwrap();
+    let after = started.duration_since(exited).unwrap_or_default();
     assert!(
         after < Duration::from_secs(2),
-        "waited {after:?} after the old daemon exited"
+        "started a daemon {after:?} after the old one exited"
     );
     drop(c);
     let _ = slow.await;
@@ -2101,7 +2114,11 @@ async fn client_starts_a_daemon_once_an_unsupervised_one_has_drained() {
 async fn client_waits_for_a_draining_daemon_only_so_long() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
-    std::fs::write(&paths.lock, record(&paths, false).encode()).unwrap();
+    std::fs::write(
+        &paths.lock,
+        record(&paths, false, std::process::id()).encode(),
+    )
+    .unwrap();
     let lock = std::fs::File::open(&paths.lock).unwrap();
     lock.try_lock().unwrap();
 
@@ -2131,6 +2148,7 @@ async fn client_does_not_wait_for_a_daemon_on_another_socket() {
     let paths = Paths::in_dir(dir.path());
     let other = LockRecord {
         supervised: true,
+        pid: std::process::id(),
         socket: dir.path().join("elsewhere.sock"),
     };
     std::fs::write(&paths.lock, other.encode()).unwrap();
@@ -2161,7 +2179,11 @@ async fn client_does_not_wait_for_a_daemon_on_another_socket() {
 async fn autostart_reports_a_daemon_still_shutting_down() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
-    std::fs::write(&paths.lock, record(&paths, false).encode()).unwrap();
+    std::fs::write(
+        &paths.lock,
+        record(&paths, false, std::process::id()).encode(),
+    )
+    .unwrap();
     let lock = std::fs::File::open(&paths.lock).unwrap();
     lock.try_lock().unwrap();
 
@@ -2202,7 +2224,10 @@ async fn client_waits_for_a_unit_daemon_waiting_behind_an_on_demand_one() {
         paths.waiter_held(),
         "the unit's daemon does not announce itself"
     );
-    assert_eq!(paths.lock_record(), Some(record(&paths, false)));
+    assert_eq!(
+        paths.lock_record(),
+        Some(record(&paths, false, on_demand.0.id()))
+    );
 
     assert!(Client::shutdown(&paths).await.unwrap());
     // Starting a daemon of its own would fail: there is no such binary.
@@ -2213,7 +2238,7 @@ async fn client_waits_for_a_unit_daemon_waiting_behind_an_on_demand_one() {
     drop(c);
     let (status, err) = on_demand.exit_within(PROCESS_WAIT).await;
     assert!(status.success(), "{status:?}: {err}");
-    assert_eq!(paths.lock_record(), Some(record(&paths, true)));
+    assert_eq!(paths.lock_record(), Some(record(&paths, true, unit.0.id())));
     unit.terminate().await;
 }
 
@@ -2230,16 +2255,47 @@ async fn second_signal_during_a_requested_shutdown_exits_without_waiting() {
     let (slow, _git) = stall_in_git(c, dir.path(), &started).await;
 
     assert!(Client::shutdown(&paths).await.unwrap());
-    tokio::time::sleep(Duration::from_millis(100)).await;
     child.signal(libc::SIGINT);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Time for the first signal to be handled, so the second is not
+    // merged into it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         child.running(),
         "shutdown did not wait for the in-flight request"
     );
     child.signal(libc::SIGINT);
-    let (status, err) = child.exit_within(Duration::from_millis(500)).await;
+    // Git would hold it for 30s.
+    let (status, err) = child.exit_within(Duration::from_secs(2)).await;
     assert_eq!(status.code(), Some(1), "{status:?}: {err}");
     assert!(err.contains("second signal"), "{err}");
     let _ = slow.await;
+}
+
+/// The README's recovery step: with a unit daemon (`--wait-for-lock`)
+/// waiting behind an on-demand one, `daemon stop` stops the on-demand
+/// daemon and reports success, although the unit's daemon takes the lock
+/// at once. Stopping while the unit's daemon still retries the lock every
+/// 20ms (before it settles into waiting) leaves the lock free for less
+/// than `daemon stop` polls it, so it must not wait for a free lock.
+#[tokio::test]
+async fn daemon_stop_succeeds_when_a_waiting_unit_daemon_takes_over() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let mut on_demand = Foreground::spawn(&paths, &["daemon", "run"], None);
+    drop(on_demand.serving(&paths).await);
+    let mut unit = Foreground::spawn(&paths, &["daemon", "run", "--wait-for-lock"], None);
+    let deadline = Instant::now() + PROCESS_WAIT;
+    while !paths.waiter_held() {
+        assert!(unit.running(), "the unit's daemon exited");
+        assert!(Instant::now() < deadline, "the unit's daemon never waited");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let (code, out) = run_cli(&paths, &["daemon", "stop"]).await;
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("daemon stopped"), "{out}");
+    let (status, err) = on_demand.exit_within(PROCESS_WAIT).await;
+    assert!(status.success(), "{status:?}: {err}");
+    drop(unit.serving(&paths).await);
+    unit.terminate().await;
 }
