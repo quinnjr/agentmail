@@ -1488,3 +1488,35 @@ fn register_wake_follows_install_kiro_wake() {
     install(&["--project"]);
     assert_eq!(wake("k4"), false);
 }
+
+/// A kiro shell command often runs in a subdirectory of the workspace
+/// (`cd crates/x && agentmail register ...`): the workspace whose
+/// `.kiro/settings/mcp.json` counts is kiro's (the working directory of
+/// the `kiro-cli` process), not the CLI's own.
+#[test]
+fn register_wake_reads_kiros_workspace_from_a_subdirectory() {
+    let env = Env::new();
+    let sub = env.work.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let wake = |name: &str| {
+        // `kiro-cli` stays in the workspace; the CLI runs in `sub`.
+        let mut c = env.under_script(
+            "kiro-cli",
+            r#"/bin/sh -c 'cd crates/x && exec "$0" "$@"' "$0" "$@"; exit $?"#,
+        );
+        c.env_remove("AGENTMAIL_KIRO_WAKE")
+            .args(["register", name, "--json", "--fresh"]);
+        ok_json(&mut c)["agent"]["wake"].clone()
+    };
+    let install = |args: &[&str]| {
+        let mut c = env.cmd();
+        c.args(["install", "--harness", "kiro"]).args(args);
+        c.assert().success();
+    };
+    install(&[]);
+    install(&["--project", "--kiro-wake"]);
+    assert_eq!(wake("k1"), true);
+    install(&["--kiro-wake"]);
+    install(&["--project"]);
+    assert_eq!(wake("k2"), false);
+}

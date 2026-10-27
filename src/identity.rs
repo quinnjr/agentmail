@@ -406,16 +406,33 @@ pub fn default_wake(
 }
 
 /// [`default_wake`] for this process: its environment, and the kiro
-/// config installed for its working directory and home.
+/// config installed for kiro's workspace and the home. kiro's workspace
+/// is the working directory of the `kiro-cli` process this one runs
+/// under, not this process's own: a shell command often runs in a
+/// subdirectory (`cd crates/x && agentmail register ...`). Without a
+/// `kiro-cli` above (`--harness kiro`), or when its directory cannot be
+/// read, this process's working directory stands in.
 pub fn default_wake_here(harness: Harness) -> bool {
     default_wake(
         harness,
         |k| std::env::var_os(k),
         || {
-            crate::install::Env::from_process()
-                .is_ok_and(|e| crate::install::kiro_wake_installed(&e))
+            crate::install::Env::from_process().is_ok_and(|mut e| {
+                if let Some(cwd) = kiro_workspace(std::process::id()) {
+                    e.cwd = cwd;
+                }
+                crate::install::kiro_wake_installed(&e)
+            })
         },
     )
+}
+
+/// The working directory of the nearest harness above `pid` when that is
+/// `kiro-cli`: the workspace kiro reads `.kiro/` from.
+fn kiro_workspace(pid: u32) -> Option<std::path::PathBuf> {
+    procinfo::find_harness_ancestor(pid)
+        .filter(|(_, h)| *h == Harness::Kiro)
+        .and_then(|(p, _)| procinfo::cwd(p.pid))
 }
 
 #[cfg(test)]

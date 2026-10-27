@@ -248,6 +248,27 @@ async fn pre_tool_blocks_once_for_urgent() {
 }
 
 #[tokio::test]
+async fn subagent_pre_tool_acts_as_the_root() {
+    // kiro gives a subagent's tool hooks the root's payload `session_id`
+    // and `KIRO_SESSION_ID`, and nothing else marks them (recorded live,
+    // `pre-tool-subagent*.json`): urgent mail is pushed at whichever tool
+    // call comes first, a subagent's included, and only once. The root
+    // agent still counts it unread in its next reminder.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", false).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "STOP", "the schema changed", true).await;
+    let out = run(&env, HookEvent::PreTool, "pre-tool-subagent").await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    assert!(silent(&run(&env, HookEvent::PreTool, "pre-tool").await));
+    assert!(silent(
+        &run(&env, HookEvent::PreTool, "pre-tool-subagent-response").await
+    ));
+    let out = run(&env, HookEvent::Prompt, "prompt").await;
+    assert!(out.stdout.contains("1 unread"), "{out:?}");
+}
+
+#[tokio::test]
 async fn post_tool_is_silent() {
     // kiro ignores PostToolUse output; nothing is installed for it, and
     // the hook says nothing even when run.
@@ -270,14 +291,75 @@ async fn stop_exit1_on_open_question() {
     send(&d, &a, "note", "fyi", false).await;
     assert!(silent(&run(&env, HookEvent::Stop, "stop").await));
 
-    let q = ask(&d, &a, "POST /orders body?").await;
     for wake in [false, true] {
+        let subject = format!("POST /orders body, wake {wake}?");
+        let q = ask(&d, &a, &subject).await;
         let out = run_wake(&env, HookEvent::Stop, "stop", wake).await;
         assert_eq!(out.exit, 1, "{out:?}");
         assert!(out.stdout.is_empty(), "{out:?}");
         assert!(out.stderr.contains(&q), "{out:?}");
-        assert!(out.stderr.contains("POST /orders body?"), "{out:?}");
+        assert!(out.stderr.contains(&subject), "{out:?}");
     }
+}
+
+#[tokio::test]
+async fn stop_shows_an_open_question_once() {
+    // Without waking: a question the model left open is not shown at
+    // every later stop (the prompt's reminder still counts it).
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let out = run(&env, HookEvent::Stop, "stop").await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(out.stderr.contains(&q), "{out:?}");
+    assert!(silent(&run(&env, HookEvent::Stop, "stop").await));
+    let out = run(&env, HookEvent::Prompt, "prompt").await;
+    assert!(out.stdout.contains("1 question"), "{out:?}");
+
+    // A new question is shown, with the one still open.
+    let q2 = ask(&d, &a, "GET /orders filters?").await;
+    let out = run(&env, HookEvent::Stop, "stop").await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(
+        out.stderr.contains(&q) && out.stderr.contains(&q2),
+        "{out:?}"
+    );
+    assert!(silent(&run(&env, HookEvent::Stop, "stop").await));
+}
+
+#[tokio::test]
+async fn stop_waits_past_an_open_question_already_shown() {
+    // kiro runs Stop once per human prompt: a question left open must
+    // not keep every later stop from waiting.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(out.stderr.contains(&q), "{out:?}");
+
+    // The question, still open and unread, does not wake the agent.
+    let h = spawn_stop(&env);
+    assert!(
+        still_waiting(&h, 0.5).await,
+        "did not wait past the question"
+    );
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(out.stderr.contains("2 unread"), "{out:?}");
+
+    // A question that comes while it waits wakes it, and the next stop
+    // shows it.
+    let h = spawn_stop(&env);
+    assert!(still_waiting(&h, 0.5).await, "woke twice for the same mail");
+    let q2 = ask(&d, &a, "GET /orders filters?").await;
+    assert_eq!(finish(h).await.exit, 1);
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(out.stderr.contains(&q2), "{out:?}");
 }
 
 #[tokio::test]

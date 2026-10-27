@@ -87,7 +87,7 @@ const STOP_SLACK: Duration = Duration::from_millis(500);
 const STOP_POLL: Duration = Duration::from_millis(20);
 
 /// The kinds of per-agent files under `<data dir>/hook-wait/`.
-const STATE_KINDS: [&str; 5] = ["turn", "lock", "woken", "busy", "stop"];
+const STATE_KINDS: [&str; 6] = ["turn", "lock", "woken", "busy", "stop", "shown"];
 
 /// Claude Code sets this in its hooks' environment to its own pid.
 const ENV_CLAUDE_PID: &str = "CLAUDE_PID";
@@ -402,6 +402,24 @@ impl Daemon {
         }
     }
 
+    /// The open questions (by id) a Stop hook has already shown the agent
+    /// ([`Daemon::record_shown_questions`]); empty when none.
+    pub fn shown_questions(&self, address: &str) -> HashSet<String> {
+        read_ids(&self.paths.data_dir, address, "shown")
+    }
+
+    /// Record that a Stop hook showed the agent the open questions `ids`
+    /// (all of them still open, so closed ones drop out). Best effort.
+    pub fn record_shown_questions(&self, address: &str, ids: &[String]) {
+        let path = state_path(&self.paths.data_dir, address, "shown");
+        let _ = write_state(&path, &ids.join("\n"));
+    }
+
+    /// The mail ids the agent's last wake was for (the `woken` file).
+    pub fn woken(&self, address: &str) -> HashSet<String> {
+        read_woken(&self.paths.data_dir, address)
+    }
+
     /// Record the Stop hook's decision for the stop `key` (for Claude
     /// Code, the payload's `prompt_id` with its `stop_hook_active`): whether
     /// it blocks the stop. The wait hook started by
@@ -480,10 +498,12 @@ impl Daemon {
     /// [`Daemon::wait`], with the unread mail that does not count as news
     /// in `known`. `None` lets the first look decide (as `wait` does);
     /// `Some` (a timed-out wait's set, or the unread mail before a turn,
-    /// passed back by opencode's plugin) is used as is, and the wait never
-    /// ends as `Busy` for open questions (the stop they would block was
-    /// the timed-out wait's, not blocked, or the turn was not one to
-    /// continue). With `after_wake` and `known` `None`, `known` is the
+    /// passed back by opencode's plugin; or, from kiro's Stop hook, the
+    /// mail the last wake was for and the open questions it has already
+    /// shown) is used as is, and the wait never ends as `Busy` for open
+    /// questions (the stop they would block was the timed-out wait's, not
+    /// blocked, or the turn was not one to continue; kiro's Stop hook
+    /// continues the stop itself for questions it has not shown). With `after_wake` and `known` `None`, `known` is the
     /// mail the last wake was for (the `woken` file), whatever the open
     /// questions, and the wait never ends as `Busy` for them either: the
     /// turn that just ended was started by a wake (or failed), so mail
@@ -852,6 +872,8 @@ fn wait_dir(data_dir: &Path) -> PathBuf {
 /// - `busy`: when the session was last marked busy ([`Daemon::mark_busy`]).
 /// - `stop`: the Stop hook's decision for the latest stop
 ///   ([`Daemon::record_stop`]).
+/// - `shown`: the open questions a kiro Stop hook has shown the agent, one
+///   id per line ([`Daemon::shown_questions`]).
 fn state_path(data_dir: &Path, address: &str, kind: &str) -> PathBuf {
     wait_dir(data_dir).join(format!("{address}.{kind}"))
 }
@@ -925,7 +947,12 @@ fn busy_since(data_dir: &Path, address: &str, since: u128) -> bool {
 
 /// The mail ids the agent's last wake was for (empty when none).
 fn read_woken(data_dir: &Path, address: &str) -> HashSet<String> {
-    read_state(&state_path(data_dir, address, "woken"))
+    read_ids(data_dir, address, "woken")
+}
+
+/// The ids, one per line, in `address`'s file of `kind` (empty when none).
+fn read_ids(data_dir: &Path, address: &str, kind: &str) -> HashSet<String> {
+    read_state(&state_path(data_dir, address, kind))
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty())
@@ -1136,6 +1163,7 @@ mod tests {
         let path = |a: &str, k: &str| state_path(&paths.data_dir, a, k);
         write_state(&path("a-1", "turn"), "wait 1").unwrap();
         write_state(&path("a-1", "woken"), "m1").unwrap();
+        write_state(&path("a-1", "shown"), "q1").unwrap();
         write_state(&path("a-1", "busy"), "1").unwrap();
         write_state(&path("a-1", "stop"), "1 idle k").unwrap();
         write_state(&path("b-2", "turn"), "wait 1").unwrap();

@@ -1,0 +1,1 @@
+{"session_id":"sess_8b70a346-1388-49b5-8819-90066699d42d","hook_event_name":"PreToolUse","cwd":"/home/user/project","tool_name":"subagent_response","tool_input":{"response":"Ran `echo sub-ok` once. Output: `sub-ok` (exit code 0).","files":[]}}

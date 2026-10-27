@@ -1016,12 +1016,29 @@ config schema and exit-code rules come from the engine bundle
   says plainly that agentmail held the call and that it can run again.
 - **(b) Stop continuations: one per human prompt.** A turn that a Stop
   hook continued ends without running the Stop hooks again
-  (`onAgentStopHooksExecuted`): with a Stop hook that always exits 1, a
-  `--no-interactive` run continued once and then ended. So open
-  questions can never hold a model that cannot answer them, and kiro needs
-  nothing like Claude Code's `stop_hook_active`; but after a wake (or an
-  open-question continuation) the agent is not woken again until the
-  human's next prompt.
+  (`onAgentStopHooksExecuted`). Checked live with a Stop hook that always
+  exits 1 (it logged each run): a `--no-interactive` run continued once
+  and then ended; in the interactive TUI (tmux pane) the prompt "Reply
+  with the single word FIRST." got `FIRST`, the hook ran, the continued
+  turn replied `CONTINUED`, and the TUI then gave the prompt back with no
+  second Stop run; a second human prompt ran the hook exactly once more.
+  So open questions can never hold a model that cannot answer them, and
+  kiro needs nothing like Claude Code's `stop_hook_active`; but after a
+  wake (or an open-question continuation) the agent is not woken again
+  until the human's next prompt.
+- **Each open question is shown at one stop only.** Because a stop that
+  shows open questions (exit 1) is one that does not wait, a question the
+  model leaves open (not its call, or ignored) would otherwise be shown
+  at every later stop and keep a `--kiro-wake` agent from ever being
+  woken while it stays open. The Stop hook records the open questions it
+  showed (the agent's `shown` file under `hook-wait/`, removed with the
+  other wait files) and continues a stop only for a question it has not
+  shown yet (listing all open ones). Otherwise it falls through to the
+  wait, where the unread messages of the questions it has shown do not
+  count as mail to wake for (nor does mail the last wake was for); a
+  question that arrives while it waits wakes the agent like other mail,
+  and the next stop shows it. The prompt hooks' reminder still counts
+  questions left open.
 - **(c) The human cannot reach the agent while a Stop hook blocks.** While
   it runs, the TUI shows "Kiro is working · Type to steer". A message
   typed and submitted then is queued ("1 message queued") and delivered
@@ -1036,8 +1053,11 @@ config schema and exit-code rules come from the engine bundle
   unless `--kiro-wake` is installed: the MCP server sees the variable;
   kiro does not pass the server's `env` to its shell tool's commands, so
   the CLI instead reads agentmail's server entry in the workspace's
-  `.kiro/settings/mcp.json` (the working directory's; it decides when it
-  has one), else the user's (`$KIRO_HOME`, else `~/.kiro`), and takes
+  `.kiro/settings/mcp.json` (kiro's workspace: the working directory of
+  the `kiro-cli` process the CLI runs under, read from
+  `/proc/<pid>/cwd`, so a command run in a subdirectory finds it; the
+  CLI's own directory only without a `kiro-cli` above it; the
+  workspace's entry decides when it has one), else the user's (`$KIRO_HOME`, else `~/.kiro`), and takes
   `env.AGENTMAIL_KIRO_WAKE = "1"` there as the install's choice.
   `wake: true` / `--wake` still turns it on.
   A Stop hook left running after Esc ends at the human's next prompt or
@@ -1080,10 +1100,45 @@ config schema and exit-code rules come from the engine bundle
   with the reminder when mail comes. Timeouts: 10 s, and none (`0`) for
   the waiting Stop hook. A reinstall updates agentmail's hooks in place,
   keeping keys the user added (`enabled`, `description`) and other hooks
-  in the file; uninstall removes them, the file itself when agentmail
-  created it, and a file left with no hooks loses its `hooks` and
-  `version` (kiro rejects an empty list). `install` prints
+  in the file; uninstall removes them, and the file itself when no hooks
+  are left in it: kiro's schema (`{version: "v1", hooks: [..] (at least
+  one)}`) rejects an empty list and `{}` alike, logging "Hook file does
+  not match v2 schema" on every load. A file agentmail did not create
+  keeps its text in `hooks/agentmail.json.agentmail.bak` (the backup
+  already there from the install, which holds the file before
+  agentmail; else the text as it was at uninstall). `install` prints
   `kiro-cli: agentmail supports the V3 engine only — run kiro-cli chat --v3`.
-- **Subagents.** Their hooks carry the root conversation's
-  `KIRO_SESSION_ID` and run under the same `kiro-cli`, so they act as the
-  root agent (see "Session ids" above).
+- **Subagents cannot be told apart.** Checked live (`--no-interactive`,
+  the root told to use `invoke_sub_agent` for `echo sub-ok`): the
+  subagent ran `PreToolUse` hooks for its own tool calls (`execute_bash`,
+  then `subagent_response`), but no `SessionStart`, `UserPromptSubmit` or
+  `Stop` hooks (the engine skips those for subagents, `skipHooks`). The
+  bundle builds the payload's `session_id` from the execution's
+  `chatSessionId` and `KIRO_SESSION_ID` from its `rootConversationId`,
+  but for the subagent both were the root's `sess_<uuid>`, the same as
+  the root's own hooks; the payload has the same keys (no agent id) and
+  the same `cwd`, and the hook runs under the same `kiro-cli`. Recorded
+  in `tests/fixtures/hooks/kiro/pre-tool-subagent.json` and
+  `pre-tool-subagent-response.json`. Only the tool name
+  `subagent_response` (a subagent's last call) is a subagent's alone, so
+  agentmail treats every tool hook as the root agent's. Consequences:
+  urgent mail that comes while a subagent runs is pushed at the
+  subagent's next tool call and marked surfaced, so the root agent does
+  not get it mid-run (it reaches the root only if the subagent passes it
+  on in its response); the root still sees it counted unread in the next
+  prompt's reminder (and a wake's). Subagents are never told they are
+  the agent (no prompt hooks run for them). Their tool calls mark the
+  session busy, which is harmless: `invoke_sub_agent` is a tool call of
+  the root, so the root's turn is still running.
+- **Background memory extraction.** The engine can start a nested
+  execution after a turn (`startMemoryExtraction`, with `skipHooks`,
+  which skips only the prompt and Stop hooks). It runs only with memory
+  set to `read_write` with `reflection` on (the default is
+  `{mode: "disabled", reflection: false}`) and after at least 10 new
+  messages. With the defaults, a TUI turn of seven separate shell tool
+  calls ran seven `PreToolUse` hooks, then Stop, and no hook in the 90 s
+  after. Whether extraction's own tool calls run `PreToolUse` with memory
+  reflection on was not checked. If they do, such a call marks the
+  session busy and ends a waiting Stop hook: that stop's wake is lost
+  until the human's next prompt (the mail stays unread and is counted in
+  the reminder). A busy session is never woken by mistake.

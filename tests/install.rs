@@ -2718,17 +2718,31 @@ fn kiro_uninstall() {
 }
 
 #[test]
-fn kiro_hooks_file_with_only_agentmails_hooks_left_valid() {
-    // A hooks file agentmail did not create keeps its other content; with
-    // none, it is left without a `hooks` list kiro would reject.
+fn kiro_hooks_file_left_with_no_hooks_is_removed() {
+    // A hooks file agentmail did not create (its hooks pasted by hand)
+    // that held nothing else: kiro rejects a hooks file without hooks
+    // (`{}` too), so the file goes, its text kept in the backup.
     let h = Home::new();
     let env = h.env(&[]);
-    write(
-        &h.kiro_hooks(),
-        &serde_json::to_string_pretty(&kiro_expected_hooks(BIN, false)).unwrap(),
-    );
+    let text = serde_json::to_string_pretty(&kiro_expected_hooks(BIN, false)).unwrap();
+    write(&h.kiro_hooks(), &text);
     uninstall(&kiro_opts(false, BIN), &env);
-    assert_eq!(read_json(&h.kiro_hooks()), json!({}));
+    assert!(!h.kiro_hooks().exists());
+    assert_eq!(std::fs::read_to_string(bak(&h.kiro_hooks())).unwrap(), text);
+
+    // Installed over a file of the user's: the backup of the original is
+    // kept as it was.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let original = r#"{"version": "v1", "hooks": []}"#;
+    write(&h.kiro_hooks(), original);
+    install(&kiro_opts(false, BIN), &env);
+    uninstall(&kiro_opts(false, BIN), &env);
+    assert!(!h.kiro_hooks().exists());
+    assert_eq!(
+        std::fs::read_to_string(bak(&h.kiro_hooks())).unwrap(),
+        original
+    );
 }
 
 #[test]

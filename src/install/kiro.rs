@@ -158,8 +158,8 @@ fn merge_hooks(hooks: &mut Vec<Value>, wanted: &[Value], bin: &Path) {
 }
 
 /// Remove agentmail's hooks from a hooks file, for [`JsonFile::change`].
-/// A file left with no hooks loses its `hooks` list (kiro rejects an
-/// empty one) and its `version`.
+/// A file left with no hooks loses its `hooks` list and its `version`;
+/// [`plan`] then removes the file ([`remove_hookless`]).
 fn strip_hooks_file(v: &mut Map<String, Value>, bin: &Path) {
     if let Some(Value::Array(hooks)) = v.get_mut("hooks") {
         hooks.retain(|h| !is_owned_hook(h, bin));
@@ -170,6 +170,26 @@ fn strip_hooks_file(v: &mut Map<String, Value>, bin: &Path) {
             }
         }
     }
+}
+
+/// An uninstall's change to a hooks file left with no hooks, made a
+/// removal: kiro's schema wants at least one hook, and rejects (logging
+/// it each time it loads the file) an empty list and `{}` alike. The
+/// file's text is kept in its backup (`.agentmail.bak`): the backup
+/// already there (the file before agentmail's install), else the text as
+/// it is now. A file agentmail created goes as any other, backup and all.
+fn remove_hookless(mut c: Change) -> Change {
+    if c.after.is_none() {
+        return c;
+    }
+    c.after = None;
+    let bak = super::backup_path(&c.path);
+    if std::fs::symlink_metadata(&bak).is_ok() {
+        c.keep_backup = true;
+    } else {
+        c.save = Some(bak);
+    }
+    c
 }
 
 fn server(bin: &str, wake: bool) -> Value {
@@ -206,7 +226,8 @@ fn set_wake_env(entry: &mut Map<String, Value>, wake: bool) {
 
 /// Whether `install --kiro-wake` is in effect where `env` runs: the
 /// agentmail MCP server entry of the workspace's `.kiro/settings/mcp.json`
-/// (in `env.cwd`), else of the user's (`$KIRO_HOME`, else `~/.kiro`), sets
+/// (in `env.cwd`: the caller passes kiro's workspace, the `kiro-cli`
+/// process's working directory), else of the user's (`$KIRO_HOME`, else `~/.kiro`), sets
 /// `AGENTMAIL_KIRO_WAKE` to `1`. kiro gives that variable only to the MCP
 /// server, not to its shell tool's commands, so the CLI's `register` reads
 /// it here. A file that is missing or cannot be read counts as no entry.
@@ -299,13 +320,17 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
         strip_mcp(&mut new_mcp);
     }
 
-    Ok([
-        file.change(new, !install, &|v| strip_hooks_file(v, &o.bin)),
-        mcp.change(new_mcp, !install, &strip_mcp),
-    ]
-    .into_iter()
-    .flatten()
-    .collect())
+    let hookless = !install && file.value.contains_key("hooks") && !new.contains_key("hooks");
+    let hooks_change = file
+        .change(new, !install, &|v| strip_hooks_file(v, &o.bin))
+        .map(|c| match hookless {
+            true => remove_hookless(c),
+            false => c,
+        });
+    Ok([hooks_change, mcp.change(new_mcp, !install, &strip_mcp)]
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// What `install` tells the user about kiro: the V3-only warning, what

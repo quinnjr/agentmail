@@ -15,15 +15,23 @@
 //! - All three mark the session busy, which ends a `stop --wake` still
 //!   waiting from an earlier turn (kiro does not stop a Stop hook when the
 //!   human presses Esc).
-//! - `stop`: open questions to the agent continue the turn (exit 1). kiro
-//!   runs Stop hooks once per human prompt: the continued turn ends without
-//!   another Stop, so a model that cannot answer is never held. Otherwise,
+//! - `stop`: open questions to the agent continue the turn (exit 1), each
+//!   at one stop only (the `shown` file): kiro runs Stop hooks once per
+//!   human prompt (the continued turn ends without another Stop), so a
+//!   model that cannot answer is never held, and a question it leaves open
+//!   does not keep later stops from waiting. Otherwise,
 //!   with `--wake` (`install --kiro-wake`) and the agent's `wake` on, it
 //!   waits while the agent is idle ([`Daemon::wait`]) and continues the
 //!   turn with the reminder (exit 1) when mail comes. While it waits kiro
 //!   shows the agent as working and holds what the human types until the
 //!   hook ends or the human presses Esc, hence opt-in.
 //! - `post-tool`, `wait`: nothing (`stop` does the waiting).
+//! - Subagents: kiro runs only the tool hooks for a subagent's tool calls,
+//!   with the root's `session_id`, `KIRO_SESSION_ID` and payload keys
+//!   (recorded live), so they cannot be told from the root's. Urgent mail
+//!   may then be pushed to a subagent rather than the root (the root still
+//!   counts it unread); marking the session busy is right, since a
+//!   subagent runs inside the root's `invoke_sub_agent` call.
 
 use std::path::Path;
 
@@ -144,7 +152,15 @@ async fn stop(d: &mut Daemon, wake: bool) -> HookOutput {
     let Some(status) = d.status(false).await else {
         return HookOutput::default();
     };
-    if let Some(questions) = text::open_questions(&status) {
+    // Each open question continues one stop. kiro runs Stop once per human
+    // prompt, so showing a question the model leaves open at every stop
+    // would keep every stop from waiting for as long as it stays open.
+    let open: Vec<String> = status.open_questions.iter().map(|q| q.id.clone()).collect();
+    let shown = d.shown_questions(&status.address);
+    if open.iter().any(|id| !shown.contains(id))
+        && let Some(questions) = text::open_questions(&status)
+    {
+        d.record_shown_questions(&status.address, &open);
         return HookOutput {
             stderr: questions,
             exit: EXIT_CONTINUE,
@@ -154,10 +170,13 @@ async fn stop(d: &mut Daemon, wake: bool) -> HookOutput {
     if !wake || !status.wake || headless(d) {
         return HookOutput::default();
     }
-    // kiro gives a Stop hook no key: the wait decides by itself, and with
-    // no open questions (just checked) unread mail already there wakes the
-    // agent once.
-    match d.wait(true, None).await {
+    // kiro gives a Stop hook no key: the wait decides by itself. Unread
+    // mail already there wakes the agent once (not again after a wake for
+    // it), except the open questions it has been shown: their messages
+    // stay unread while the questions are open.
+    let mut known = d.woken(&status.address);
+    known.extend(open);
+    match d.wait_from(true, None, &mut Some(known), false).await {
         WaitOutcome::Mail(status) => match text::reminder(&status) {
             Some(reminder) => HookOutput {
                 stderr: reminder,

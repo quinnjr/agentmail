@@ -111,6 +111,20 @@ pub fn env_var(pid: u32, name: &str) -> Option<std::ffi::OsString> {
     }
 }
 
+/// The working directory of `pid` (`/proc/<pid>/cwd`). `None` when
+/// unreadable.
+pub fn cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Map a process command name to the harness it belongs to.
 pub fn detect_harness(comm: &str) -> Harness {
     match comm {
