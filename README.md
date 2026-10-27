@@ -109,7 +109,10 @@ byte of a file as it was, saves each file's original once as
 `<file>.agentmail.bak` before first changing it, and finds nothing to do
 when run twice. `--dry-run` prints the changes as a diff and writes
 nothing. `uninstall` removes agentmail's entries again and deletes a file
-only if `install` created it. `--project` installs into the current
+only if `install` created it, with one exception: kiro's schema rejects an
+empty hooks list, so a kiro `hooks/agentmail.json` left with no hooks is
+removed even if it was yours, and its text is kept in
+`hooks/agentmail.json.agentmail.bak`. `--project` installs into the current
 directory instead of your user config. Run the harness from the same
 `agentmail` binary you installed with: the config records its absolute
 path.

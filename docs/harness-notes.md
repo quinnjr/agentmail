@@ -548,38 +548,37 @@ process would override `--session` for every session. `AGENTMAIL_HUMAN=1`
 still silences a hook, and so does `--as human`. Tests bind their agent to the test process's parent
 (in the hook's ancestry) instead.
 
-### Interfaces for later hook tasks (Tasks 6 and 8)
-
-The code differs from the plan's sketch; build on the code:
+### Internal hook API
 
 - `hook::run(harness, event, stdin, env)`, `hook::run_as(harness,
   event, session: Option<&str>, stdin, env)` and `hook::run_with(harness,
-  event, &HookArgs { session, surface_urgent, timeout }, stdin, env)`
+  event, &HookArgs { session, surface_urgent, timeout, wake }, stdin, env)`
   (the whole `hook` command line), where `env: &(dyn Fn(&str) ->
   Option<OsString> + Sync)` (the `Sync` lets a waiting hook run on a
   spawned task). `run_with` dispatches on the harness: Claude Code,
-  opencode (Task 6) and kiro (Task 8; `HookArgs::wake` is its `--wake`).
-- `HookInput` also carries `agent_id` (Claude Code subagents), `prompt_id` and
-  `hook_event_name`.
+  opencode and kiro (`HookArgs::wake` is kiro's `--wake`).
+- `HookInput` also carries `agent_id` (Claude Code subagents),
+  `prompt_id`, `hook_event_name`, and opencode's `known` and `after_wake`.
 - `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(&status)`,
-  `record_stop(&status, key, block)`, `wait(wake_for_unread, stop_key) ->
-  WaitOutcome { Mail(HookStatus), Gone, Busy, Skip }`; `stop_key` is the
-  stop's key (Claude Code: `<prompt_id>:plain|active`), `None` where a
-  harness has none, and then the wait
-  decides alone). The wait is not a loop over `WaitForMail { timeout_secs: 300
-  }`: it subscribes with `Request::Watch { agent }` and wakes on
-  `Delivered` events (re-reading `HookStatus` to decide per message id
-  whether the mail is new, and ending when the re-read names another
-  agent), ends on a `Presence` event showing the agent signed off or
-  gone, `wake` turned off, a lost connection, a dead harness process
-  (checked every 0.5 s) or a busy mark, and keeps one waiter per agent with the turn file and lock
-  above. It has no timeout of its own; the harness's hook `timeout` bounds
-  it. kiro's Stop (Task 8) maps `Mail` to its exit code and the rest to 0.
+  `record_stop(&status, key, block)`, `wait(wake_for_unread, stop_key)` and
+  `wait_from(…, known, after_wake)` -> `WaitOutcome { Mail(HookStatus),
+  Gone, Busy, Skip }`; `stop_key` is the stop's key (Claude Code:
+  `<prompt_id>:plain|active`), `None` where a harness has none, and then
+  the wait decides alone). The wait is not a loop over `WaitForMail`: it
+  subscribes with `Request::Watch { agent }` and wakes on `Delivered`
+  events (re-reading `HookStatus` to decide per message id whether the
+  mail is new, and ending when the re-read names another agent), ends on
+  a `Presence` event showing the agent signed off or gone, `wake` turned
+  off, a lost connection, a dead harness process (checked every 0.5 s) or
+  a busy mark, and keeps one waiter per agent with the turn file and lock
+  above. It has no timeout of its own; the harness's hook `timeout` (or
+  opencode's `--timeout`) bounds it. kiro's Stop maps `Mail` to its exit
+  code and the rest to 0.
 
-### Interfaces for later install tasks (Tasks 7 and 8)
+### Internal install API
 
-The plan's `json_merge_owned(...)` does not exist; `src/install/mod.rs`
-has these instead (Claude Code's `claude.rs` shows the pattern):
+`src/install/mod.rs` holds the shared pieces (Claude Code's `claude.rs`
+shows the pattern):
 
 - `JsonFile::read(path, entry)`: the file as a JSON object (missing or
   blank: empty), refusing other text with a message that shows `entry`
@@ -593,7 +592,9 @@ has these instead (Claude Code's `claude.rs` shows the pattern):
   an object and nothing else; with it, containers agentmail emptied are
   removed unless they were there before agentmail, and an uninstall
   deletes the file only when agentmail created it, which `apply` records
-  in `<file>.agentmail.created` (`created_marker_path`).
+  in `<file>.agentmail.created` (`created_marker_path`). kiro's hooks
+  file is the exception: one left with no hooks is removed (its schema
+  rejects an empty list), its text kept in the backup.
 - Ownership: `is_agentmail_hook(cmd)` (program named `agentmail…` run
   with `hook`) and `owns_hook(cmd, bin)` (that, or the program is `bin`
   itself); MCP servers are owned by their key `agentmail`.
@@ -1334,6 +1335,16 @@ with `AGENTMAIL_E2E_MIN_LOGIN_SECS=600`):
   `CLAUDE_CONFIG_DIR` and runs `claude -p` with neither flag, so Claude
   Code reads the installed user-scope config (`settings.json` and
   `.claude.json` there) and the e2e run also covers `install`.
+
+- **Deviation from the design: no `#[ignore]`d cargo tests.** The design
+  has the real-harness e2e as `#[ignore]`d tests run by `scripts/e2e.sh`.
+  The e2e lives in `scripts/e2e.sh` alone. Each run needs a real harness
+  binary, a copied login, a model, minutes of wall time and a throwaway
+  home that the script builds and tears down (process groups, the
+  daemon, the login copies); a cargo test would only shell out to the
+  script and add a second way to run it, with `cargo test -- --ignored`
+  then also starting paid model runs. `cargo test` stays hermetic, and
+  the e2e is run by hand per harness as described in the README.
 
 - **Logins.** Claude Code's `.credentials.json` and kiro-cli's
   `data.sqlite3` were copied into the throwaway home with their refresh

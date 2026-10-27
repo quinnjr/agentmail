@@ -32,12 +32,14 @@
 //!   wake was already for). `stop_hook_active` `true`, as Claude Code's
 //!   Stop payload says after a continuation: only mail that arrives from
 //!   now on counts (the plugin's waiter uses it after a wake it could not
-//!   queue). `after_wake` (the turn that just ended was started by a wake,
-//!   or failed or was interrupted): mail the last wake was for does not
-//!   count, all other unread mail does, so mail that came during the turn
-//!   wakes the session. `known` (the ids the timed-out wait before this
-//!   one did not count as news, or the unread mail when the plugin queued
-//!   open questions as a turn): exactly that mail does not count
+//!   queue). `after_wake` (sent only after a turn the plugin queued
+//!   itself: a wake, a dropped wake's reminder, or urgent mail): mail the
+//!   last wake was for does not count, all other unread mail does, so
+//!   mail that came during the turn wakes the session. `known` (the ids
+//!   the timed-out wait before this one did not count as news, the unread
+//!   mail when the plugin queued open questions as a turn, or the unread
+//!   mail when a turn failed or was interrupted or the questions could
+//!   not be queued): exactly that mail does not count
 //!   ([`Daemon::wait_from`]), so mail delivered between the two waits, or
 //!   during the questions' turn, is news rather than counted as already
 //!   there by the new wait's first look. With `after_wake` or `known`, open

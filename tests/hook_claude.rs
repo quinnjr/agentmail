@@ -1155,6 +1155,85 @@ async fn wait_exits_when_its_harness_exits() {
     assert_eq!(wait_files(&d.paths), Vec::<String>::new());
 }
 
+/// Seconds in one of `times`'s `<m>m<s>s` fields.
+fn times_secs(field: &str) -> f64 {
+    let (m, s) = field
+        .strip_suffix('s')
+        .and_then(|f| f.split_once('m'))
+        .unwrap_or_else(|| panic!("not a time: {field:?}"));
+    m.parse::<f64>().unwrap() * 60.0 + s.parse::<f64>().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_does_not_spin_while_it_waits() {
+    // The wait blocks on the daemon's events: idle for 2 s with no mail,
+    // the `hook stop` and `hook wait` processes together use a small
+    // fraction of that in CPU time. A busy loop would use about all of it.
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let d = TestDaemon::start().await;
+    let payload =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks/claude-code/stop.json");
+    // A stand-in harness that reports its children's CPU time (`times`'
+    // second line) once the wait ends.
+    let mut harness = Command::new("sh")
+        .arg("-c")
+        .arg(r#"read go; "$0" hook stop --harness claude-code < "$1" > /dev/null 2>&1; "$0" hook wait --harness claude-code < "$1" > /dev/null 2>&1; echo "exit $?"; times"#)
+        .arg(BIN)
+        .arg(&payload)
+        .env("AGENTMAIL_DATA_DIR", &d.paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &d.paths.socket)
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("CLAUDE_PID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let harness_id = procinfo::proc_id(harness.id()).unwrap();
+    let mut c = d.client().await;
+    let data = c
+        .call(
+            &Caller::Human,
+            Request::Register {
+                name: "backend".into(),
+                role: None,
+                working_on: None,
+                harness: Harness::ClaudeCode,
+                cwd: d.dir.path().to_path_buf(),
+                proc_id: Some(harness_id),
+                fresh: true,
+                wake: true,
+                session: None,
+            },
+        )
+        .await
+        .unwrap();
+    let a = data["address"].as_str().unwrap().to_string();
+    harness.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut stdout = harness.stdout.take().unwrap();
+    let done = tokio::task::spawn_blocking(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        out
+    });
+    assert!(still_waiting(&done, 2.0).await, "the hook did not wait");
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = tokio::time::timeout(Duration::from_secs(10), done)
+        .await
+        .expect("the wait did not end on mail")
+        .unwrap();
+    harness.wait().unwrap();
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("exit 2"), "{out}");
+    let children = lines.nth(1).unwrap_or_else(|| panic!("no times: {out}"));
+    let cpu: f64 = children.split_whitespace().map(times_secs).sum();
+    assert!(cpu < 0.5, "the hooks used {cpu} s of CPU in 2 s: {out}");
+}
+
 #[tokio::test]
 async fn wait_ends_when_its_process_is_registered_as_another_agent() {
     // The harness process was registered as `a`, then as `b`: the wait for

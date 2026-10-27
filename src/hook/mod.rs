@@ -138,13 +138,15 @@ pub struct HookInput {
     pub prompt_id: Option<String>,
     /// opencode's plugin: the unread mail ids a timed-out `wait` did not
     /// count as news (its `known`), passed back to the wait that follows,
-    /// so mail that came between the two is news; or the unread mail
-    /// before a turn the plugin started with open questions. `None` when
-    /// absent.
+    /// so mail that came between the two is news; the unread mail before
+    /// a turn the plugin started with open questions; or the unread mail
+    /// when a turn failed or was interrupted, or when the plugin could not
+    /// queue the open questions as a turn. `None` when absent.
     pub known: Option<Vec<String>>,
-    /// opencode's plugin: the turn that just ended was started by a wake
-    /// (or failed or was interrupted), so the wait counts mail not in the
-    /// `woken` file as news ([`Daemon::wait_from`]'s `after_wake`).
+    /// opencode's plugin: the turn that just ended was one the plugin
+    /// queued (a wake, a dropped wake's reminder, or urgent mail), so the
+    /// wait counts mail not in the `woken` file as news
+    /// ([`Daemon::wait_from`]'s `after_wake`).
     pub after_wake: bool,
 }
 
@@ -507,7 +509,7 @@ impl Daemon {
     /// `after_wake` and `known` `None`, `known` is the mail the last wake
     /// was for (the `woken` file), whatever the open
     /// questions, and the wait never ends as `Busy` for them either: the
-    /// turn that just ended was started by a wake (or failed), so mail
+    /// turn that just ended was started by a wake, so mail
     /// that came during it is news, as after a woken turn's plain stop.
     /// The wait keeps `known` up to date (mail read meanwhile drops out),
     /// so a caller that stops it (a timeout) can hand it to the wait that
