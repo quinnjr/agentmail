@@ -7,19 +7,19 @@
 //! last), and at project scope also `.opencode/opencode.json(c)` after
 //! them, so install updates agentmail's entry in each that has one, else
 //! adds it to the first of the direct two that exists (a new
-//! `opencode.json` when neither does), and uninstall removes it from all. The MCP server goes in
-//! `mcp.servers.agentmail`, also in a file that keeps its other servers in
-//! the V1 shape (`mcp.<name>`): opencode 2.0.27 reads both, but drops
-//! `codemode` from a V1 entry, and its own `opencode mcp add` writes
-//! `servers` into such a file too (see `docs/harness-notes.md`). A V1
-//! entry named `agentmail` is agentmail's: install moves it to `servers`,
-//! uninstall removes it. A config with JSONC syntax (comments, trailing
-//! commas) is never rewritten (it would be lost): install and uninstall
-//! refuse with the entry to add or remove by hand, unless the file is
-//! already as they would leave it. The plugin is `plugin/agentmail.js`,
-//! embedded, with the binary's path in place of its placeholder; a
-//! `plugins/agentmail.js` that is not agentmail's is never replaced or
-//! removed.
+//! `opencode.json` when neither does), and uninstall removes it from
+//! all. The MCP server goes in `mcp.servers.agentmail`, also in a file
+//! that keeps its other servers in the V1 shape (`mcp.<name>`): opencode
+//! 2.0.27 reads both, but drops `codemode` from a V1 entry, and its own
+//! `opencode mcp add` writes `servers` into such a file too (see
+//! `docs/harness-notes.md`). A V1 entry named `agentmail` is agentmail's:
+//! install moves it to `servers`, uninstall removes it. A config with
+//! JSONC syntax (comments, trailing commas) is never rewritten (it would
+//! be lost): install and uninstall refuse with the entry to add or remove
+//! by hand, unless the file is already as they would leave it. The plugin
+//! is `plugin/agentmail.js`, embedded, with the binary's path in place of
+//! its placeholder; a `plugins/agentmail.js` that is not agentmail's is
+//! never replaced or removed.
 
 use std::path::{Path, PathBuf};
 
