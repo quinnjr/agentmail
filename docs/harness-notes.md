@@ -864,7 +864,16 @@ same instruction as `restart` (null when nothing needs restarting).
   loaded from `plugin/` and `plugins/` next to it, `.js` and `.ts` files
   only, so the `.agentmail.bak` and `.agentmail.created` files there are
   never loaded. `--project`: `./opencode.json` (or `./opencode.jsonc`) and
-  `./.opencode/plugins/agentmail.js`.
+  `./.opencode/plugins/agentmail.js`. At project scope opencode also
+  merges `./.opencode/opencode.json` and `./.opencode/opencode.jsonc`,
+  after the direct files (checked with `opencode debug config` in a
+  project holding all four: the direct `opencode.json`, then
+  `.opencode/opencode.json`, then `.opencode/opencode.jsonc`), so an
+  agentmail entry there overrides the one install writes. Install
+  therefore updates an agentmail entry found in those too (with the same
+  JSONC refusal), and uninstall removes it from them; a new entry still
+  goes only into the first existing direct file (`./opencode.json` when
+  there is none).
 - **The entry**: `mcp.servers.agentmail = {"type": "local", "command":
   [<bin>, "mcp"], "codemode": false}`. A reinstall sets only `type`,
   `command` and `codemode`, keeping keys the user added (`environment`,
@@ -891,8 +900,10 @@ same instruction as `restart` (null when nothing needs restarting).
   removed; otherwise nothing at all is changed and the error shows the
   exact entry to paste (install; also telling to delete a V1
   `mcp.agentmail` when there is one) or says what to delete by hand
-  (uninstall), then to run the command again. With both files, either
-  one refusing changes nothing in either.
+  (uninstall), then to run the command again and `opencode service
+  restart` (the rerun changes only the plugin, so it prints no restart
+  line itself, but the service has not read the hand edit). With several
+  files, any one refusing changes nothing in any.
 - **The plugin** is `plugin/agentmail.js` embedded in the binary with its
   one `"__AGENTMAIL_BIN__"` literal replaced by the binary's path as a
   JSON string (quotes and backslashes escaped). A file at

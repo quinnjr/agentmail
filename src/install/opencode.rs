@@ -4,9 +4,10 @@
 //! `~/.config/opencode`; project scope (`--project`) is the current
 //! directory, with the plugin in `.opencode/plugins/`. opencode loads and
 //! merges both `opencode.json` and `opencode.jsonc` there (the `.jsonc`
-//! last), so install updates agentmail's entry in each that has one, else
-//! adds it to the first that exists (a new `opencode.json` when neither
-//! does), and uninstall removes it from both. The MCP server goes in
+//! last), and at project scope also `.opencode/opencode.json(c)` after
+//! them, so install updates agentmail's entry in each that has one, else
+//! adds it to the first of the direct two that exists (a new
+//! `opencode.json` when neither does), and uninstall removes it from all. The MCP server goes in
 //! `mcp.servers.agentmail`, also in a file that keeps its other servers in
 //! the V1 shape (`mcp.<name>`): opencode 2.0.27 reads both, but drops
 //! `codemode` from a V1 entry, and its own `opencode mcp add` writes
@@ -41,29 +42,36 @@ const SERVER_KEYS: [&str; 3] = ["type", "command", "codemode"];
 /// V1 entry is moved to `servers`.
 const SHARED_KEYS: [&str; 4] = ["environment", "cwd", "timeout", "protocol"];
 
-/// The files: (configs, plugin). The configs are those of `opencode.json`
-/// and `opencode.jsonc` that exist, in that order, else a new
-/// `opencode.json` alone.
-fn files(o: &InstallOpts, env: &Env) -> (Vec<PathBuf>, PathBuf) {
-    let (dir, plugins) = if o.project {
-        (env.cwd.clone(), env.cwd.join(".opencode").join("plugins"))
+/// The files: (direct configs, overriding configs, plugin). The direct
+/// configs are those of `opencode.json` and `opencode.jsonc` that exist,
+/// in that order, else a new `opencode.json` alone. At project scope the
+/// overriding ones are those of `.opencode/opencode.json` and
+/// `.opencode/opencode.jsonc` that exist: opencode merges them after the
+/// direct ones, so an agentmail entry there wins.
+fn files(o: &InstallOpts, env: &Env) -> (Vec<PathBuf>, Vec<PathBuf>, PathBuf) {
+    let existing = |dir: &Path| -> Vec<PathBuf> {
+        ["opencode.json", "opencode.jsonc"]
+            .iter()
+            .map(|n| dir.join(n))
+            .filter(|p| std::fs::symlink_metadata(p).is_ok())
+            .collect()
+    };
+    let (dir, overrides, plugins) = if o.project {
+        let dot = env.cwd.join(".opencode");
+        (env.cwd.clone(), existing(&dot), dot.join("plugins"))
     } else {
         let dir = match env.dir_var("XDG_CONFIG_HOME") {
             Some(d) => d.join("opencode"),
             None => env.home.join(".config").join("opencode"),
         };
         let plugins = dir.join("plugins");
-        (dir, plugins)
+        (dir, Vec::new(), plugins)
     };
-    let mut configs: Vec<PathBuf> = ["opencode.json", "opencode.jsonc"]
-        .iter()
-        .map(|n| dir.join(n))
-        .filter(|p| std::fs::symlink_metadata(p).is_ok())
-        .collect();
+    let mut configs = existing(&dir);
     if configs.is_empty() {
         configs.push(dir.join("opencode.json"));
     }
-    (configs, plugins.join("agentmail.js"))
+    (configs, overrides, plugins.join("agentmail.js"))
 }
 
 fn server(bin: &str) -> Value {
@@ -198,7 +206,8 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
             bail!(
                 "{} {jsonc}. Add this by hand, merging it into the \"mcp\" there in place of any \
                  \"agentmail\" entry in \"mcp\" → \"servers\".{v1} Then run the install again \
-                 to add the plugin:\n{}",
+                 to add the plugin, and `opencode service restart` to load the server (opencode's \
+                 background service reads its config only at start):\n{}",
                 path.display(),
                 snippet(bin)
             );
@@ -206,7 +215,8 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
         bail!(
             "{} {jsonc}. Remove the \"agentmail\" entry from \"mcp\" → \"servers\" (and any \
              \"agentmail\" directly under \"mcp\") by hand, then run the uninstall again to \
-             remove the plugin.",
+             remove the plugin, and `opencode service restart` to unload the server (opencode's \
+             background service reads its config only at start).",
             path.display()
         );
     }
@@ -250,12 +260,12 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
 
 pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Change>> {
     let bin = bin_str(o)?;
-    let (configs, plugin) = files(o, env);
-    // Install updates the entry where there is one (in both files, since
-    // opencode merges them), else adds it to the first file; uninstall
-    // removes it from both.
+    let (configs, overrides, plugin) = files(o, env);
+    // Install updates the entry where there is one (in every file, since
+    // opencode merges them), else adds it to the first direct file;
+    // uninstall removes it from all.
     let mut targets = Vec::new();
-    for path in &configs {
+    for path in configs.iter().chain(&overrides) {
         if !install || load(path, bin)?.is_some_and(|(v, _)| has_entry(&v)) {
             targets.push(path.clone());
         }

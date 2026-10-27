@@ -1208,6 +1208,12 @@ fn opencode_jsonc_with_comments_refused_unchanged() {
     assert!(msg.contains("\"agentmail\": {"), "{msg}");
     assert!(msg.contains(&format!("\"{BIN}\"")), "{msg}");
     assert!(msg.contains("\"codemode\": false"), "{msg}");
+    // The rerun after pasting changes only the plugin, so the command
+    // prints no restart line then: the refusal says it is needed.
+    assert!(
+        msg.contains("`opencode service restart` to load the server"),
+        "{msg}"
+    );
     assert_eq!(read(&path), text);
     assert!(!h.oc_plugin().exists());
     assert!(!h.oc_config().exists());
@@ -1224,7 +1230,12 @@ fn opencode_jsonc_with_comments_refused_unchanged() {
     assert_eq!(paths(&changes), [h.oc_plugin().as_path()]);
     assert_eq!(read(&path), pasted);
     let err = install::plan_uninstall(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
-    assert!(format!("{err:#}").contains("by hand"), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("by hand"), "{msg}");
+    assert!(
+        msg.contains("`opencode service restart` to unload the server"),
+        "{msg}"
+    );
     assert!(h.oc_plugin().exists());
     // Without the entry there is nothing to edit: the plugin goes.
     write(&path, text);
@@ -1515,6 +1526,18 @@ fn opencode_respects_xdg() {
         ]
     );
     assert!(!h.oc_dir().exists());
+    // A relative value is taken from the current directory, as opencode
+    // does.
+    let changes =
+        install::plan_install(&oc_opts(false, BIN), &h.env(&[("XDG_CONFIG_HOME", "rel")])).unwrap();
+    let rel = h.env(&[]).cwd.join("rel");
+    assert_eq!(
+        paths(&changes),
+        [
+            rel.join("opencode/opencode.json").as_path(),
+            rel.join("opencode/plugins/agentmail.js").as_path()
+        ]
+    );
     // An empty variable is unset.
     let changes =
         install::plan_install(&oc_opts(false, BIN), &h.env(&[("XDG_CONFIG_HOME", "")])).unwrap();
@@ -1541,6 +1564,70 @@ fn opencode_project_scope() {
     uninstall(&oc_opts(true, BIN), &env);
     assert!(!cfg.exists());
     assert!(!h.proj().join(".opencode").exists());
+}
+
+#[test]
+fn opencode_project_dot_opencode_entry_updated_and_removed() {
+    // opencode merges ./.opencode/opencode.json(c) after ./opencode.json:
+    // a stale agentmail entry there would override the one install writes.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let direct = h.proj().join("opencode.json");
+    let dot = h.proj().join(".opencode/opencode.json");
+    let dotc = h.proj().join(".opencode/opencode.jsonc");
+    write(&direct, "{\n  \"theme\": \"dark\"\n}\n");
+    write(&dotc, "{\n  // mine\n  \"model\": \"x\"\n}\n");
+    // No entry anywhere: the new one goes to the direct config, even with
+    // .opencode configs there.
+    write(&dot, "{\n  \"theme\": \"light\"\n}\n");
+    let changes = install(&oc_opts(true, BIN), &env);
+    let plugin = h.proj().join(".opencode/plugins/agentmail.js");
+    assert_eq!(paths(&changes), [direct.as_path(), plugin.as_path()]);
+    assert_eq!(read_json(&dot), json!({"theme": "light"}));
+    uninstall(&oc_opts(true, BIN), &env);
+    assert_eq!(read_json(&direct), json!({"theme": "dark"}));
+
+    // A stale entry (old shape, old binary) in .opencode/opencode.json is
+    // updated there.
+    write(
+        &dot,
+        "{\n  \"mcp\": {\n    \"agentmail\": {\"type\": \"local\", \"command\": [\"/old/agentmail\", \"mcp\"]}\n  }\n}\n",
+    );
+    let changes = install(&oc_opts(true, BIN), &env);
+    assert_eq!(paths(&changes), [dot.as_path(), plugin.as_path()]);
+    assert_eq!(
+        read_json(&dot),
+        json!({"mcp": {"servers": {"agentmail": oc_server(BIN)}}})
+    );
+    assert_eq!(read_json(&direct), json!({"theme": "dark"}));
+    // Uninstall removes it from every config, the .opencode ones included.
+    write(
+        &direct,
+        &format!(
+            "{{\"theme\": \"dark\", \"mcp\": {{\"servers\": {{\"agentmail\": {}}}}}}}\n",
+            oc_server(BIN)
+        ),
+    );
+    uninstall(&oc_opts(true, BIN), &env);
+    assert!(!read_json(&dot).to_string().contains("agentmail"));
+    assert_eq!(read_json(&direct), json!({"theme": "dark"}));
+    assert!(!plugin.exists());
+
+    // The same JSONC rule: a commented .opencode/opencode.jsonc with an
+    // entry is refused and nothing changes.
+    let commented = format!(
+        "{{\n  // mine\n  \"mcp\": {{\"servers\": {{\"agentmail\": {}}}}}\n}}\n",
+        oc_server("/old/agentmail")
+    );
+    write(&dotc, &commented);
+    let before_direct = read(&direct);
+    let err = install::plan_install(&oc_opts(true, BIN), &env).unwrap_err();
+    assert!(format!("{err:#}").contains("opencode.jsonc"), "{err:#}");
+    let err = install::plan_uninstall(&oc_opts(true, BIN), &env).unwrap_err();
+    assert!(format!("{err:#}").contains("by hand"), "{err:#}");
+    assert_eq!(read(&dotc), commented);
+    assert_eq!(read(&direct), before_direct);
+    assert!(!plugin.exists());
 }
 
 #[test]
