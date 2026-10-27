@@ -313,6 +313,87 @@ fn claude_uninstall_keeps_empty_containers_that_were_there() {
 }
 
 #[test]
+fn claude_reinstall_after_uninstall_records_the_file_anew() {
+    // The record of the file before agentmail is taken again by an install
+    // into a file without agentmail's entries: containers the user added
+    // since the first install stay, empty, through the next uninstall.
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(&h.settings(), "{\"model\":\"opus\"}");
+    write(&h.user_mcp(), "{\"x\":1}");
+    install(&opts(false, BIN), &env);
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(read_json(&h.settings()), json!({"model": "opus"}));
+    assert_eq!(read_json(&h.user_mcp()), json!({"x": 1}));
+    let settings = "{\"model\":\"opus\",\"hooks\":{}}";
+    let mcp = "{\"x\":1,\"mcpServers\":{}}";
+    write(&h.settings(), settings);
+    write(&h.user_mcp(), mcp);
+    install(&opts(false, BIN), &env);
+    assert_eq!(read(&bak(&h.settings())), settings);
+    assert_eq!(read(&bak(&h.user_mcp())), mcp);
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(
+        read_json(&h.settings()),
+        json!({"model": "opus", "hooks": {}})
+    );
+    assert_eq!(read_json(&h.user_mcp()), json!({"x": 1, "mcpServers": {}}));
+}
+
+#[test]
+fn claude_file_agentmail_created_then_kept_is_the_users_after_reinstall() {
+    // Agentmail created the files; the user added keys of their own, so an
+    // uninstall kept them. Once agentmail's entries are gone, the next
+    // install sees files the user had, not files agentmail created.
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&opts(false, BIN), &env);
+    let mut s = read_json(&h.settings());
+    s["model"] = json!("opus");
+    write(&h.settings(), &s.to_string());
+    let mut m = read_json(&h.user_mcp());
+    m["x"] = json!(1);
+    write(&h.user_mcp(), &m.to_string());
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(read_json(&h.settings()), json!({"model": "opus"}));
+    assert_eq!(read_json(&h.user_mcp()), json!({"x": 1}));
+    let settings = "{\"model\":\"opus\",\"hooks\":{}}";
+    let mcp = "{\"x\":1,\"mcpServers\":{}}";
+    write(&h.settings(), settings);
+    write(&h.user_mcp(), mcp);
+    install(&opts(false, BIN), &env);
+    assert!(!marker(&h.settings()).exists());
+    assert!(!marker(&h.user_mcp()).exists());
+    assert_eq!(read(&bak(&h.settings())), settings);
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(
+        read_json(&h.settings()),
+        json!({"model": "opus", "hooks": {}})
+    );
+    assert_eq!(read_json(&h.user_mcp()), json!({"x": 1, "mcpServers": {}}));
+}
+
+#[test]
+fn claude_install_after_file_removed_forgets_its_old_backup() {
+    // A backup left from a file the user has since deleted does not make
+    // the file agentmail now creates count as theirs.
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(&h.settings(), "{\"model\":\"opus\"}");
+    install(&opts(false, BIN), &env);
+    assert!(bak(&h.settings()).exists());
+    std::fs::remove_file(h.settings()).unwrap();
+    // A stale marker listing a directory this install does not create.
+    write(&marker(&h.settings()), "/stale\n");
+    install(&opts(false, BIN), &env);
+    assert!(!bak(&h.settings()).exists());
+    assert_eq!(read(&marker(&h.settings())), "");
+    uninstall(&opts(false, BIN), &env);
+    assert!(!h.settings().exists());
+    assert!(!marker(&h.settings()).exists());
+}
+
+#[test]
 fn claude_uninstall_keeps_files_that_were_empty_objects() {
     let h = Home::new();
     let env = h.env(&[]);

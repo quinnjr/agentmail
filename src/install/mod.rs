@@ -9,7 +9,9 @@
 //! twice in a row finds nothing more to do. Before a file is first changed
 //! its original is saved next to it as `<file>.agentmail.bak`; a file
 //! agentmail creates is marked as such by `<file>.agentmail.created`, and
-//! only such a file is ever deleted again.
+//! only such a file is ever deleted again. An install into a file holding
+//! none of agentmail's entries takes that record anew, so an earlier
+//! install's record never outlives an uninstall.
 
 mod claude;
 pub mod json;
@@ -44,6 +46,10 @@ pub struct Change {
     pub path: PathBuf,
     pub before: Option<String>,
     pub after: Option<String>,
+    /// The file holds none of agentmail's entries (an install): `before` is
+    /// the file before agentmail, replacing any backup or marker an earlier
+    /// install left, which no longer describe it.
+    pub record_anew: bool,
 }
 
 /// The environment the config locations depend on.
@@ -122,7 +128,10 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// file: saves the original as `<path>.agentmail.bak` unless a backup is
 /// already there, or, for a file that does not exist yet, records that
 /// agentmail creates it (and the directories it creates for it) in
-/// `<path>.agentmail.created`. The file is replaced atomically (a temporary
+/// `<path>.agentmail.created`. With [`Change::record_anew`] the earlier
+/// record is dropped first: the backup is replaced (or removed, for a file
+/// that does not exist) and any marker removed (and, for a file that does
+/// not exist, written again). The file is replaced atomically (a temporary
 /// file in the same directory, renamed over it), keeping its permissions; a
 /// new file is private to its owner (mode 0600). A symlink is followed, even
 /// one whose target does not exist yet: the file it points to changes, the
@@ -225,7 +234,21 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
         remove_if_there(&marker)?;
         return Ok(dirs);
     };
-    if let Some(before) = &c.before {
+    if c.record_anew {
+        match &c.before {
+            Some(before) => {
+                replace_file(&bak, perms.as_ref(), before.as_bytes())
+                    .with_context(|| format!("writing {}", bak.display()))?;
+                remove_if_there(&marker)?;
+            }
+            // Written again below, listing the directories this install
+            // creates.
+            None => {
+                remove_if_there(&bak)?;
+                remove_if_there(&marker)?;
+            }
+        }
+    } else if let Some(before) = &c.before {
         write_backup(&bak, perms.as_ref(), |f| f.write_all(before.as_bytes()))
             .with_context(|| format!("writing {}", bak.display()))?;
     }
@@ -285,6 +308,32 @@ fn set_private(f: &std::fs::File) -> std::io::Result<()> {
         let _ = f;
         Ok(())
     }
+}
+
+/// Replace `path` with `text` atomically (a temporary file next to it,
+/// renamed over it), with permissions `perms` when given.
+fn replace_file(path: &Path, perms: Option<&std::fs::Permissions>, text: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        if let Some(p) = perms {
+            f.set_permissions(p.clone())?;
+        }
+        f.write_all(text)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
 }
 
 /// Save a backup at `bak` unless one is there already, never leaving a
@@ -422,6 +471,13 @@ impl JsonFile {
         if new == self.value {
             return None;
         }
+        // Without agentmail's entries the file is as it was before
+        // agentmail: an older backup or marker no longer describes it.
+        let record_anew = !uninstall && {
+            let mut s = self.value.clone();
+            strip(&mut s);
+            s == self.value
+        };
         let after = if uninstall && new.is_empty() && original.is_none() {
             None
         } else {
@@ -431,6 +487,7 @@ impl JsonFile {
             path: self.path,
             before: self.before,
             after,
+            record_anew,
         })
     }
 }
@@ -781,6 +838,7 @@ mod tests {
             path: "/f".into(),
             before: Some(before),
             after: Some(after),
+            record_anew: false,
         });
         assert_eq!(
             d,
@@ -791,6 +849,7 @@ mod tests {
             path: "/f".into(),
             before: None,
             after: Some("a\n".into()),
+            record_anew: false,
         });
         assert_eq!(d, "--- /dev/null\n+++ /f\n@@ -0,0 +1,1 @@\n+a\n");
     }

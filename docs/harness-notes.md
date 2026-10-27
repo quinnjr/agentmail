@@ -501,6 +501,13 @@ Checked live against Claude Code 2.1.311 in a throwaway
   when the file had no such key before agentmail (a `"hooks": {}` that was
   there stays). "Before agentmail" is the backup when there is one (with
   agentmail's entries taken out), else the file as it is.
+- That record is taken anew by an install into a file holding none of
+  agentmail's entries (after an uninstall, say): the backup is replaced by
+  the file as it is now and a `.agentmail.created` marker left from an
+  earlier install is removed (for a missing file, a stale backup is removed
+  and the marker written afresh). Without this, a second uninstall was
+  judged against the first-ever original and removed a `"hooks": {}` or
+  `"mcpServers": {}` the user added between the two installs.
 - Creation is recorded, never inferred: when install creates a file it
   first writes `<file>.agentmail.created`, listing the directories it
   creates for the file (`.claude/` in a project, `~/.claude/` or
