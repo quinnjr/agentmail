@@ -998,8 +998,12 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     } else {
         (None, None)
     };
-    // A unit that was there may be running: it is restarted to run ours.
-    let restart = !uninstall && changes.iter().any(|c| c.before.is_some());
+    // A unit that was there may be running, and so may the service of one
+    // removed by hand: it is restarted to run ours (enabling a running
+    // service does not).
+    let restart = !uninstall
+        && !changes.is_empty()
+        && (changes.iter().any(|c| c.before.is_some()) || service::is_active(&env));
     // Only a daemon started on demand is stopped, decided before the
     // service starts: a supervised one (the service's own, say, on a
     // re-run) would only drop its clients while it is restarted.

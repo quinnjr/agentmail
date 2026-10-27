@@ -2959,9 +2959,12 @@ fn service_unit_quotes_the_binary_for_systemd() {
 
 /// A temporary home for `install --service`: a fake `systemctl` that logs
 /// each call (with whether the test's daemon at the default location was
-/// up then) but the read-only `show-environment`, which prints `FAKE_ENV`
+/// up then) but the read-only `is-active`, which succeeds with
+/// `FAKE_ACTIVE=active`, `show-environment`, which prints `FAKE_ENV`
 /// (by default, the manager's `XDG_CONFIG_HOME` the same as the CLI's),
-/// and `show`, which prints `FAKE_SHOW` (by default, no unit file), and
+/// `show -p UnitPath`, which prints the manager's unit search path
+/// `FAKE_UNITPATH` (by default, nothing), and `show`, which prints
+/// `FAKE_SHOW` (by default, no unit file), and
 /// fails a call holding `FAKE_FAIL`; and the daemon's default data
 /// directory and socket inside it.
 struct ServiceHome {
@@ -2977,6 +2980,10 @@ impl ServiceHome {
             r#"#!/bin/sh
 case "$*" in
   *show-environment*) printf '%s' "$FAKE_ENV"; exit 0 ;;
+  *is-active*) [ "$FAKE_ACTIVE" = active ]; exit $? ;;
+  *"show -p UnitPath"*)
+    if [ -n "${FAKE_UNITPATH+x}" ]; then printf 'UnitPath=%s\n' "$FAKE_UNITPATH"; fi
+    exit 0 ;;
   "--user show "*) printf '%s' "${FAKE_SHOW:-LoadState=not-found
 FragmentPath=
 }"; exit 0 ;;
@@ -2991,7 +2998,6 @@ if [ -n "$FAKE_FAIL" ]; then
 fi
 case "$*" in
   *is-system-running*) echo "${FAKE_STATE:-running}"; exit "${FAKE_RC:-0}" ;;
-  *is-active*) [ "$FAKE_ACTIVE" = active ]; exit $? ;;
 esac
 exit 0
 "#,
@@ -3049,6 +3055,7 @@ exit 0
                 format!("XDG_CONFIG_HOME={}\n", self.config().display()),
             )
             .env_remove("FAKE_SHOW")
+            .env_remove("FAKE_UNITPATH")
             .env_remove("FAKE_FAIL")
             .env_remove("FAKE_RO");
         c
@@ -3536,11 +3543,8 @@ fn service_uninstall() {
         String::from_utf8(out).unwrap().contains("not installed"),
         "second uninstall"
     );
-    // Only asked whether it runs.
-    assert_eq!(
-        s.log()[n + 3..],
-        ["--user is-active --quiet agentmail [down]"]
-    );
+    // Only asked whether it runs (not logged).
+    assert_eq!(s.log().len(), n + 3, "{:?}", s.log());
 }
 
 #[test]
@@ -3586,9 +3590,8 @@ fn service_uninstall_cleans_up_after_a_unit_removed_by_hand() {
     assert!(out.contains("already removed"), "{out}");
     assert!(out.contains("ran systemctl --user daemon-reload"), "{out}");
     assert_eq!(
-        s.log()[n + 1..],
+        s.log()[n..],
         [
-            "--user is-active --quiet agentmail [down]",
             "--user is-system-running [down]",
             "--user stop agentmail [down]",
             "--user daemon-reload [down]",
@@ -3605,7 +3608,6 @@ fn service_uninstall_cleans_up_after_a_unit_removed_by_hand() {
     assert_eq!(
         s.log()[n..],
         [
-            "--user is-active --quiet agentmail [down]",
             "--user is-system-running [down]",
             "--user daemon-reload [down]",
         ]
@@ -3659,11 +3661,7 @@ fn service_uninstall_leaves_a_service_agentmail_did_not_install() {
         assert!(out.contains(&theirs.display().to_string()), "{out}");
     }
     assert_eq!(std::fs::read_link(&link).unwrap(), theirs);
-    assert!(
-        s.log().iter().all(|l| l.starts_with("--user is-active")),
-        "{:?}",
-        s.log()
-    );
+    assert!(s.log().is_empty(), "{:?}", s.log());
 
     // A service still loaded from agentmail's (removed) unit is agentmail's.
     std::fs::remove_file(&link).unwrap();
@@ -3680,7 +3678,6 @@ fn service_uninstall_leaves_a_service_agentmail_did_not_install() {
     assert_eq!(
         s.log()[n..],
         [
-            "--user is-active --quiet agentmail [down]",
             "--user is-system-running [down]",
             "--user stop agentmail [down]",
             "--user daemon-reload [down]",
@@ -3690,14 +3687,21 @@ fn service_uninstall_leaves_a_service_agentmail_did_not_install() {
 
 #[test]
 fn service_refuses_a_manager_loading_units_elsewhere() {
-    // The manager's XDG_CONFIG_HOME is not this shell's: it would never
-    // see the unit, so nothing is written.
+    // The manager's unit search path (from its own XDG_CONFIG_HOME, not
+    // this shell's) does not hold the unit's directory: it would never see
+    // the unit, so nothing is written.
     let s = ServiceHome::new();
     let other = s.h.dir.path().join("other-cfg");
-    let fake_env = format!("XDG_CONFIG_HOME={}\n", other.display());
+    let ours = s.config().join("systemd/user");
+    let search = format!(
+        "{}/systemd/user.control /run/user/1/systemd/transient {} /etc/systemd/user \
+         /usr/lib/systemd/user",
+        other.display(),
+        other.join("systemd/user").display()
+    );
     let out = s
         .cli()
-        .env("FAKE_ENV", &fake_env)
+        .env("FAKE_UNITPATH", &search)
         .args(["install", "--service"])
         .assert()
         .failure()
@@ -3706,19 +3710,19 @@ fn service_refuses_a_manager_loading_units_elsewhere() {
         .clone();
     let err = String::from_utf8(out).unwrap();
     assert!(
-        err.contains(&format!(
-            "loads user units from {}",
-            other.join("systemd/user").display()
-        )),
+        err.contains(&format!("does not load user units from {}", ours.display())),
         "{err}"
     );
     assert!(err.contains("Nothing was changed"), "{err}");
+    // `set-environment` changes only what the manager passes to units,
+    // never where it looks for them: not suggested.
+    assert!(!err.contains("set-environment"), "{err}");
     assert!(!s.unit().exists());
     assert!(s.log().is_empty(), "{:?}", s.log());
     // A dry run says so.
     let out = s
         .cli()
-        .env("FAKE_ENV", &fake_env)
+        .env("FAKE_UNITPATH", &search)
         .args(["--json", "install", "--service", "--dry-run"])
         .assert()
         .success()
@@ -3726,22 +3730,106 @@ fn service_refuses_a_manager_loading_units_elsewhere() {
         .stdout
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
+    let notes: Vec<&str> = v["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
     assert!(
-        v["notes"]
-            .as_array()
-            .unwrap()
+        notes
             .iter()
-            .any(|n| n.as_str().unwrap().contains("loads user units from")),
+            .any(|n| n.contains("does not load user units from")),
         "{v}"
     );
+    assert!(notes.iter().all(|n| !n.contains("set-environment")), "{v}");
     // Uninstall too refuses, keeping the unit.
     s.cli().args(["install", "--service"]).assert().success();
     s.cli()
-        .env("FAKE_ENV", &fake_env)
+        .env("FAKE_UNITPATH", &search)
         .args(["uninstall", "--service"])
         .assert()
         .failure();
     assert!(s.unit().exists());
+}
+
+#[test]
+fn service_trusts_the_manager_search_path_over_its_unit_environment() {
+    // The environment the manager passes to units (`show-environment`,
+    // say after `import-environment`) names another XDG_CONFIG_HOME, but
+    // the manager's own search path holds the unit's directory: installed.
+    let s = ServiceHome::new();
+    let other = s.h.dir.path().join("other-cfg");
+    let search = format!(
+        "/run/user/1/systemd/transient {} /etc/systemd/user /usr/lib/systemd/user",
+        s.config().join("systemd/user").display()
+    );
+    s.cli()
+        .env("FAKE_ENV", format!("XDG_CONFIG_HOME={}\n", other.display()))
+        .env("FAKE_UNITPATH", &search)
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert!(s.unit().exists());
+    // So too with only show-environment differing, the search path unknown.
+    let s = ServiceHome::new();
+    s.cli()
+        .env("FAKE_ENV", format!("XDG_CONFIG_HOME={}\n", other.display()))
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert!(s.unit().exists());
+}
+
+#[test]
+fn service_restarts_a_running_service_whose_unit_was_removed() {
+    // The unit was removed by hand while the service still runs: install
+    // writes it anew and restarts the service onto it, since enabling a
+    // running service does not.
+    let s = ServiceHome::new();
+    let out = s
+        .cli()
+        .env("FAKE_ACTIVE", "active")
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(s.unit().exists());
+    assert!(
+        s.log()
+            .iter()
+            .any(|l| l.starts_with("--user try-restart agentmail")),
+        "{:?}",
+        s.log()
+    );
+    assert!(
+        out.contains("ran systemctl --user try-restart agentmail"),
+        "{out}"
+    );
+    // A dry run lists it too.
+    std::fs::remove_file(s.unit()).unwrap();
+    let out = s
+        .cli()
+        .env("FAKE_ACTIVE", "active")
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("try-restart agentmail"), "{out}");
+    // Not running: no restart.
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    assert!(
+        !s.log().iter().any(|l| l.contains("try-restart")),
+        "{:?}",
+        s.log()
+    );
 }
 
 #[test]

@@ -134,11 +134,14 @@ under `$XDG_CONFIG_HOME`, when it is absolute), with `ExecStart` running the bin
 the path you invoked it as (a symlink stays a symlink, so a unit pointing at
 `~/.local/bin/agentmail` follows it to a newer version; a path that is not
 this binary, or one with `..` in it, gives way to the binary's resolved
-path). It saves a unit already there as `agentmail.service.agentmail.bak`,
-and refuses to replace one you wrote when that backup already keeps a
-different one, so that neither is lost. It then runs the commands below,
-`daemon-reload` and `enable --now`, and, when it replaced an
-existing unit, `systemctl --user try-restart agentmail`, since enabling a
+path). A unit already there that matches the one below, whatever its
+`ExecStart` (say, one you wrote by hand from this README), is taken as
+agentmail's and replaced with no backup. Any other unit is saved as
+`agentmail.service.agentmail.bak`, and install refuses to replace it when
+that backup already keeps a different one, so that neither is lost. It then
+runs the commands below, `daemon-reload` and `enable --now`, and, when it
+replaced an existing unit or the service was already running (its unit
+removed by hand), `systemctl --user try-restart agentmail`, since enabling a
 running service does not restart it on the new unit. Last, when a daemon
 started on demand runs at the default location (its lock record does not say
 it is supervised), it runs `agentmail daemon stop` (with `AGENTMAIL_DATA_DIR`
@@ -149,10 +152,13 @@ on demand in between. With no daemon running, or the service's own
 (supervised) one, it skips that step, so a re-run leaves the service's daemon
 alone; should the step fail, the service is running all the same, and the
 error says to stop the on-demand daemon yourself. It refuses, changing
-nothing, when the systemd user manager loads user units from another
-directory than the one it would write to (the manager's `XDG_CONFIG_HOME` or
-`HOME` differs from your shell's, as `systemctl --user show-environment`
-shows), since the manager would never see the unit. It first asks
+nothing, when the systemd user manager's unit search path (`systemctl --user
+show -p UnitPath`) does not hold the directory it would write to (the
+manager's own `XDG_CONFIG_HOME` or `HOME` differs from your shell's), since
+the manager would never see the unit; run it again with `XDG_CONFIG_HOME`
+and `HOME` set as the manager has them. (`systemctl --user set-environment`
+does not help here: it changes only the environment the manager gives the
+services it starts, not where it looks for units.) It first asks
 `systemctl --user is-system-running`: a manager that answers `running`,
 `degraded` (some other unit failed), `starting` or `initializing` can run the
 service; any other answer, or none, changes nothing and prints these steps to

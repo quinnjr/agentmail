@@ -54,8 +54,9 @@ pub fn location_overrides(env: &Env) -> Vec<&'static str> {
         .collect()
 }
 
-/// The systemd user manager's environment (`systemctl --user
-/// show-environment`), with `HOME` defaulting to `env`'s. Nothing when the
+/// The environment the systemd user manager passes to the units it starts,
+/// the service's daemon among them (`systemctl --user show-environment`),
+/// with `HOME` defaulting to `env`'s. Nothing when the
 /// manager cannot be asked, or a value cannot be read (one with special
 /// characters is shown quoted, `$'...'`).
 fn manager_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
@@ -153,35 +154,66 @@ fn unit_dir(xdg: Option<&str>, home: &Path) -> PathBuf {
         .join("systemd/user")
 }
 
-/// When the systemd user manager loads user units from another directory
-/// than the one the unit goes in here (its `XDG_CONFIG_HOME`, or `HOME`,
-/// differs from this shell's): why agentmail refuses, since the manager
-/// would never see the unit (and `enable` it, which the manager does). Nothing
-/// when they match, or the manager cannot be asked.
-pub fn config_mismatch(env: &Env) -> Option<String> {
-    let manager = manager_env(env)?;
-    let theirs = unit_dir(
-        manager.get("XDG_CONFIG_HOME").map(String::as_str),
-        Path::new(manager.get("HOME")?),
-    );
-    let ours = unit_path(env).parent()?.to_path_buf();
-    let same = |a: &Path, b: &Path| {
-        a == b
-            || matches!(
-                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-                (Ok(x), Ok(y)) if x == y
-            )
+/// The systemd user manager's unit search path, as it reports it
+/// (`systemctl --user show -p UnitPath`, space-separated). The manager
+/// builds it from its own process environment (`XDG_CONFIG_HOME`, `HOME`),
+/// which `show-environment` does not show: that is the environment it
+/// passes to the units it starts. Nothing when the manager cannot be asked
+/// or reports no search path.
+fn manager_unit_path(env: &Env) -> Option<String> {
+    let out = Command::new(systemctl(env))
+        .args(["--user", "show", "-p", "UnitPath"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("UnitPath="))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether the directory `dir` is on the search path `search` (directories
+/// separated by spaces; `dir` may hold spaces too), as is or once symlinks
+/// are resolved.
+fn on_search_path(search: &str, dir: &Path) -> bool {
+    let padded = format!(" {search} ");
+    let listed = |d: &Path| {
+        d.to_str()
+            .is_some_and(|d| padded.contains(&format!(" {d} ")))
     };
-    if same(&theirs, &ours) {
+    if listed(dir) {
+        return true;
+    }
+    let Ok(canon) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    listed(&canon)
+        || search
+            .split(' ')
+            .filter_map(|d| std::fs::canonicalize(d).ok())
+            .any(|d| d == canon)
+}
+
+/// When the systemd user manager does not load user units from the
+/// directory the unit goes in here (its own `XDG_CONFIG_HOME`, or `HOME`,
+/// differs from this shell's), as its unit search path says (see
+/// [`manager_unit_path`]): why agentmail refuses, since the manager would
+/// never see the unit (and `enable` it, which the manager does). Nothing
+/// when the directory is on that path, or the manager cannot be asked.
+pub fn config_mismatch(env: &Env) -> Option<String> {
+    let search = manager_unit_path(env)?;
+    let ours = unit_path(env).parent()?.to_path_buf();
+    if on_search_path(&search, &ours) {
         return None;
     }
     Some(format!(
-        "the systemd user manager loads user units from {} (its XDG_CONFIG_HOME or HOME), not \
-         {}, where agentmail would put the unit (from XDG_CONFIG_HOME or HOME here), so it \
-         would never see it. Run this with the manager's values (`systemctl --user \
-         show-environment` shows them), or set XDG_CONFIG_HOME in the manager with \
-         `systemctl --user set-environment`.",
-        theirs.display(),
+        "the systemd user manager does not load user units from {}, where agentmail would put \
+         the unit (from XDG_CONFIG_HOME or HOME here), so it would never see it: the manager's \
+         own XDG_CONFIG_HOME or HOME differs from this shell's (`systemctl --user show -p \
+         UnitPath` lists where it looks). Run this with XDG_CONFIG_HOME and HOME set as the \
+         manager has them.",
         ours.display()
     ))
 }
@@ -374,9 +406,10 @@ fn removal_steps(path: &Path) -> String {
 /// `bin` and the daemon location overrides `unset` (see
 /// [`location_overrides`]), which `daemon stop` leaves out so that it stops
 /// the daemon at the default location, the one the service replaces. With
-/// `restart` (install, replacing a unit systemd may be running), the
-/// service is restarted so that it runs the new unit: enabling a running
-/// service does not. With `stop_daemon`, install then stops any daemon run
+/// `restart` (install, replacing a unit systemd may be running, or writing
+/// one while the service runs, its unit removed by hand), the service is
+/// restarted so that it runs the new unit: enabling a running service does
+/// not. With `stop_daemon`, install then stops any daemon run
 /// on demand: last, so that the service's daemon, already waiting for the
 /// lock, takes over as it exits, leaving no time for a client to start
 /// another on demand. (Install passes `stop_daemon` only when such a daemon

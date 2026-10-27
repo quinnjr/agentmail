@@ -1186,3 +1186,39 @@ config schema and exit-code rules come from the engine bundle
   session busy and ends a waiting Stop hook: that stop's wake is lost
   until the human's next prompt (the mail stays unread and is counted in
   the reminder). A busy session is never woken by mistake.
+
+## `install --service` (Task 9)
+
+Deviations from the plan, and why:
+
+- **Step order.** The plan has install run `agentmail daemon stop`, then
+  `systemctl --user daemon-reload` and `enable --now agentmail`. Install
+  instead runs `daemon-reload` and `enable --now` first, then
+  `try-restart agentmail` when it replaced an existing unit or the
+  service was already running (its unit removed by hand; enabling a
+  running service does not restart it on the new unit), and runs
+  `daemon stop` last, only when a daemon started on demand holds the lock
+  at the default location (its lock record does not say it is
+  supervised). The service's daemon runs with `--wait-for-lock`, so it is
+  already waiting when the on-demand daemon exits and takes over at once:
+  stopping first would leave a gap in which a client starts another
+  daemon on demand, which the service's would then wait behind
+  indefinitely. Skipping the stop for a supervised daemon keeps a re-run
+  from dropping the service's own clients.
+- **Manager states.** The plan says install errors out when `systemctl
+  --user is-system-running` fails. That command exits 1 for `degraded`
+  (some other unit failed) and for `starting`/`initializing` (still
+  booting), in all of which the manager can load and run the service, so
+  those answers (and `running`) are accepted; any other answer, or none,
+  errors out with the manual steps as planned.
+- **Unit search path.** Install (and uninstall) refuse when the manager
+  would not see the unit: the check reads the manager's own unit search
+  path, `systemctl --user show -p UnitPath`, and refuses only when the
+  unit's directory is not on it. `show-environment` is not used for this:
+  it shows the environment the manager passes to units (which
+  `import-environment` and `set-environment` change), not the
+  `XDG_CONFIG_HOME`/`HOME` of the manager process that builds the search
+  path, so it gave false refusals and `set-environment` cannot fix a real
+  one. `show-environment` is still what install reads to note a service
+  data directory or socket that differs from the shell's defaults, since
+  those come from the environment the service's daemon gets.
