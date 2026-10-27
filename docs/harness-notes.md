@@ -1066,7 +1066,13 @@ config schema and exit-code rules come from the engine bundle
   process `<agentmail> mcp`) among the descendants of the `kiro-cli` the
   CLI runs under, reading `AGENTMAIL_KIRO_WAKE` from its
   `/proc/<pid>/environ` (`1` there means on; a server without it means
-  off, whatever the files say). The config files cannot be relied on for
+  off, whatever the files say). Only kiro's own engine-started servers
+  count: one with another harness process (a nested `kiro-cli`, `claude`
+  or `opencode`) between it and this `kiro-cli` belongs to that harness,
+  and one whose chain up to `kiro-cli` carries a `KIRO_SESSION_ID` other
+  than `kiro-cli`'s own was started from kiro's shell (another MCP
+  client, an inspector; the same test as the MCP bind redirect), so
+  neither decides this agent's default. The config files cannot be relied on for
   this: kiro's V3 `MCPConfigManager.readWorkspaceFiles` returns nothing
   unless the workspace is trusted (`if(!this.workspaceTrusted)return r`
   in the 2.32.0 bundle), and the order in which `items.merged()` lets a

@@ -456,9 +456,10 @@ fn kiro_ancestor(pid: u32) -> Option<ProcId> {
         .map(|(p, _)| p)
 }
 
-/// What agentmail's MCP servers running under `kiro` (a `kiro-cli` pid)
-/// say: whether one was started with [`ENV_KIRO_WAKE`]`=1`, or `None`
-/// when none runs there (see [`servers_wake`]).
+/// What agentmail's MCP servers that `kiro` (a `kiro-cli` pid) itself
+/// started say: whether one was started with [`ENV_KIRO_WAKE`]`=1`, or
+/// `None` when none runs there (see [`servers_wake`]). Servers below
+/// `kiro` that are not its own ([`is_kiro_own_server`]) do not count.
 fn kiro_servers_wake(kiro: u32) -> Option<bool> {
     let me = std::process::id();
     let own_name = std::env::current_exe()
@@ -472,8 +473,57 @@ fn kiro_servers_wake(kiro: u32) -> Option<bool> {
             .into_iter()
             .filter(|&pid| pid != me)
             .filter(|&pid| procinfo::args(pid).is_some_and(|a| is_agentmail_mcp(&a, &names)))
+            .filter(|&pid| {
+                is_kiro_own_server(
+                    pid,
+                    kiro,
+                    procinfo::parent_pid,
+                    procinfo::comm,
+                    procinfo::env_var,
+                )
+            })
             .map(|pid| procinfo::env_var(pid, ENV_KIRO_WAKE)),
     )
+}
+
+/// Whether `server`, a process below `kiro` (a `kiro-cli` pid), was
+/// started by kiro's own engine. Not when another harness process (a
+/// nested `kiro-cli`, `claude` or `opencode`) lies between them: that
+/// harness started it, with its own config. Nor when a process in the
+/// chain from `server` up to (not including) `kiro` carries a
+/// [`ENV_KIRO_SESSION`] value other than `kiro`'s own: it was started
+/// from kiro's shell (by another MCP client, say), the same test as
+/// [`launched_from_harness_shell`]. Nor when the chain does not reach
+/// `kiro` (a process in it exited). `parent`, `comm` and `environ` read
+/// the process table, injected for tests.
+fn is_kiro_own_server(
+    server: u32,
+    kiro: u32,
+    parent: impl Fn(u32) -> Option<u32>,
+    comm: impl Fn(u32) -> Option<String>,
+    environ: impl Fn(u32, &str) -> Option<OsString>,
+) -> bool {
+    let kiro_session = environ(kiro, ENV_KIRO_SESSION);
+    let mut pid = server;
+    // Bounded, as a guard against a cyclic table.
+    for _ in 0..1024 {
+        if pid == kiro {
+            return true;
+        }
+        if comm(pid).is_some_and(|c| procinfo::detect_harness(&c) != Harness::Other) {
+            return false;
+        }
+        if environ(pid, ENV_KIRO_SESSION)
+            .is_some_and(|v| !v.is_empty() && Some(&v) != kiro_session.as_ref())
+        {
+            return false;
+        }
+        match parent(pid) {
+            Some(p) if p > 0 => pid = p,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Whether a process started with `args` (the program first) is
@@ -529,6 +579,50 @@ mod tests {
         assert_eq!(servers_wake([Some(OsString::from("0"))]), Some(false));
         assert_eq!(servers_wake([one()]), Some(true));
         assert_eq!(servers_wake([None, one()]), Some(true));
+    }
+
+    #[test]
+    fn is_kiro_own_server_counts_only_servers_kiro_started() {
+        // pid -> (ppid, comm, KIRO_SESSION_ID)
+        let table: HashMap<u32, (u32, &str, Option<&str>)> = HashMap::from([
+            (10, (1, "kiro-cli", None)),
+            (11, (10, "kiro-cli-chat", None)),
+            (12, (11, "node", None)),
+            // kiro's own engine-started server.
+            (13, (12, "agentmail", None)),
+            // kiro's shell, and a foreign MCP client run from it.
+            (20, (12, "bash", Some("outer"))),
+            (21, (20, "codex", Some("outer"))),
+            (22, (21, "agentmail", None)),
+            // A client that cleans its server's environment and whose own
+            // environment carries no session either, but whose shell does.
+            (23, (20, "inspector", None)),
+            (24, (23, "agentmail", None)),
+            // A nested kiro-cli run from kiro's shell, and its engine's server.
+            (30, (20, "kiro-cli", Some("outer"))),
+            (31, (30, "kiro-cli-chat", Some("outer"))),
+            (32, (31, "node", Some("outer"))),
+            (33, (32, "agentmail", Some("outer"))),
+            // A process whose parent exited (chain broken).
+            (40, (99, "agentmail", None)),
+        ]);
+        let parent = |p: u32| table.get(&p).map(|e| e.0);
+        let comm = |p: u32| table.get(&p).map(|e| e.1.to_string());
+        let environ = |p: u32, k: &str| {
+            assert_eq!(k, ENV_KIRO_SESSION);
+            table.get(&p).and_then(|e| e.2).map(OsString::from)
+        };
+        let own = |s: u32| is_kiro_own_server(s, 10, parent, comm, environ);
+        assert!(own(13));
+        assert!(!own(22), "a foreign client's server counted");
+        assert!(!own(24), "a server started from kiro's shell counted");
+        assert!(!own(33), "a nested kiro's server counted");
+        assert!(!own(40));
+        // A session kiro itself inherited (kiro run from a kiro shell) and
+        // passes on to its engine does not mark a server as foreign.
+        let inherited = |p: u32, _: &str| Some(OsString::from(if p == 22 { "x" } else { "outer" }));
+        assert!(is_kiro_own_server(13, 10, parent, comm, inherited));
+        assert!(!is_kiro_own_server(22, 10, parent, comm, inherited));
     }
 
     #[test]
