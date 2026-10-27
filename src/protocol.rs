@@ -170,7 +170,9 @@ pub enum Request {
     },
     /// What a harness hook needs about the caller, in one round trip.
     /// Data: `{"address", "name", "wake", "unread": count,
-    /// "open_questions": [{"id","from","subject"}], "urgent": [Message]}`.
+    /// "unread_ids": [id], "open_questions": [{"id","from","subject"}],
+    /// "urgent": [Message]}`. `unread_ids` are the unread messages' ids,
+    /// in id order.
     /// `open_questions` are those addressed to the caller, oldest first;
     /// `urgent` is its urgent mail that is neither read nor surfaced yet,
     /// oldest first. With `surface_urgent`, those messages are marked

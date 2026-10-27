@@ -470,6 +470,7 @@ async fn read_urgent_mail_is_not_surfaced() {
     let status = c.call(&session("s1"), hook_status(true)).await.unwrap();
     assert!(status["urgent"].as_array().unwrap().is_empty(), "{status}");
     assert_eq!(status["unread"], 0);
+    assert_eq!(status["unread_ids"], serde_json::json!([]), "{status}");
 }
 
 #[tokio::test]
@@ -520,6 +521,16 @@ async fn hook_status_lists_open_questions_and_counts() {
     let status = c.call(&session("s1"), hook_status(false)).await.unwrap();
     assert_eq!(status["open_questions"].as_array().unwrap().len(), 2);
     assert_eq!(status["unread"], 2);
+    // The unread ids name exactly the unread mail, so a hook can tell new
+    // mail from mail it already knew about.
+    let ids: Vec<&str> = status["unread_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{status}");
+    assert!(!ids.contains(&q1_id.as_str()), "{status}");
     c.call(
         &session("s1"),
         Request::Reply {

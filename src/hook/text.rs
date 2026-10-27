@@ -102,6 +102,7 @@ mod tests {
             name: "backend".into(),
             wake: true,
             unread,
+            unread_ids: (0..unread).map(|i| format!("M{i}")).collect(),
             open_questions: questions
                 .iter()
                 .enumerate()

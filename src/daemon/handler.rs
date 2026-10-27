@@ -1364,6 +1364,7 @@ impl Handler {
             "name": agent.name,
             "wake": agent.wake,
             "unread": snap.unread,
+            "unread_ids": snap.unread_ids,
             "open_questions": open_questions,
             "urgent": to_json(&snap.urgent)?,
         }))

@@ -247,6 +247,30 @@ come from the binary's bundled settings schema.
   waiting instead of waking it again for the same mail. After `/exit` no
   wait hook was left running.
 
+- **A rewake during a busy turn is injected into that turn.** Checked
+  with a stub `asyncRewake` Stop hook that exits 2 on a trigger file: the
+  hook started by one Stop kept running through the next human prompt, and
+  the trigger was fired while that turn ran a 20 s `sleep` tool call. No
+  extra turn started and nothing was dropped: when the tool call finished,
+  Claude Code ran `UserPromptSubmit` (its `prompt` is the
+  `<task-notification>` text) and sent the next model request with the
+  stderr in a block headed "[SYSTEM NOTIFICATION - NOT USER INPUT] ... an
+  automated background-task event", in the same turn; the terminal showed
+  "Stop hook feedback" above the turn's answer, which the model was free
+  to ignore (haiku did). That turn's Stop got `stop_hook_active: false`,
+  so the wake did not count as a hook continuation. Fired between turns
+  (idle), the same hook started a new turn, as above, and that turn also
+  ran `UserPromptSubmit` with the notification as its prompt. Harmful for
+  agentmail: the busy turn's one wake is spent as a confusing "Stop hook
+  blocking error" mid-turn, and a long-lived wait keeps the lock so later
+  Stops' waits skip. Hence the busy marking below. Rerun end to end with
+  the agentmail hooks (debug build, isolated daemon): the wait exited 0
+  about 0.1 s after the next prompt; mail sent during that turn's tool
+  call caused no injection; the turn's Stop started a plain wait that woke
+  the session at once for the unread mail; the woken turn's wait
+  (`stop_hook_active: true`) kept waiting, and woke it again only when a
+  new message came after the first was read outside the session.
+
 Hook configuration (`settings.json`), as Task 5 installs it:
 
 ```json
@@ -263,18 +287,29 @@ Hook configuration (`settings.json`), as Task 5 installs it:
 
 How `agentmail hook wait` behaves under it:
 
-- It waits only for an agent registered with `wake`, and only one per
-  agent at a time (a lock under `<data dir>/hook-wait/`): every Stop starts
-  one, and two would wake the agent twice for the same mail. A later one
-  exits 0 at once while the first still waits.
+- It waits only for an agent registered with `wake`, and only for an idle
+  session. Every Stop starts one, and the newest replaces the one before
+  (a turn file under `<data dir>/hook-wait/`, plus a lock so only one waits
+  per agent): the earlier one exits 0, so the agent is never woken twice
+  for the same mail.
+- The `session-start`, `prompt` and `post-tool` hooks mark the session
+  busy, and a wait exits 0 within half a second of that (it also checks
+  just before waking). So a wait started by one Stop never outlives the
+  idle period: mail that arrives during a later turn is that turn's
+  (the `post-tool` reminder tells it), and the turn's own Stop starts a
+  fresh wait.
 - On a plain stop, unread mail already there wakes at once, unless the
   agent also has open questions (the Stop hook's `decision: block` handles
-  those). After a wake or block (`stop_hook_active: true`) only mail that
-  arrives from then on counts, so mail the agent leaves unread cannot wake
-  it in a loop. Mail read as soon as it arrives does not count.
+  those). This includes mail that came mid-turn and was left unread: the
+  agent gets one wake for it. After a wake or block (`stop_hook_active:
+  true`) only mail that arrives from then on counts, so mail the agent
+  leaves unread cannot wake it in a loop. What is new is decided per
+  message id, not by the unread count: the agent reading old mail while
+  the wait runs does not hide a later message. Mail already read by the
+  time the wait looks (just after its delivery) does not count.
 - It exits 0 when the agent signs off, when the daemon stops, or when a
-  process it runs under (Claude Code) exits; it checks the processes every
-  2 s and otherwise sleeps on the daemon's event stream (no polling of
-  mail).
+  process it runs under (Claude Code) exits; it checks the processes and
+  the turn file every 0.5 s and otherwise sleeps on the daemon's event
+  stream (no polling of mail).
 - A `hook` command line this binary cannot parse (a newer config, an older
   binary) prints the usage error and exits 0, so it never blocks a stop.

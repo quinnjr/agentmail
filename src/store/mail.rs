@@ -245,10 +245,11 @@ fn hook_snapshot_in(
     index: &impl ReadableTable<&'static str, ()>,
     addr: &str,
 ) -> Result<HookSnapshot, StoreError> {
-    let unread = mailbox_rows(mailbox, addr)?
-        .iter()
+    let unread_ids: Vec<String> = mailbox_rows(mailbox, addr)?
+        .into_iter()
         .filter(|(_, flags)| flags & READ == 0)
-        .count();
+        .map(|(id, _)| id)
+        .collect();
     let mut open_questions = Vec::new();
     for row in index.iter()? {
         let (id, _) = row?;
@@ -266,7 +267,8 @@ fn hook_snapshot_in(
     }
     let urgent = unsurfaced_urgent_in(mailbox, messages, addr)?;
     Ok(HookSnapshot {
-        unread,
+        unread: unread_ids.len(),
+        unread_ids,
         open_questions,
         urgent,
     })
@@ -330,6 +332,8 @@ pub(crate) fn agent_repo_key(agent: &Agent) -> Option<String> {
 pub struct HookSnapshot {
     /// Messages in the mailbox not yet read.
     pub unread: usize,
+    /// Their ids, in id order.
+    pub unread_ids: Vec<String>,
     /// Open questions addressed to the agent (read or not), in id order.
     pub open_questions: Vec<Message>,
     /// Unread urgent mail not yet surfaced, oldest first.

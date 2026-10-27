@@ -452,18 +452,88 @@ async fn wait_skips_headless_claude() {
 
 #[tokio::test]
 async fn one_waiter_per_agent() {
-    // Every Stop starts a wait hook; a second one while the first still
-    // waits must not wake the agent twice for the same mail.
+    // Every Stop starts a wait hook; two waiting would wake the agent twice
+    // for the same mail. The later stop's wait takes over: the earlier one
+    // ends silently, and only the later one wakes.
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths).with("CLAUDE_CODE_ENTRYPOINT", "cli");
     let first = spawn(&env, HookEvent::Wait, "stop");
     assert!(still_waiting(&first, 0.5).await);
-    let second = finish(spawn(&env, HookEvent::Wait, "stop")).await;
-    assert!(silent(&second), "{second:?}");
-    send(&d, &a, "schema", "see the PR", false).await;
+    let second = spawn(&env, HookEvent::Wait, "stop");
     let out = finish(first).await;
+    assert!(silent(&out), "{out:?}");
+    assert!(still_waiting(&second, 0.5).await, "the later wait ended");
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(second).await;
     assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_wakes_for_new_mail_after_old_mail_is_read() {
+    // The wait knew one unread message when it started. The agent read it
+    // later; a new message must still wake it, though the unread count is
+    // back where it started.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let mut c = d.client().await;
+    let sent = c
+        .call(&Caller::Human, send_req(&[&a], "x", "y"))
+        .await
+        .unwrap();
+    let h = spawn(&env, HookEvent::Wait, "stop-active");
+    assert!(still_waiting(&h, 0.5).await, "woke for old mail");
+    let id = sent["id"].as_str().unwrap().to_string();
+    c.call(&agent(&a), Request::Read { id }).await.unwrap();
+    assert!(still_waiting(&h, 0.3).await, "woke for a read");
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    assert!(out.stderr.contains("1 unread"), "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_ends_when_the_session_is_busy_again() {
+    // A wait wakes an idle session. Once a new turn starts (a prompt) or
+    // the session runs a tool, the session is busy: mail arriving now must
+    // not wake it (Claude Code would inject the wake into the busy turn),
+    // and the turn's own Stop starts a fresh wait.
+    for (event, payload) in [
+        (HookEvent::Prompt, "prompt"),
+        (HookEvent::PostTool, "post-tool"),
+        (HookEvent::SessionStart, "session-start"),
+    ] {
+        let d = TestDaemon::start().await;
+        let a = register_here(&d, "backend", true).await;
+        let env = Env::of(&d.paths);
+        let h = spawn(&env, HookEvent::Wait, "stop");
+        assert!(still_waiting(&h, 0.5).await);
+        run(&env, event, payload).await;
+        let out = finish(h).await;
+        assert!(silent(&out), "{event:?}: {out:?}");
+        // The next stop waits again, and wakes for mail.
+        let h = spawn(&env, HookEvent::Wait, "stop");
+        assert!(still_waiting(&h, 0.5).await, "{event:?}");
+        send(&d, &a, "schema", "see the PR", false).await;
+        let out = finish(h).await;
+        assert_eq!(out.exit, 2, "{event:?}: {out:?}");
+    }
+}
+
+#[tokio::test]
+async fn busy_session_mail_is_not_a_wake() {
+    // Mail that comes during a turn is the turn's to see (the post-tool
+    // reminder); it never fires the wait started by an earlier stop.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    run(&env, HookEvent::Prompt, "prompt").await;
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
 }
 
 #[tokio::test]

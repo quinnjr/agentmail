@@ -18,10 +18,11 @@
 pub mod claude;
 pub mod text;
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -39,8 +40,11 @@ use crate::protocol::{Caller, ErrorCode, Event, Request};
 pub const CALL_LIMIT: Duration = Duration::from_secs(5);
 
 /// How often a waiting hook checks that the processes it ran under are
-/// still alive.
-const LIVENESS_EVERY: Duration = Duration::from_secs(2);
+/// still alive and that its session is still idle.
+const CHECK_EVERY: Duration = Duration::from_millis(500);
+
+/// How long a waiting hook waits for the one it replaces to let go.
+const TAKEOVER_LIMIT: Duration = Duration::from_secs(5);
 
 /// Claude Code sets this in its hooks' environment to its own pid.
 const ENV_CLAUDE_PID: &str = "CLAUDE_PID";
@@ -103,6 +107,9 @@ pub struct HookStatus {
     pub name: String,
     pub wake: bool,
     pub unread: usize,
+    /// The unread messages' ids, in id order.
+    #[serde(default)]
+    pub unread_ids: Vec<String>,
     /// Open questions addressed to the agent, oldest first.
     pub open_questions: Vec<OpenQuestion>,
     /// Urgent mail neither read nor surfaced before this call.
@@ -125,8 +132,11 @@ pub enum WaitOutcome {
     /// The agent signed off, the processes the hook runs under are gone,
     /// or the daemon went away.
     Gone,
-    /// Nothing to wait for: the agent does not want waking, or another
-    /// hook already waits for it.
+    /// The session is busy again (a prompt or tool call since the wait
+    /// began), or a later wait took over.
+    Busy,
+    /// Nothing to wait for: the agent does not want waking, or the wait it
+    /// would replace did not let go in time.
     Skip,
 }
 
@@ -203,20 +213,34 @@ impl Daemon {
         serde_json::from_value(data).ok()
     }
 
-    /// Block until the agent has mail to be woken for.
+    /// Note that the agent's session is busy: a prompt was submitted, or a
+    /// tool ran. A wait started by an earlier stop then ends (see
+    /// [`Daemon::wait`]). Best effort: a marker that cannot be written
+    /// leaves the wait running.
+    pub fn mark_busy(&self, address: &str) {
+        let _ = write_turn(&self.paths, address, &format!("busy {}", unique()));
+    }
+
+    /// Block until the idle agent has mail to be woken for.
     ///
     /// With `wake_for_unread`, unread mail already there counts, unless the
     /// agent also has open questions (a Stop hook deals with those).
     /// Otherwise (the agent was just woken, or blocked, and stopped again
     /// without reading) only mail that arrives from now on counts, so
-    /// mail it chose to leave unread never wakes it twice. Mail the agent
-    /// reads as soon as it comes never counts.
+    /// mail it chose to leave unread never wakes it twice. Which mail is
+    /// new is decided per message (by id), so reading old mail meanwhile
+    /// never hides a new one. Mail already read by the time the wait looks
+    /// never counts.
+    ///
+    /// The wait is for an idle session only. It ends with
+    /// [`WaitOutcome::Busy`] once the session is busy again
+    /// ([`Daemon::mark_busy`]) or a later wait takes over: each stop
+    /// starts one, the newest replaces the one before, and only one waits
+    /// per agent, so the agent is never woken twice for the same mail.
     ///
     /// Ends with [`WaitOutcome::Gone`] when the agent signs off, the daemon
     /// goes away, or a process the hook runs under (its harness) exits; and
-    /// with [`WaitOutcome::Skip`] at once when the agent has `wake` off or
-    /// another hook already waits for it. Only one waits per agent: every
-    /// stop starts a wait hook, and two waiting would wake the agent twice.
+    /// with [`WaitOutcome::Skip`] at once when the agent has `wake` off.
     pub async fn wait(&mut self, wake_for_unread: bool) -> WaitOutcome {
         let Some(status) = self.status(false).await else {
             return WaitOutcome::Gone;
@@ -224,20 +248,28 @@ impl Daemon {
         if !status.wake {
             return WaitOutcome::Skip;
         }
-        let Some(_lock) = waiter_lock(&self.paths, &status.address) else {
+        let address = status.address.clone();
+        // Claim the turn first, so the wait holding the lock lets go.
+        let token = format!("wait {}", unique());
+        let claimed = write_turn(&self.paths, &address, &token).is_ok();
+        let Some(_lock) = self.take_waiter_lock(&address).await else {
             return WaitOutcome::Skip;
         };
+        let busy = |paths: &Paths| claimed && read_turn(paths, &address) != Some(token.clone());
+        if busy(&self.paths) {
+            return WaitOutcome::Busy;
+        }
         let caller = self.caller.clone();
-        let mut first = true;
-        // Unread mail that does not count as news.
-        let mut known = 0;
+        // Unread mail that does not count as news; `None` until the first
+        // look sets it.
+        let mut known: Option<HashSet<String>> = None;
         loop {
             // Subscribe before looking, so no delivery slips between.
             let Some(mut watcher) = self.watcher().await else {
                 return WaitOutcome::Gone;
             };
             let request = Request::Watch {
-                agent: Some(status.address.clone()),
+                agent: Some(address.clone()),
             };
             let Ok(Ok(events)) =
                 tokio::time::timeout(CALL_LIMIT, watcher.stream(&caller, request)).await
@@ -248,34 +280,39 @@ impl Daemon {
             let Some(now) = self.status(false).await else {
                 return WaitOutcome::Gone;
             };
-            if first {
-                first = false;
-                known = if wake_for_unread && now.open_questions.is_empty() {
-                    0
+            let known = known.get_or_insert_with(|| {
+                if wake_for_unread && now.open_questions.is_empty() {
+                    HashSet::new()
                 } else {
-                    now.unread
+                    now.unread_ids.iter().cloned().collect()
+                }
+            });
+            if has_news(known, &now) {
+                return if busy(&self.paths) {
+                    WaitOutcome::Busy
+                } else {
+                    WaitOutcome::Mail(now)
                 };
             }
-            if now.unread > known {
-                return WaitOutcome::Mail(now);
-            }
-            known = now.unread;
-            let mut tick = tokio::time::interval(LIVENESS_EVERY);
+            let mut tick = tokio::time::interval(CHECK_EVERY);
             tick.tick().await;
             loop {
                 tokio::select! {
                     ev = events.next() => match ev {
-                        Some(Ok(Event::Delivered { to, .. })) if to == status.address => {
+                        Some(Ok(Event::Delivered { to, .. })) if to == address => {
                             let Some(now) = self.status(false).await else {
                                 return WaitOutcome::Gone;
                             };
-                            if now.unread > known {
-                                return WaitOutcome::Mail(now);
+                            if has_news(known, &now) {
+                                return if busy(&self.paths) {
+                                    WaitOutcome::Busy
+                                } else {
+                                    WaitOutcome::Mail(now)
+                                };
                             }
-                            known = now.unread;
                         }
                         Some(Ok(Event::Presence { agent }))
-                            if agent.agent.address == status.address && agent.agent.signed_off =>
+                            if agent.agent.address == address && agent.agent.signed_off =>
                         {
                             return WaitOutcome::Gone;
                         }
@@ -289,9 +326,27 @@ impl Daemon {
                         if !self.procs.iter().all(procinfo::is_alive) {
                             return WaitOutcome::Gone;
                         }
+                        if busy(&self.paths) {
+                            return WaitOutcome::Busy;
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// The waiter lock for `address`, waiting up to [`TAKEOVER_LIMIT`] for
+    /// the wait it replaces to let go. `None` when it never did.
+    async fn take_waiter_lock(&self, address: &str) -> Option<Option<File>> {
+        let started = Instant::now();
+        loop {
+            if let Some(lock) = waiter_lock(&self.paths, address) {
+                return Some(lock);
+            }
+            if started.elapsed() >= TAKEOVER_LIMIT {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -302,6 +357,48 @@ impl Daemon {
             .ok()?
             .ok()
     }
+}
+
+/// Whether `now` has unread mail not in `known`, and forget known mail
+/// that is no longer unread.
+fn has_news(known: &mut HashSet<String>, now: &HookStatus) -> bool {
+    let unread: HashSet<&str> = now.unread_ids.iter().map(String::as_str).collect();
+    known.retain(|id| unread.contains(id.as_str()));
+    now.unread_ids.iter().any(|id| !known.contains(id))
+}
+
+/// A token no other hook process writes.
+fn unique() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{} {nanos}", std::process::id())
+}
+
+/// The file that says who last claimed the agent's turn: the newest wait,
+/// or a busy mark. A wait whose token is no longer there ends.
+fn turn_path(paths: &Paths, address: &str) -> PathBuf {
+    paths
+        .data_dir
+        .join("hook-wait")
+        .join(format!("{address}.turn"))
+}
+
+fn write_turn(paths: &Paths, address: &str, token: &str) -> std::io::Result<()> {
+    let path = turn_path(paths, address);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Written whole and renamed into place, so a reader never sees half.
+    let tmp = path.with_extension(format!("turn.{}", unique().replace(' ', "-")));
+    std::fs::write(&tmp, token)?;
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+fn read_turn(paths: &Paths, address: &str) -> Option<String> {
+    std::fs::read_to_string(turn_path(paths, address)).ok()
 }
 
 /// Take the lock only one waiting hook per agent may hold: `None` when
@@ -404,6 +501,44 @@ mod tests {
             assert_eq!(input.session_id, None);
             assert!(!input.stop_hook_active);
         }
+    }
+
+    #[test]
+    fn has_news_is_per_message() {
+        let status = |ids: &[&str]| HookStatus {
+            address: "a".into(),
+            name: "a".into(),
+            wake: true,
+            unread: ids.len(),
+            unread_ids: ids.iter().map(|s| s.to_string()).collect(),
+            open_questions: Vec::new(),
+            urgent: Vec::new(),
+        };
+        let mut known: HashSet<String> = ["m1".to_string()].into();
+        assert!(!has_news(&mut known, &status(&["m1"])));
+        // m1 read, m2 new: the count is the same, but m2 is news.
+        assert!(has_news(&mut known.clone(), &status(&["m2"])));
+        // Reading m1 forgets it.
+        assert!(!has_news(&mut known, &status(&[])));
+        assert!(known.is_empty());
+        assert!(has_news(&mut known, &status(&["m1"])));
+    }
+
+    #[test]
+    fn turn_marker_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(&dir.path().join("data"));
+        assert_eq!(read_turn(&paths, "a-1"), None);
+        write_turn(&paths, "a-1", "wait 1").unwrap();
+        assert_eq!(read_turn(&paths, "a-1").as_deref(), Some("wait 1"));
+        write_turn(&paths, "a-1", "busy 2").unwrap();
+        assert_eq!(read_turn(&paths, "a-1").as_deref(), Some("busy 2"));
+        // No temporary files are left behind.
+        let names: Vec<_> = std::fs::read_dir(paths.data_dir.join("hook-wait"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![OsString::from("a-1.turn")]);
     }
 
     #[test]

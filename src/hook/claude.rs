@@ -5,11 +5,14 @@
 //!   and its reminder.
 //! - `post-tool`: urgent mail in full, once (it is marked surfaced), else
 //!   the reminder; nothing when there is neither.
+//! - All three mark the session busy, which ends a `wait` an earlier stop
+//!   started: a wake reaching a busy session is injected into its turn.
 //! - `stop`: `decision: block` while questions to the agent are open,
 //!   unless this stop already follows a hook continuation
 //!   (`stop_hook_active`), so a model that cannot answer is not held.
-//! - `wait` (an `asyncRewake` Stop hook): block until mail comes, then exit
-//!   2 with the reminder on stderr, which wakes the idle session.
+//! - `wait` (an `asyncRewake` Stop hook): block until mail comes while the
+//!   session stays idle, then exit 2 with the reminder on stderr, which
+//!   wakes it.
 
 use std::ffi::OsString;
 
@@ -59,6 +62,7 @@ async fn context(d: &mut Daemon, event_name: &str) -> HookOutput {
     let Some(status) = d.status(false).await else {
         return HookOutput::default();
     };
+    d.mark_busy(&status.address);
     let mut text = text::guidance_reminder(&status);
     if let Some(r) = text::reminder(&status) {
         text.push('\n');
@@ -71,6 +75,7 @@ async fn post_tool(d: &mut Daemon) -> HookOutput {
     let Some(status) = d.status(true).await else {
         return HookOutput::default();
     };
+    d.mark_busy(&status.address);
     match text::urgent(&status.urgent).or_else(|| text::reminder(&status)) {
         Some(text) => additional_context("PostToolUse", text),
         None => HookOutput::default(),
@@ -114,6 +119,6 @@ async fn wait(
             },
             None => HookOutput::default(),
         },
-        WaitOutcome::Gone | WaitOutcome::Skip => HookOutput::default(),
+        WaitOutcome::Gone | WaitOutcome::Busy | WaitOutcome::Skip => HookOutput::default(),
     }
 }
