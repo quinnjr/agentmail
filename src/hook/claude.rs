@@ -58,7 +58,7 @@ pub async fn run(
         HookEvent::PostTool => post_tool(d, input).await,
         HookEvent::Stop => stop(d, input).await,
         HookEvent::Wait => wait(d, input, env).await,
-        HookEvent::PreTool | HookEvent::Status => HookOutput::default(),
+        HookEvent::PreTool | HookEvent::Status | HookEvent::Signoff => HookOutput::default(),
     }
 }
 

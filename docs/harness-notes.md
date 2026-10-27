@@ -665,10 +665,14 @@ bundle (the `fromPromise` adapter that wraps a `{ id, setup }` module).
   session's events to every instance (seen with two `run --server` in two
   directories: both instances got both sessions' `execution.*` events). The
   plugin therefore acts on a session only when `ctx.session.get` places it
-  in its own `ctx.location.directory` (cached per session); otherwise two
-  instances would each queue the same question or run two waiters. A
-  deleted session cannot be looked up any more: an instance that never saw
-  it signs it off too, which is harmless twice.
+  in its own `ctx.location.directory`; otherwise two instances would each
+  queue the same question or run two waiters. Answers are cached: its own
+  sessions until deleted, another instance's in a list of the 256 most
+  recently seen (state for those is dropped, so a long-running `opencode
+  serve` does not grow without bound). A failed lookup is not cached; the
+  session's next event asks again. A deleted session cannot be looked up
+  any more: an instance that never saw it signs it off too, which is
+  harmless twice.
 - **No `session.hook("context")`.** The spec's table names it for the
   reminder at start and on a prompt; 2.0.27 has no such hook (the session
   hooks are `prompt`, `title`, `retry`, `model.request`, `http.request`,
@@ -688,21 +692,35 @@ How the plugin (`plugin/agentmail.js`) behaves, built on that:
   shared with the other harnesses.
 - After each tool call (`--surface-urgent`): urgent mail goes into the
   running turn with `synthetic` `steer` (once: agentmail marks it surfaced),
-  else, with unread mail, the reminder is appended to the tool result.
+  else, with unread mail, the reminder is appended to the tool result. When
+  the steer fails (the session ended meanwhile), the urgent text is
+  appended to the tool result instead, with the reminder, since agentmail
+  will not report that mail as urgent again.
 - At the end of a successful turn, open questions are queued as the next
   turn (`queue`, `resume: true`), unless that turn was itself one the
   plugin started (a wake or the questions): like Claude Code's
   `stop_hook_active`, it is not held in a loop by questions the model does
   not answer. A human prompt (`inbox.enqueued` with a `user` item) clears
-  that mark.
+  that mark. When the questions cannot be queued (`synthetic` fails), the
+  waiter starts as after a continuation (`stop_hook_active: true`), so the
+  open questions do not end the wait at once (`{"busy":true}`).
+- Turn starts and ends are recorded on the session's state as the event
+  arrives, before any lookup, with a counter; every step after an await
+  checks the session is still in the same idle period. Events are handled
+  side by side, so without this a turn that started during the end's
+  lookup could be overwritten as idle, and a waiter would run in a busy
+  session.
 - While a session is idle (after `execution.succeeded`, `failed` or
   `interrupted`) and its agent has `wake` on, one waiter per session runs
   `agentmail hook wait --harness opencode --session <id> --timeout 300`
   with `{"stop_hook_active": <the turn was the plugin's, or did not
   succeed>}` on stdin, the same `Daemon::wait` Claude Code's wait hook
   uses (one waiter per agent, wake once per message, new mail only after
-  a wake). It prints `{"mail":true,"text":...}`, `{"mail":false}` on the
-  timeout (the plugin waits again, at most once a second), `{"busy":true}`
+  a wake). It prints `{"mail":true,"text":...}`, `{"mail":false,
+  "known":[<ids>]}` on the timeout (the plugin waits again, at most once a
+  second, passing `known` back on the next wait's stdin, so mail delivered
+  between the two waits is news rather than counted as already there by
+  the next wait's first look), `{"busy":true}`
   (open questions continue the turn, or another wait took over),
   `{"skip":true}` (`wake` off, or the lock unusable) or `{"gone":true}`
   (signed off, gone, no agent, daemon down, opencode exited). On mail the
@@ -710,17 +728,29 @@ How the plugin (`plugin/agentmail.js`) behaves, built on that:
   anything but the timeout the waiter stops until the session is idle
   again. `execution.started` kills the waiter's process, so a wake never
   lands in a busy turn (`Bun.spawn`, since Bun's `$` cannot be killed).
+  A mail answer the wait printed just before the kill (or while the turn
+  was starting) has already been recorded by agentmail as woken, so the
+  plugin does not drop it: it marks the session, and if the busy turn ends
+  without a tool call having appended the reminder, the reminder is queued
+  then (`resume: true`), once.
   There are no busy-mark files for opencode: the plugin sees the session's
   state directly.
 - The waiter starts lazily, at the first end of turn whose status shows the
   agent registered with `wake`. After opencode restarts, a session that
   was idle when it went down is not waited on until its next turn ends.
-- `session.deleted` stops the waiter and runs `agentmail signoff` with
-  `OPENCODE_SESSION_ID` set to that session; the CLI accepts it because
-  its nearest harness ancestor is opencode itself.
+- `session.deleted` stops the waiter and runs `agentmail hook signoff
+  --harness opencode --session <id>`. Like every hook it never starts the
+  daemon (plain `agentmail signoff` would, through the CLI's
+  connect-or-spawn), and it acts only as the agent registered for that
+  session (`Caller::Session`), never by process ancestry, so it cannot
+  sign off an outer agent (the Claude Code session whose shell started
+  opencode) when the session has none. It prints `{"signed_off":true,
+  "address":...}`, or `{}` for a session without an agent or with the
+  daemon down.
 - `AGENTMAIL_ADDRESS` is removed from the environment of every agentmail
   command the plugin runs: opencode may have inherited it from the shell
-  that started it, and the CLI's `signoff` would act as that address.
+  that started it. The hooks never read it, but it is removed anyway so no
+  agentmail command the plugin runs can act as that address.
 - The plugin's cleanup kills every waiter and stops its event stream.
 - The installed file has the binary's absolute path in place of the
   `__AGENTMAIL_BIN__` placeholder; uninstalled (the placeholder left as is,

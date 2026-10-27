@@ -108,6 +108,10 @@ pub enum HookEvent {
     Wait,
     /// The agent's status as JSON (for plugins).
     Status,
+    /// Sign the session's agent off (opencode's plugin, when opencode
+    /// deletes the session). Never starts the daemon and acts only as the
+    /// agent registered for `--session`, never by process ancestry.
+    Signoff,
 }
 
 /// What the harness sent the hook on stdin.
@@ -131,6 +135,10 @@ pub struct HookInput {
     /// Stop hook's decision. It is the same for every stop until the next
     /// human prompt, a blocked stop's continuation included.
     pub prompt_id: Option<String>,
+    /// opencode's plugin: the unread mail ids a timed-out `wait` did not
+    /// count as news (its `known`), passed back to the wait that follows,
+    /// so mail that came between the two is news. `None` when absent.
+    pub known: Option<Vec<String>>,
 }
 
 impl HookInput {
@@ -159,6 +167,11 @@ impl HookInput {
             agent_id,
             hook_event_name: str_field("hook_event_name"),
             prompt_id: str_field("prompt_id"),
+            known: raw["known"].as_array().map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            }),
             raw,
         }
     }
@@ -354,6 +367,13 @@ impl Daemon {
         serde_json::from_value(data).ok()
     }
 
+    /// Sign the agent off. `None` for no agent (the session has none), or
+    /// any failure; otherwise the agent's view after signing off.
+    pub async fn signoff(&mut self) -> Option<Value> {
+        let call = self.client.call(&self.caller, Request::Signoff);
+        tokio::time::timeout(CALL_LIMIT, call).await.ok()?.ok()
+    }
+
     /// Note that the agent's session is busy: a prompt was submitted, or a
     /// tool ran. A wait started by an earlier stop then ends, and one that
     /// has not claimed the turn yet never does (see [`Daemon::wait`]). The
@@ -441,6 +461,22 @@ impl Daemon {
     /// while the agent lives, for the next wait, and the daemon removes
     /// them once it finds the agent gone.
     pub async fn wait(&mut self, wake_for_unread: bool, stop_key: Option<&str>) -> WaitOutcome {
+        self.wait_from(wake_for_unread, stop_key, &mut None).await
+    }
+
+    /// [`Daemon::wait`], with the unread mail that does not count as news
+    /// in `known`. `None` lets the first look decide (as `wait` does);
+    /// `Some` (a timed-out wait's set, passed back by opencode's plugin)
+    /// is used as is. The wait keeps `known` up to date (mail read
+    /// meanwhile drops out), so a caller that stops it (a timeout) can
+    /// hand it to the wait that follows: mail that came in between is then
+    /// news, not counted as already there.
+    pub async fn wait_from(
+        &mut self,
+        wake_for_unread: bool,
+        stop_key: Option<&str>,
+        known: &mut Option<HashSet<String>>,
+    ) -> WaitOutcome {
         let Some(status) = self.status(false).await else {
             return WaitOutcome::Gone;
         };
@@ -493,9 +529,8 @@ impl Daemon {
             return WaitOutcome::Busy;
         }
         let caller = self.caller.clone();
-        // Unread mail that does not count as news; `None` until the first
-        // look sets it.
-        let mut known: Option<HashSet<String>> = None;
+        // `known`: unread mail that does not count as news; `None` until
+        // the first look sets it.
         loop {
             // Subscribe before looking, so no delivery slips between.
             let Some(mut watcher) = self.watcher().await else {

@@ -37,12 +37,25 @@ if (cmd === "hook status") {
   const lines = fs.existsSync(q) ? fs.readFileSync(q, "utf8").split("\\n").filter(Boolean) : [];
   if (lines.length) {
     fs.writeFileSync(q, lines.slice(1).map((l) => l + "\\n").join(""));
-    process.stdout.write(lines[0] + "\\n");
+    let answer = lines[0];
+    let v = null;
+    try { v = JSON.parse(answer); } catch {}
+    if (v && v._delay_ms) {
+      // Answer late, and (with _ignore_term) after a kill: the answer was
+      // already on its way when the plugin killed it.
+      if (v._ignore_term) process.on("SIGTERM", () => {});
+      const ms = v._delay_ms;
+      delete v._delay_ms;
+      delete v._ignore_term;
+      setTimeout(() => process.stdout.write(JSON.stringify(v) + "\\n"), ms);
+    } else {
+      process.stdout.write(answer + "\\n");
+    }
   } else {
     fs.writeFileSync(dir + "/waiting." + session + ".pid", String(process.pid));
     setTimeout(() => {}, 30000);
   }
-} else if (cmd === "signoff") {
+} else if (cmd === "hook signoff") {
   process.stdout.write('{"signed_off":true}');
 }
 `;
@@ -111,7 +124,7 @@ function alive(pid) {
 }
 
 /** opencode's plugin context, mocked: records and feeds. */
-function mockCtx({ directory = "/work", sessionDirs = {} } = {}) {
+function mockCtx({ directory = "/work", sessionDirs = {}, get = null, synthetic = null } = {}) {
   const queue = [];
   let wake = null;
   const ctx = {
@@ -126,12 +139,19 @@ function mockCtx({ directory = "/work", sessionDirs = {} } = {}) {
         return { dispose: () => void ctx.disposed++ };
       },
     },
+    gets: [],
     session: {
+      // `synthetic(input)`, when given, may throw to fail the call.
       synthetic: async (input) => {
+        if (synthetic) await synthetic(input);
         ctx.synthetic.push(input);
         return { id: `msg_${ctx.synthetic.length}`, type: "synthetic" };
       },
-      get: async ({ sessionID }) => ({ id: sessionID, location: { directory: sessionDirs[sessionID] ?? directory } }),
+      get: async ({ sessionID }) => {
+        ctx.gets.push(sessionID);
+        if (get) await get(sessionID);
+        return { id: sessionID, location: { directory: sessionDirs[sessionID] ?? directory } };
+      },
     },
     event: {
       subscribe: ({ signal } = {}) => {
@@ -339,12 +359,22 @@ test("deleted_session_signs_off_and_stops_waiter", async () => {
   await until(() => existsSync(join(fake, "waiting.ses_a.pid")));
   const pid = Number(readFileSync(join(fake, "waiting.ses_a.pid"), "utf8"));
   ctx.emit("session.deleted", { sessionID: "ses_a" });
-  await until(() => calls().some((c) => c.args[0] === "signoff"));
-  const off = calls().find((c) => c.args[0] === "signoff");
-  expect(off.args).toEqual(["signoff"]);
-  expect(off.session_env).toBe("ses_a");
+  await until(() => calls().some((c) => c.args[1] === "signoff"));
+  const off = calls().find((c) => c.args[1] === "signoff");
+  // The session-strict hook, never the CLI's `signoff` (which would start
+  // the daemon, and fall back to process ancestry).
+  expect(off.args).toEqual(["hook", "signoff", "--harness", "opencode", "--session", "ses_a"]);
   expect(off.address).toBe("");
   await until(() => !alive(pid));
+});
+
+test("deleted_unknown_session_is_signed_off_by_session", async () => {
+  // Deleted before this instance saw it: it cannot be looked up any more,
+  // so it is signed off, by its session only.
+  const { ctx } = await start();
+  ctx.emit("session.deleted", { sessionID: "ses_new" });
+  await until(() => calls().length === 1);
+  expect(calls()[0].args).toEqual(["hook", "signoff", "--harness", "opencode", "--session", "ses_new"]);
 });
 
 test("deleted_session_of_another_directory_is_left_alone", async () => {
@@ -421,4 +451,176 @@ test("installed_path_is_substituted_whole", () => {
   expect(installed).toContain('const BIN = "/opt/agentmail/bin/agentmail";');
   expect(installed).toContain('"__AGENTMAIL" + "_BIN__"');
   expect(src.split("__AGENTMAIL_BIN__").length - 1).toBe(1);
+});
+
+test("turn_start_during_lookup_wins", async () => {
+  // The turn end's session lookup is slow; the next turn starts meanwhile.
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const { ctx } = await start({ get: () => gate });
+  setStatus("ses_a", registered());
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await until(() => ctx.gets.length >= 1);
+  await Bun.sleep(50);
+  release();
+  await Bun.sleep(300);
+  // The session is busy: no status for the ended turn, no waiter.
+  expect(waits("ses_a")).toEqual([]);
+  expect(calls()).toEqual([]);
+  // Its own end starts the waiter.
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+});
+
+test("turn_start_during_status_wins", async () => {
+  // The turn started after the lookup, while `hook status` ran.
+  const { ctx } = await start();
+  setStatus("ses_a", registered());
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await Bun.sleep(500);
+  expect(waits("ses_a")).toEqual([]);
+});
+
+test("failed_lookup_is_asked_again", async () => {
+  let fail = true;
+  const { ctx } = await start({
+    get: () => {
+      if (fail) throw new Error("transient");
+    },
+  });
+  setStatus("ses_a", registered());
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.gets.length === 1);
+  await Bun.sleep(100);
+  expect(calls()).toEqual([]);
+  fail = false;
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  // A positive answer is kept: no more lookups.
+  const n = ctx.gets.length;
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => calls().filter((c) => c.args[1] === "status").length === 2);
+  expect(ctx.gets.length).toBe(n);
+});
+
+test("foreign_session_is_looked_up_once", async () => {
+  const { ctx } = await start({ sessionDirs: { ses_b: "/elsewhere" } });
+  setStatus("ses_b", registered());
+  for (let i = 0; i < 3; i++) {
+    ctx.emit("session.execution.started", { sessionID: "ses_b" });
+    ctx.emit("session.execution.succeeded", { sessionID: "ses_b" });
+  }
+  await Bun.sleep(300);
+  expect(ctx.gets).toEqual(["ses_b"]);
+  expect(calls()).toEqual([]);
+});
+
+test("foreign_sessions_are_bounded", async () => {
+  const sessionDirs = {};
+  for (let i = 0; i < 300; i++) sessionDirs[`ses_${i}`] = "/elsewhere";
+  const { ctx } = await start({ sessionDirs });
+  for (let i = 0; i < 300; i++) ctx.emit("session.execution.succeeded", { sessionID: `ses_${i}` });
+  await until(() => ctx.gets.length === 300);
+  await Bun.sleep(100);
+  // The oldest were forgotten (looked up again), the newest kept.
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_0" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_299" });
+  await until(() => ctx.gets.length === 301);
+  await Bun.sleep(100);
+  expect(ctx.gets.slice(300)).toEqual(["ses_0"]);
+});
+
+test("urgent_is_appended_when_steering_fails", async () => {
+  const { ctx } = await start({
+    synthetic: () => {
+      throw new Error("session ended");
+    },
+  });
+  setStatus("ses_a", registered({ unread: 1, urgent: [{ id: "m1" }], text: { urgent: "🚨 prod", reminder: "📬 1" } }));
+  const ev = toolEvent("ses_a");
+  await ctx.hooks["execute.after"](ev);
+  expect(ev.result.content).toEqual([
+    { type: "text", text: "hi\n" },
+    { type: "text", text: "🚨 prod" },
+    { type: "text", text: "📬 1" },
+  ]);
+  expect(ctx.synthetic).toEqual([]);
+});
+
+test("questions_queue_failure_still_waits_for_new_mail", async () => {
+  const { ctx } = await start({
+    synthetic: () => {
+      throw new Error("no");
+    },
+  });
+  setStatus("ses_a", registered({ unread: 1, text: { questions: "❓ q" } }));
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  // The questions cannot continue the turn: wait as after a continuation,
+  // for new mail only, so the open questions do not end the wait.
+  expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: true });
+});
+
+test("waiter_passes_known_after_a_timeout", async () => {
+  const { ctx } = await start();
+  setStatus("ses_a", registered());
+  queueWaits("ses_a", { mail: false, known: ["m1", "m2"] }, { mail: false });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 3, 5000);
+  const [w1, w2, w3] = waits("ses_a").map((w) => JSON.parse(w.stdin));
+  expect(w1).toEqual({ stop_hook_active: false });
+  expect(w2).toEqual({ stop_hook_active: false, known: ["m1", "m2"] });
+  // A timeout without `known` leaves the next wait to look for itself.
+  expect(w3).toEqual({ stop_hook_active: false });
+});
+
+test("wake_dropped_while_busy_is_delivered_at_turn_end", async () => {
+  const { ctx } = await start();
+  setStatus("ses_a", registered());
+  // The wait's mail answer is on its way when the next turn starts.
+  queueWaits("ses_a", { mail: true, text: "📬 1 unread", _delay_ms: 300, _ignore_term: true });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  await Bun.sleep(50);
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await Bun.sleep(600);
+  // Not queued into the busy turn.
+  expect(ctx.synthetic).toEqual([]);
+  // That turn makes no tool call, then ends: the agent hears of it now.
+  setStatus("ses_a", registered({ unread: 1, text: { reminder: "📬 1 unread" } }));
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.synthetic.length === 1);
+  expect(ctx.synthetic[0]).toEqual({ sessionID: "ses_a", text: "📬 1 unread", delivery: "queue", resume: true });
+  // Once.
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 2);
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+  expect(ctx.synthetic).toHaveLength(1);
+});
+
+test("wake_dropped_while_busy_is_not_repeated_after_a_tool_reminder", async () => {
+  const { ctx } = await start();
+  setStatus("ses_a", registered());
+  queueWaits("ses_a", { mail: true, text: "📬 1 unread", _delay_ms: 300, _ignore_term: true });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  await Bun.sleep(50);
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await Bun.sleep(600);
+  // The busy turn's tool call reminds it of the mail.
+  setStatus("ses_a", registered({ unread: 1, text: { reminder: "📬 1 unread" } }));
+  const ev = toolEvent("ses_a");
+  await ctx.hooks["execute.after"](ev);
+  expect(ev.result.content.at(-1)).toEqual({ type: "text", text: "📬 1 unread" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 2);
+  expect(ctx.synthetic).toEqual([]);
 });

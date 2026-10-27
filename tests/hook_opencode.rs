@@ -137,10 +137,25 @@ fn spawn_wait(
     continued: bool,
     timeout: Option<Duration>,
 ) -> tokio::task::JoinHandle<Value> {
+    spawn_wait_with(
+        env,
+        session,
+        json!({ "stop_hook_active": continued }),
+        timeout,
+    )
+}
+
+/// [`spawn_wait`] with the whole stdin payload.
+fn spawn_wait_with(
+    env: &Env,
+    session: &str,
+    payload: Value,
+    timeout: Option<Duration>,
+) -> tokio::task::JoinHandle<Value> {
     let env = env.clone();
     let session = session.to_string();
     tokio::spawn(async move {
-        let stdin = json!({ "stop_hook_active": continued }).to_string();
+        let stdin = payload.to_string();
         let args = HookArgs {
             session: Some(&session),
             surface_urgent: false,
@@ -286,9 +301,76 @@ async fn status_empty_when_daemon_down_and_spawns_nothing() {
     assert_eq!(status(&env, "ses_a", true).await, json!({}));
     let wait = joined(spawn_wait(&env, "ses_a", false, None)).await;
     assert_eq!(wait, json!({ "gone": true }));
+    let off = run(&env, HookEvent::Signoff, Some("ses_a"), false, b"").await;
+    assert_eq!(json_of(&off), json!({}));
     assert!(!paths.socket.exists(), "a daemon socket appeared");
     assert!(!paths.lock.exists(), "a daemon lock appeared");
     assert!(!paths.db.exists(), "a database appeared");
+}
+
+async fn whoami(d: &TestDaemon, caller: &Caller) -> Value {
+    let mut c = d.client().await;
+    c.call(caller, Request::Whoami).await.unwrap()
+}
+
+#[tokio::test]
+async fn signoff_acts_only_as_the_session_agent() {
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    let b = register(&d, "frontend", "ses_b", true).await;
+    // A process-level agent bound to the same (opencode) process: a
+    // session-less sign-off would find it by process ancestry.
+    let mut c = d.client().await;
+    let docs = c
+        .call(
+            &Caller::Human,
+            Request::Register {
+                name: "docs".into(),
+                role: None,
+                working_on: None,
+                harness: Harness::Opencode,
+                cwd: d.dir.path().to_path_buf(),
+                proc_id: Some(parent()),
+                fresh: false,
+                wake: true,
+                session: None,
+            },
+        )
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let env = Env::of(&d.paths).with("AGENTMAIL_ADDRESS", &docs);
+    let procs = Caller::Procs {
+        procs: procinfo::ancestors(std::process::id()),
+    };
+    assert_eq!(whoami(&d, &procs).await["address"], docs.as_str());
+
+    // An unregistered session signs nobody off.
+    let out = run(&env, HookEvent::Signoff, Some("ses_unknown"), false, b"").await;
+    assert_eq!(json_of(&out), json!({}));
+    // No session: nobody's.
+    let out = run(&env, HookEvent::Signoff, None, false, b"").await;
+    assert_eq!(json_of(&out), json!({}));
+    let v = whoami(&d, &procs).await;
+    assert_eq!(v["address"], docs.as_str());
+    assert_eq!(v["agent"]["signed_off"], false, "{v}");
+
+    // The session's own agent, and only it.
+    let out = run(&env, HookEvent::Signoff, Some("ses_a"), false, b"").await;
+    assert_eq!(
+        json_of(&out),
+        json!({ "signed_off": true, "address": a.as_str() })
+    );
+    assert_eq!(status(&env, "ses_a", false).await, json!({}));
+    assert_eq!(status(&env, "ses_b", false).await["address"], b.as_str());
+    let v = whoami(&d, &procs).await;
+    assert_eq!(v["address"], docs.as_str());
+    assert_eq!(v["agent"]["signed_off"], false, "{v}");
+    // Again: the session has no agent any more.
+    let out = run(&env, HookEvent::Signoff, Some("ses_a"), false, b"").await;
+    assert_eq!(json_of(&out), json!({}));
 }
 
 #[tokio::test]
@@ -359,7 +441,9 @@ async fn wait_wakes_at_once_for_unread_mail_once() {
     assert_eq!(v["mail"], true, "{v}");
     // ...but only once for that mail, even after a plain turn.
     let wait = spawn_wait(&env, "ses_a", false, Some(Duration::from_secs(1)));
-    assert_eq!(joined(wait).await, json!({ "mail": false }));
+    let v = joined(wait).await;
+    assert_eq!(v["mail"], false, "{v}");
+    assert_eq!(v["known"].as_array().unwrap().len(), 1, "{v}");
 }
 
 #[tokio::test]
@@ -375,8 +459,39 @@ async fn wait_times_out_without_mail() {
         Some(Duration::from_secs(1)),
     ))
     .await;
-    assert_eq!(v, json!({ "mail": false }));
+    assert_eq!(v, json!({ "mail": false, "known": [] }));
     assert!(started.elapsed() >= Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn wait_after_timeout_counts_mail_that_came_between() {
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    send(&d, &a, "schema", false).await;
+    let env = Env::of(&d.paths);
+    let short = Some(Duration::from_secs(1));
+    // Woken for the first message; the woken turn ends without reading it.
+    assert_eq!(
+        joined(spawn_wait(&env, "ses_a", false, None)).await["mail"],
+        true
+    );
+    let v = joined(spawn_wait(&env, "ses_a", true, short)).await;
+    let known = v["known"].clone();
+    assert_eq!(v["mail"], false, "{v}");
+    assert_eq!(known.as_array().unwrap().len(), 1, "{v}");
+
+    // Mail delivered after that wait timed out, before the next one looks.
+    send(&d, &a, "between", false).await;
+
+    // Without `known` the next wait counts it as already there...
+    let v = joined(spawn_wait(&env, "ses_a", true, short)).await;
+    assert_eq!(v["mail"], false, "{v}");
+    assert_eq!(v["known"].as_array().unwrap().len(), 2, "{v}");
+    // ...with the timed-out wait's `known` it is news, at once.
+    let payload = json!({ "stop_hook_active": true, "known": known });
+    let v = joined(spawn_wait_with(&env, "ses_a", payload, short)).await;
+    assert_eq!(v["mail"], true, "{v}");
+    assert!(v["text"].as_str().unwrap().contains("2 unread"), "{v}");
 }
 
 #[tokio::test]
@@ -475,7 +590,21 @@ async fn cli_status_and_wait() {
     assert_eq!(v["mail"], true, "{v}");
     // After that wake, the same mail does not wake it again: timeout.
     let v = stdout_json(&cli(&d.paths, &wait, r#"{"stop_hook_active":true}"#));
-    assert_eq!(v, json!({ "mail": false }));
+    assert_eq!(v["mail"], false, "{v}");
+    assert_eq!(v["known"].as_array().unwrap().len(), 1, "{v}");
+
+    // `hook signoff` signs the session's agent off.
+    let off = [
+        "hook",
+        "signoff",
+        "--harness",
+        "opencode",
+        "--session",
+        "ses_a",
+    ];
+    let v = stdout_json(&cli(&d.paths, &off, ""));
+    assert_eq!(v, json!({ "signed_off": true, "address": a.as_str() }));
+    assert_eq!(stdout_json(&cli(&d.paths, &off, "")), json!({}));
 
     let unknown = [
         "hook",
@@ -499,5 +628,20 @@ fn cli_daemon_down_prints_empty_status_and_gone() {
         stdout_json(&cli(&paths, &wait, "")),
         json!({ "gone": true })
     );
+    // The plugin's sign-off of a deleted session, with an
+    // `OPENCODE_SESSION_ID` set as well: still nothing started.
+    let off = ["hook", "signoff", "--harness", "opencode", "--session", "s"];
+    let out = assert_cmd::Command::new(BIN)
+        .args(off)
+        .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &paths.socket)
+        .env("OPENCODE_SESSION_ID", "s")
+        .env_remove("AGENTMAIL_ADDRESS")
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert_eq!(stdout_json(&out), json!({}));
     assert!(!paths.socket.exists(), "a daemon socket appeared");
+    assert!(!paths.lock.exists(), "a daemon lock appeared");
+    assert!(!paths.db.exists(), "a database appeared");
 }
