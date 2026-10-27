@@ -363,17 +363,34 @@ How `agentmail hook wait` behaves under it:
   for the same mail. A new wait keeps trying for the lock for as long as
   its claim on the turn stands (the one it replaces lets go once it sees
   the claim, after at most a status call and a tick), and exits 0 if a
-  later claim or a busy mark replaces it meanwhile. With a lock file that
+  later claim replaces it or a busy mark comes meanwhile. With a lock file that
   cannot be opened or locked it exits 0 at once: two waits never both run.
 - The `session-start`, `prompt` and `post-tool` hooks of the main agent
-  (not of a subagent, see above) mark the session busy, and a wait exits 0 within half a second of that (it also checks
-  just before waking). So a wait started by one Stop never outlives the
-  idle period: mail that arrives during a later turn is that turn's
-  (the `post-tool` reminder tells it), and the turn's own Stop starts a
-  fresh wait.
+  (not of a subagent, see above) mark the session busy: they write the
+  time to `<address>.busy` (agents with `wake` only), a file waits only
+  read. A wait counts a mark newer than its stop (the Stop hook's record
+  below, else when the wait hook started) and exits 0 within half a
+  second of it (it also checks before claiming the turn and just before
+  waking). So a mark is not lost when it comes before the wait has
+  claimed the turn: Claude Code submits a queued prompt right after the
+  Stop hook returns, and its `prompt` hook can run before the wait hook
+  has connected. A wait started by one Stop never outlives the idle
+  period: mail that arrives during a later turn is that turn's (the
+  `post-tool` reminder tells it), and the turn's own Stop starts a fresh
+  wait.
+- The Stop hook and the wait hook of one stop run side by side, and they
+  decide together: the Stop hook writes its decision (block or not) with
+  the stop's `prompt_id` and the time to `<address>.stop` before it
+  prints, and the wait with the same `prompt_id` goes by that record
+  (looking for it up to 6 s) instead of reading the agent's questions for
+  itself, so a question opened or answered between two reads cannot make
+  them disagree. Only with no record (no `prompt_id`, or no Stop hook
+  answer in time) does the wait decide alone from the open questions. A
+  record for another `prompt_id` written after the wait started means a
+  later stop: the wait exits 0.
 - On a plain stop with open questions, the Stop hook's `decision: block`
   continues the turn, so the session is not idle: the wait that stop
-  started exits 0 at once and writes nothing (were it to wait, mail coming
+  started exits 0 at once and claims nothing (were it to wait, mail coming
   during a text-only continuation, which runs no busy-marking hook, would
   be injected into it). The continuation's own Stop (`stop_hook_active:
   true`) starts the real wait.
@@ -388,7 +405,9 @@ How `agentmail hook wait` behaves under it:
   message id, not by the unread count: the agent reading old mail while
   the wait runs does not hide a later message. Mail already read by the
   time the wait looks (just after its delivery) does not count.
-- It exits 0 when the agent signs off, when the daemon stops, when a
+- It exits 0 when the agent turns `wake` off (registers again with
+  `--no-wake`; the registration publishes a presence event, and every
+  status re-read checks it), when the agent signs off, when the daemon stops, when a
   process it runs under (Claude Code) exits, or when the agent is gone
   because its Claude Code process was registered as another agent
   (`agentmail register --pid`): the daemon then publishes the unbound
@@ -406,9 +425,9 @@ How `agentmail hook wait` behaves under it:
   (after global options such as `--json` or `--as human`, before any
   `--`) is `hook`.
 - Its files under `<data dir>/hook-wait/` (`<address>.turn`,
-  `<address>.lock`, `<address>.woken`) exist only for agents that have
-  had a wait (a busy mark rewrites an existing turn file and never
-  creates one). The daemon removes them, with any temporary
+  `<address>.lock`, `<address>.woken`, `<address>.busy`,
+  `<address>.stop`) exist only for agents registered with `wake` (busy
+  marks and stop records are written only for those). The daemon removes them, with any temporary
   `<address>.<kind>.<pid>-<nanos>` file a crashed write left, when the
   agent becomes gone: on sign-off, on a registration that unbinds it, and
   the first time a listing or lookup finds its process dead. It remembers
@@ -444,16 +463,18 @@ The code differs from the plan's sketch; build on the code:
   -> Option<OsString> + Sync)` (the `Sync` lets a waiting hook run on a
   spawned task). `run_as` dispatches on the harness; opencode and kiro
   currently return empty output there.
-- `HookInput` also carries `agent_id` (Claude Code subagents) and
+- `HookInput` also carries `agent_id` (Claude Code subagents), `prompt_id` and
   `hook_event_name`.
-- `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(address)`,
-  `wait(wake_for_unread) -> WaitOutcome { Mail(HookStatus), Gone, Busy,
-  Skip }`). The wait is not a loop over `WaitForMail { timeout_secs: 300
+- `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(&status)`,
+  `record_stop(&status, key, block)`, `wait(wake_for_unread, stop_key) ->
+  WaitOutcome { Mail(HookStatus), Gone, Busy, Skip }`; `stop_key` is the
+  stop's `prompt_id`, `None` where a harness has none, and then the wait
+  decides alone). The wait is not a loop over `WaitForMail { timeout_secs: 300
   }`: it subscribes with `Request::Watch { agent }` and wakes on
   `Delivered` events (re-reading `HookStatus` to decide per message id
   whether the mail is new, and ending when the re-read names another
   agent), ends on a `Presence` event showing the agent signed off or
-  gone, a lost connection, a dead harness process (checked every 0.5 s) or a
-  busy mark, and keeps one waiter per agent with the turn file and lock
+  gone, `wake` turned off, a lost connection, a dead harness process
+  (checked every 0.5 s) or a busy mark, and keeps one waiter per agent with the turn file and lock
   above. It has no timeout of its own; the harness's hook `timeout` bounds
   it. kiro's Stop (Task 8) maps `Mail` to its exit code and the rest to 0.

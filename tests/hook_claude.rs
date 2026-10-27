@@ -11,6 +11,7 @@ mod common;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use agentmail::hook::{self, HookEvent, HookOutput};
@@ -58,13 +59,31 @@ async fn run(env: &Env, event: HookEvent, payload: &str) -> HookOutput {
     .await
 }
 
+/// `name`'s Stop payload with a `prompt_id` of its own, as each stop has.
+fn stop_payload(name: &str) -> Vec<u8> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let mut v: Value = serde_json::from_slice(&fixture(name)).unwrap();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    v["prompt_id"] = Value::from(format!("prompt-{}-{n}", std::process::id()));
+    serde_json::to_vec(&v).unwrap()
+}
+
 /// Run a hook on its own task, so the test can act while it waits.
-fn spawn(env: &Env, event: HookEvent, payload: &str) -> tokio::task::JoinHandle<HookOutput> {
+fn spawn_raw(env: &Env, event: HookEvent, stdin: Vec<u8>) -> tokio::task::JoinHandle<HookOutput> {
     let env = env.clone();
-    let stdin = fixture(payload);
     tokio::spawn(
         async move { hook::run(Harness::ClaudeCode, event, &stdin, &|k| env.get(k)).await },
     )
+}
+
+/// What Claude Code does on a stop: start the wait hook and, beside it,
+/// run the Stop hook, both with the stop's payload (`stop` or
+/// `stop-active`). The wait goes by the Stop hook's decision.
+async fn stop_and_wait(env: &Env, name: &str) -> tokio::task::JoinHandle<HookOutput> {
+    let payload = stop_payload(name);
+    let wait = spawn_raw(env, HookEvent::Wait, payload.clone());
+    spawn_raw(env, HookEvent::Stop, payload).await.unwrap();
+    wait
 }
 
 fn parent() -> ProcId {
@@ -73,6 +92,11 @@ fn parent() -> ProcId {
 
 /// Register `name` bound to this test process's parent (the "harness").
 async fn register_here(d: &TestDaemon, name: &str, wake: bool) -> String {
+    register_with(d, name, wake, true).await
+}
+
+/// [`register_here`], reclaiming the process's own agent unless `fresh`.
+async fn register_with(d: &TestDaemon, name: &str, wake: bool, fresh: bool) -> String {
     let mut c = d.client().await;
     let data = c
         .call(
@@ -84,7 +108,7 @@ async fn register_here(d: &TestDaemon, name: &str, wake: bool) -> String {
                 harness: Harness::ClaudeCode,
                 cwd: d.dir.path().to_path_buf(),
                 proc_id: Some(parent()),
-                fresh: true,
+                fresh,
                 wake,
                 session: None,
             },
@@ -329,7 +353,7 @@ async fn background_subagent_does_not_end_the_idle_wait() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     for (event, payload) in [
         (HookEvent::PostTool, "post-tool-subagent"),
@@ -432,7 +456,7 @@ async fn wait_exits_2_on_mail() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await, "returned with no mail");
     send(&d, &a, "schema", "see the PR", false).await;
     let out = finish(h).await;
@@ -448,7 +472,7 @@ async fn wait_wakes_at_once_for_unread_mail() {
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     send(&d, &a, "schema", "see the PR", false).await;
-    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    let out = finish(stop_and_wait(&env, "stop").await).await;
     assert_eq!(out.exit, 2, "{out:?}");
 }
 
@@ -460,7 +484,7 @@ async fn wait_after_a_wake_waits_for_new_mail() {
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     send(&d, &a, "schema", "see the PR", false).await;
-    let h = spawn(&env, HookEvent::Wait, "stop-active");
+    let h = stop_and_wait(&env, "stop-active").await;
     assert!(still_waiting(&h, 0.5).await, "woke for old mail");
     send(&d, &a, "deploy", "tomorrow", false).await;
     let out = finish(h).await;
@@ -472,26 +496,111 @@ async fn wait_after_a_wake_waits_for_new_mail() {
 async fn wait_leaves_open_questions_to_the_stop_hook() {
     // The Stop hook blocks a plain stop for an open question, so the
     // session goes on with a continuation and is not idle. The wait that
-    // stop started ends at once, writing nothing: mail coming while the
+    // stop started ends at once, claiming nothing: mail coming while the
     // continuation runs must not be injected into it as a wake.
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     ask(&d, &a, "POST /orders body?").await;
     let started = Instant::now();
-    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    let out = finish(stop_and_wait(&env, "stop").await).await;
     assert!(silent(&out), "{out:?}");
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
+    // Only the Stop hook's record.
+    assert_eq!(wait_files(&d.paths), vec![format!("{a}.stop")]);
     // Mail during the continuation wakes nothing.
     send(&d, &a, "schema", "see the PR", false).await;
     // The continuation's own stop starts the real wait, which wakes for
     // mail that comes after it.
-    let h = spawn(&env, HookEvent::Wait, "stop-active");
+    let h = stop_and_wait(&env, "stop-active").await;
     assert!(still_waiting(&h, 0.5).await, "woke for old mail");
     send(&d, &a, "deploy", "tomorrow", false).await;
     let out = finish(h).await;
     assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_goes_by_the_stop_hooks_decision() {
+    // The Stop hook and the wait hook of one stop run side by side. Each
+    // reading the agent's questions for itself, they could decide apart
+    // when a question opens or closes between the two reads. The wait goes
+    // by the Stop hook's record for the stop instead.
+
+    // The Stop hook let the session stop; a question opens before the
+    // wait looks. The session is idle with unread mail: the wait wakes it.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let payload = stop_payload("stop");
+    let out = spawn_raw(&env, HookEvent::Stop, payload.clone())
+        .await
+        .unwrap();
+    assert!(silent(&out), "{out:?}");
+    ask(&d, &a, "POST /orders body?").await;
+    let out = finish(spawn_raw(&env, HookEvent::Wait, payload)).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+
+    // The Stop hook blocked the stop; the question is answered before the
+    // wait looks. The session goes on with the continuation: the wait
+    // ends at once, though mail is unread.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let payload = stop_payload("stop");
+    let out = spawn_raw(&env, HookEvent::Stop, payload.clone())
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["decision"], "block", "{v}");
+    let reply = Request::Reply {
+        message_id: q,
+        body: "id and qty".into(),
+        urgent: false,
+        refs: Vec::new(),
+        answer: true,
+    };
+    d.client().await.call(&agent(&a), reply).await.unwrap();
+    send(&d, &a, "schema", "see the PR", false).await;
+    let started = Instant::now();
+    let out = finish(spawn_raw(&env, HookEvent::Wait, payload)).await;
+    assert!(silent(&out), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn busy_before_the_wait_claims_is_not_lost() {
+    // Claude Code submits a queued prompt right after the Stop; its prompt
+    // hook can mark the session busy before the stop's wait has claimed
+    // the turn. The wait must still see the session busy: waking now would
+    // inject the wake into the new turn, and record the mail as woken for.
+    for wait_first in [false, true] {
+        let d = TestDaemon::start().await;
+        let a = register_here(&d, "backend", true).await;
+        let env = Env::of(&d.paths);
+        send(&d, &a, "schema", "see the PR", false).await;
+        let payload = stop_payload("stop");
+        let wait = if wait_first {
+            // The wait started before the Stop hook ran, as Claude Code
+            // starts them side by side; the prompt comes as soon as the
+            // Stop hook is done, whether or not the wait has claimed yet.
+            let wait = spawn_raw(&env, HookEvent::Wait, payload.clone());
+            spawn_raw(&env, HookEvent::Stop, payload).await.unwrap();
+            run(&env, HookEvent::Prompt, "prompt").await;
+            wait
+        } else {
+            spawn_raw(&env, HookEvent::Stop, payload.clone())
+                .await
+                .unwrap();
+            run(&env, HookEvent::Prompt, "prompt").await;
+            spawn_raw(&env, HookEvent::Wait, payload)
+        };
+        let out = finish(wait).await;
+        assert!(silent(&out), "wait first {wait_first}: {out:?}");
+        // The mail was not woken for: the busy turn's own stop wakes for it.
+        let out = finish(stop_and_wait(&env, "stop").await).await;
+        assert_eq!(out.exit, 2, "wait first {wait_first}: {out:?}");
+    }
 }
 
 #[tokio::test]
@@ -506,7 +615,7 @@ async fn wait_ignores_mail_already_read() {
         .unwrap();
     let id = sent["id"].as_str().unwrap().to_string();
     c.call(&agent(&a), Request::Read { id }).await.unwrap();
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await, "woke for read mail");
     h.abort();
 }
@@ -516,7 +625,7 @@ async fn wait_exits_0_on_signoff() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     d.client()
         .await
@@ -532,7 +641,7 @@ async fn wait_exits_0_when_daemon_stops() {
     let mut d = TestDaemon::start().await;
     register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     d.shutdown().await;
     let out = finish(h).await;
@@ -549,6 +658,24 @@ async fn wait_respects_no_wake() {
     let out = run(&env, HookEvent::Wait, "stop").await;
     assert!(silent(&out), "{out:?}");
     assert!(started.elapsed() < Duration::from_secs(1));
+
+    // `wake` turned off by registering again while a wait runs: the wait
+    // ends without waking, with or without mail it already knew.
+    for mail_first in [false, true] {
+        let d = TestDaemon::start().await;
+        let a = register_here(&d, "backend", true).await;
+        let env = Env::of(&d.paths);
+        if mail_first {
+            // Not news for a wait after a wake: it keeps waiting.
+            send(&d, &a, "old", "x", false).await;
+        }
+        let h = stop_and_wait(&env, "stop-active").await;
+        assert!(still_waiting(&h, 0.5).await);
+        assert_eq!(register_with(&d, "backend", false, false).await, a);
+        send(&d, &a, "schema", "see the PR", false).await;
+        let out = finish(h).await;
+        assert!(silent(&out), "mail first {mail_first}: {out:?}");
+    }
 }
 
 #[tokio::test]
@@ -572,9 +699,9 @@ async fn one_waiter_per_agent() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths).with("CLAUDE_CODE_ENTRYPOINT", "cli");
-    let first = spawn(&env, HookEvent::Wait, "stop");
+    let first = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&first, 0.5).await);
-    let second = spawn(&env, HookEvent::Wait, "stop");
+    let second = stop_and_wait(&env, "stop").await;
     let out = finish(first).await;
     assert!(silent(&out), "{out:?}");
     assert!(still_waiting(&second, 0.5).await, "the later wait ended");
@@ -596,7 +723,7 @@ async fn wait_wakes_for_new_mail_after_old_mail_is_read() {
         .call(&Caller::Human, send_req(&[&a], "x", "y"))
         .await
         .unwrap();
-    let h = spawn(&env, HookEvent::Wait, "stop-active");
+    let h = stop_and_wait(&env, "stop-active").await;
     assert!(still_waiting(&h, 0.5).await, "woke for old mail");
     let id = sent["id"].as_str().unwrap().to_string();
     c.call(&agent(&a), Request::Read { id }).await.unwrap();
@@ -621,13 +748,13 @@ async fn wait_ends_when_the_session_is_busy_again() {
         let d = TestDaemon::start().await;
         let a = register_here(&d, "backend", true).await;
         let env = Env::of(&d.paths);
-        let h = spawn(&env, HookEvent::Wait, "stop");
+        let h = stop_and_wait(&env, "stop").await;
         assert!(still_waiting(&h, 0.5).await);
         run(&env, event, payload).await;
         let out = finish(h).await;
         assert!(silent(&out), "{event:?}: {out:?}");
         // The next stop waits again, and wakes for mail.
-        let h = spawn(&env, HookEvent::Wait, "stop");
+        let h = stop_and_wait(&env, "stop").await;
         assert!(still_waiting(&h, 0.5).await, "{event:?}");
         send(&d, &a, "schema", "see the PR", false).await;
         let out = finish(h).await;
@@ -642,7 +769,7 @@ async fn busy_session_mail_is_not_a_wake() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     run(&env, HookEvent::Prompt, "prompt").await;
     send(&d, &a, "schema", "see the PR", false).await;
@@ -677,7 +804,7 @@ async fn signoff_during_a_wait_leaves_no_files() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     assert!(!wait_files(&d.paths).is_empty(), "the wait wrote nothing");
     d.client()
@@ -697,7 +824,7 @@ async fn signoff_after_a_wait_leaves_no_files() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     run(&env, HookEvent::Prompt, "prompt").await;
     assert!(silent(&finish(h).await));
@@ -794,6 +921,13 @@ async fn cli_hook_post_tool_and_wait() {
         .unwrap();
     assert!(ctx.contains(&a), "{ctx}");
 
+    // Claude Code runs the Stop hook beside the wait; here before it.
+    let out = cli(
+        &d.paths,
+        &["hook", "stop", "--harness", "claude-code"],
+        "stop",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
     let out = cli(
         &d.paths,
         &["hook", "wait", "--harness", "claude-code"],
@@ -852,7 +986,7 @@ async fn wait_exits_when_its_harness_exits() {
     // the hook once its agent is registered (a line on its stdin).
     let mut harness = Command::new("sh")
         .arg("-c")
-        .arg(r#"read go; "$0" hook wait --harness claude-code < "$1"; exit $?"#)
+        .arg(r#"read go; "$0" hook stop --harness claude-code < "$1" > /dev/null; "$0" hook wait --harness claude-code < "$1"; exit $?"#)
         .arg(BIN)
         .arg(&payload)
         .env("AGENTMAIL_DATA_DIR", &d.paths.data_dir)
@@ -913,7 +1047,7 @@ async fn wait_ends_when_its_process_is_registered_as_another_agent() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     let b = register_here(&d, "frontend", true).await;
     assert_ne!(a, b);
@@ -931,11 +1065,11 @@ async fn plain_stops_wake_once_for_mail_left_unread() {
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     send(&d, &a, "fyi", "no action needed", false).await;
-    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    let out = finish(stop_and_wait(&env, "stop").await).await;
     assert_eq!(out.exit, 2, "{out:?}");
     // A human turn, then a plain stop with the same mail still unread.
     run(&env, HookEvent::Prompt, "prompt").await;
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await, "woke again for the same mail");
     send(&d, &a, "deploy", "tomorrow", false).await;
     let out = finish(h).await;
@@ -1018,6 +1152,7 @@ async fn harness_exit_between_waits_leaves_no_files() {
     // It is then closed mid-turn, with no wait running.
     let script = r#"
         read go
+        "$0" hook stop --harness claude-code < "$1/stop.json" > /dev/null 2>&1
         "$0" hook wait --harness claude-code < "$1/stop.json" > /dev/null 2>&1 &
         read go
         "$0" hook prompt --harness claude-code < "$1/prompt.json" > /dev/null 2>&1
@@ -1062,7 +1197,7 @@ async fn harness_exit_between_waits_leaves_no_files() {
     let mut stdin = harness.stdin.take().unwrap();
     stdin.write_all(b"go\n").unwrap();
     let started = Instant::now();
-    while wait_files(&d.paths).is_empty() {
+    while !wait_files(&d.paths).iter().any(|f| f.ends_with(".turn")) {
         assert!(started.elapsed() < Duration::from_secs(10), "no wait ran");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1114,7 +1249,7 @@ async fn wait_outlasts_a_slow_takeover() {
         .open(dir.join(format!("{a}.lock")))
         .unwrap();
     stuck.try_lock().unwrap();
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 5.5).await, "gave up on the lock");
     drop(stuck);
     send(&d, &a, "schema", "see the PR", false).await;
@@ -1136,7 +1271,7 @@ async fn wait_for_the_lock_ends_when_the_session_is_busy() {
         .open(dir.join(format!("{a}.lock")))
         .unwrap();
     stuck.try_lock().unwrap();
-    let h = spawn(&env, HookEvent::Wait, "stop");
+    let h = stop_and_wait(&env, "stop").await;
     assert!(still_waiting(&h, 0.5).await);
     run(&env, HookEvent::Prompt, "prompt").await;
     let out = finish(h).await;
@@ -1152,6 +1287,6 @@ async fn unusable_wait_lock_skips() {
     let env = Env::of(&d.paths);
     std::fs::create_dir_all(d.paths.data_dir.join(format!("hook-wait/{a}.lock"))).unwrap();
     send(&d, &a, "schema", "see the PR", false).await;
-    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    let out = finish(stop_and_wait(&env, "stop").await).await;
     assert!(silent(&out), "{out:?}");
 }

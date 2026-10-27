@@ -10,7 +10,9 @@
 //!   started: a wake reaching a busy session is injected into its turn.
 //! - `stop`: `decision: block` while questions to the agent are open,
 //!   unless this stop already follows a hook continuation
-//!   (`stop_hook_active`), so a model that cannot answer is not held.
+//!   (`stop_hook_active`), so a model that cannot answer is not held. It
+//!   records its decision under the stop's `prompt_id` before printing,
+//!   and the `wait` hook of the same stop goes by that record.
 //! - `wait` (an `asyncRewake` Stop hook): block until mail comes while the
 //!   session stays idle, then exit 2 with the reminder on stderr, which
 //!   wakes it.
@@ -24,7 +26,7 @@
 //!   wake it (a foreground subagent runs inside a turn whose prompt
 //!   already marked the session busy).
 //! - Waking needs the interactive terminal UI (`CLAUDE_CODE_ENTRYPOINT`
-//!   unset or `cli`); see [`wait`].
+//!   unset or `cli`); see `wait` below.
 
 use std::ffi::OsString;
 
@@ -77,7 +79,7 @@ async fn context(d: &mut Daemon, event_name: &str) -> HookOutput {
     let Some(status) = d.status(false).await else {
         return HookOutput::default();
     };
-    d.mark_busy(&status.address);
+    d.mark_busy(&status);
     let mut text = text::guidance_reminder(&status);
     if let Some(r) = text::reminder(&status) {
         text.push('\n');
@@ -94,7 +96,7 @@ async fn post_tool(d: &mut Daemon, input: &HookInput) -> HookOutput {
     let Some(status) = d.status(true).await else {
         return HookOutput::default();
     };
-    d.mark_busy(&status.address);
+    d.mark_busy(&status);
     match text::urgent(&status.urgent).or_else(|| text::reminder(&status)) {
         Some(text) => additional_context(event_name, text),
         None => HookOutput::default(),
@@ -102,13 +104,16 @@ async fn post_tool(d: &mut Daemon, input: &HookInput) -> HookOutput {
 }
 
 async fn stop(d: &mut Daemon, input: &HookInput) -> HookOutput {
-    if input.stop_hook_active {
-        return HookOutput::default();
-    }
     let Some(status) = d.status(false).await else {
         return HookOutput::default();
     };
-    match text::open_questions(&status) {
+    let reason = match input.stop_hook_active {
+        true => None,
+        false => text::open_questions(&status),
+    };
+    // The wait hook of this stop goes by this decision, not its own read.
+    d.record_stop(&status, input.prompt_id.as_deref(), reason.is_some());
+    match reason {
         Some(reason) => HookOutput {
             stdout: json!({ "decision": "block", "reason": reason }).to_string(),
             ..HookOutput::default()
@@ -132,7 +137,10 @@ async fn wait(
     if entrypoint.is_some_and(|e| e != INTERACTIVE_ENTRYPOINT) {
         return HookOutput::default();
     }
-    match d.wait(!input.stop_hook_active).await {
+    match d
+        .wait(!input.stop_hook_active, input.prompt_id.as_deref())
+        .await
+    {
         WaitOutcome::Mail(status) => match text::reminder(&status) {
             Some(reminder) => HookOutput {
                 stderr: reminder,

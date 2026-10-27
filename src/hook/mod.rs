@@ -23,13 +23,13 @@
 //! - [`run`]`(harness, event, stdin, env)` and [`run_as`]`(.., session, ..)`,
 //!   with `env: &(dyn Fn(&str) -> Option<OsString> + Sync)` (the `Sync`
 //!   lets a waiting hook run on a spawned task).
-//! - [`Daemon::status`], [`Daemon::mark_busy`] and [`Daemon::wait`]. The
-//!   wait is not a `WaitForMail { timeout_secs }` loop: it watches the
-//!   daemon's event stream ([`Request::Watch`]) for deliveries and the
-//!   agent's sign-off or going away, and coordinates with other hooks of the same agent
-//!   through a turn file and a lock under `<data dir>/hook-wait/` (see
-//!   [`Daemon::wait`]). It ends with a [`WaitOutcome`], which the harness
-//!   module maps to its exit code.
+//! - [`Daemon::status`], [`Daemon::mark_busy`], [`Daemon::record_stop`]
+//!   and [`Daemon::wait`]. The wait is not a `WaitForMail { timeout_secs }`
+//!   loop: it watches the daemon's event stream ([`Request::Watch`]) for
+//!   deliveries and the agent's sign-off, going away or turning `wake`
+//!   off, and coordinates with other hooks of the same agent through files
+//!   under `<data dir>/hook-wait/` (see [`Daemon::wait`]). It ends with a
+//!   [`WaitOutcome`], which the harness module maps to its exit code.
 //! - [`clear_wait_state`]: the daemon removes an agent's files there once
 //!   it finds the agent gone (signed off, unbound, or its process dead).
 
@@ -67,8 +67,16 @@ const CHECK_EVERY: Duration = Duration::from_millis(500);
 /// the claim, which can take a status call ([`CALL_LIMIT`]) and a tick.
 const TAKEOVER_LIMIT: Duration = Duration::from_secs(5);
 
+/// How long a waiting hook looks for its stop's decision
+/// ([`Daemon::record_stop`]) before deciding by itself: the Stop hook runs
+/// alongside it and may take a status call ([`CALL_LIMIT`]) to write it.
+const STOP_LIMIT: Duration = Duration::from_secs(6);
+
+/// How often a waiting hook looks for its stop's decision.
+const STOP_POLL: Duration = Duration::from_millis(20);
+
 /// The kinds of per-agent files under `<data dir>/hook-wait/`.
-const STATE_KINDS: [&str; 3] = ["turn", "lock", "woken"];
+const STATE_KINDS: [&str; 5] = ["turn", "lock", "woken", "busy", "stop"];
 
 /// Claude Code sets this in its hooks' environment to its own pid.
 const ENV_CLAUDE_PID: &str = "CLAUDE_PID";
@@ -108,6 +116,9 @@ pub struct HookInput {
     /// Claude Code's `hook_event_name` (`PostToolUse` or
     /// `PostToolUseFailure` for `post-tool`).
     pub hook_event_name: Option<String>,
+    /// Claude Code's `prompt_id`: the Stop and the wait hook it starts get
+    /// the same one, which ties the wait to the Stop hook's decision.
+    pub prompt_id: Option<String>,
 }
 
 impl HookInput {
@@ -115,7 +126,7 @@ impl HookInput {
     ///
     /// A payload cut short (the CLI reads at most 16 MiB) is not JSON, but
     /// its `agent_id` is still looked for among the leading fields Claude
-    /// Code writes before the event's own (see [`agent_id_prefix`]), so a
+    /// Code writes before the event's own (see `agent_id_prefix`), so a
     /// subagent's huge tool result never passes for the main agent's.
     pub fn parse(stdin: &[u8]) -> HookInput {
         let raw: Value = serde_json::from_slice(stdin).unwrap_or(Value::Null);
@@ -135,6 +146,7 @@ impl HookInput {
             stop_hook_active: raw["stop_hook_active"].as_bool().unwrap_or(false),
             agent_id,
             hook_event_name: str_field("hook_event_name"),
+            prompt_id: str_field("prompt_id"),
             raw,
         }
     }
@@ -201,10 +213,12 @@ pub enum WaitOutcome {
     /// agent, or no process names it), the processes the hook runs under
     /// are gone, or the daemon went away.
     Gone,
-    /// The session is busy again (a prompt or tool call since the wait
-    /// began), or a later wait took over.
+    /// The session is not idle: the Stop hook blocked this stop, the
+    /// session is busy again (a prompt or tool call since the stop), or a
+    /// later stop or wait took over.
     Busy,
-    /// Nothing to wait for: the agent does not want waking, the wait it
+    /// Nothing to wait for: the agent does not want waking (or turned
+    /// `wake` off while the wait ran), the wait it
     /// would replace did not let go in time (only when this wait could not
     /// claim the turn), or the waiter lock is unusable.
     Skip,
@@ -246,6 +260,9 @@ pub struct Daemon {
     paths: Paths,
     /// The processes the hook runs under, nearest first, up to its harness.
     procs: Vec<ProcId>,
+    /// When the hook started ([`now_nanos`]), before it connected: a busy
+    /// mark newer than this came after the hook was started.
+    started: u128,
 }
 
 impl Daemon {
@@ -257,6 +274,7 @@ impl Daemon {
         session: Option<&str>,
         env: &(dyn Fn(&str) -> Option<OsString> + Sync),
     ) -> Option<Daemon> {
+        let started = now_nanos();
         let procs = hook_procs(harness, env);
         let caller = hook_caller(harness, session, env, &procs)?;
         let paths = Paths::from_vars(env).ok()?;
@@ -269,6 +287,7 @@ impl Daemon {
             caller,
             paths,
             procs,
+            started,
         })
     }
 
@@ -284,25 +303,55 @@ impl Daemon {
     }
 
     /// Note that the agent's session is busy: a prompt was submitted, or a
-    /// tool ran. A wait started by an earlier stop then ends (see
-    /// [`Daemon::wait`]). Best effort: a marker that cannot be written
-    /// leaves the wait running.
+    /// tool ran. A wait started by an earlier stop then ends, and one that
+    /// has not claimed the turn yet never does (see [`Daemon::wait`]). The
+    /// mark is the time it was made, in the `busy` file, which waits only
+    /// read, so a mark made before a wait claims the turn is not lost.
+    /// Best effort: a mark that cannot be written leaves the wait running.
     ///
-    /// Only an agent that has had a wait has a turn file to mark: with none
-    /// there is no wait to end, and nothing is written.
-    pub fn mark_busy(&self, address: &str) {
-        let path = state_path(&self.paths.data_dir, address, "turn");
-        if path.exists() {
-            let _ = write_state(&path, &format!("busy {}", unique()));
+    /// Only an agent with `wake` on is marked: no wait runs for one
+    /// without, and nothing is written.
+    pub fn mark_busy(&self, status: &HookStatus) {
+        if status.wake {
+            let path = state_path(&self.paths.data_dir, &status.address, "busy");
+            let _ = write_state(&path, &now_nanos().to_string());
         }
     }
 
-    /// Block until the idle agent has mail to be woken for.
+    /// Record the Stop hook's decision for the stop `key` (the payload's
+    /// `prompt_id`): whether it blocks the stop. The wait hook started by
+    /// the same stop reads it ([`Daemon::wait`]), so the two never decide
+    /// apart from different status reads. The record also dates the stop:
+    /// a busy mark newer than it came after the stop. Written before the
+    /// Stop hook prints, and only for an agent with `wake` on (no wait runs
+    /// for one without) and a stop with a key. Best effort.
+    pub fn record_stop(&self, status: &HookStatus, key: Option<&str>, block: bool) {
+        let Some(key) = key.filter(|k| !k.contains(char::is_whitespace)) else {
+            return;
+        };
+        if status.wake {
+            let path = state_path(&self.paths.data_dir, &status.address, "stop");
+            let record = StopRecord {
+                at: now_nanos(),
+                block,
+                key: key.to_string(),
+            };
+            let _ = write_state(&path, &record.to_string());
+        }
+    }
+
+    /// Block until the idle agent has mail to be woken for. `stop_key` is
+    /// the stop's key (Claude Code's `prompt_id`), shared with the Stop
+    /// hook of the same stop.
     ///
     /// With `wake_for_unread` (a plain stop), the wait ends at once with
-    /// [`WaitOutcome::Busy`] when the agent has open questions: the Stop
-    /// hook blocks that stop, so the session is not idle, and the
-    /// continuation's own stop starts the wait. Otherwise unread mail
+    /// [`WaitOutcome::Busy`] when the Stop hook blocked this stop (for open
+    /// questions): the session goes on with a continuation, so it is not
+    /// idle, and the continuation's own stop starts the wait. That
+    /// decision is the Stop hook's, read from its record
+    /// ([`Daemon::record_stop`], looked for up to 6 s); only
+    /// without one (no key, or no record in time) does the wait decide by
+    /// itself from the agent's open questions. Otherwise unread mail
     /// already there counts, unless a wait already woke it for that mail
     /// (the `woken` file): mail it
     /// chose to leave unread wakes it once, not after every human turn.
@@ -314,43 +363,62 @@ impl Daemon {
     /// never counts.
     ///
     /// The wait is for an idle session only. It ends with
-    /// [`WaitOutcome::Busy`] once the session is busy again
-    /// ([`Daemon::mark_busy`]) or a later wait takes over: each stop
-    /// starts one, the newest replaces the one before, and only one waits
-    /// per agent, so the agent is never woken twice for the same mail.
+    /// [`WaitOutcome::Busy`] once the session is busy again: a busy mark
+    /// ([`Daemon::mark_busy`]) newer than the stop (its record's time, or
+    /// else when this hook started), whether made before or after the wait
+    /// claims the turn. It also ends so when a later wait takes over: each
+    /// stop starts one, the newest replaces the one before (the `turn`
+    /// file), and only one waits per agent (the `lock` file), so the agent
+    /// is never woken twice for the same mail.
     ///
     /// Ends with [`WaitOutcome::Gone`] when the agent signs off or is
     /// otherwise gone (its harness process was rebound to another agent:
     /// a re-read that names another agent, or a `Presence` event that
     /// shows it gone), the daemon goes away, or a process the hook runs
-    /// under (its harness) exits; and with [`WaitOutcome::Skip`] at once
-    /// when the agent has `wake` off. On sign-off, on going away and on
-    /// harness exit the wait removes the agent's files
-    /// ([`clear_wait_state`]); they are kept while the agent lives, for
-    /// the next wait, and the daemon removes them once it finds the agent
-    /// gone.
-    pub async fn wait(&mut self, wake_for_unread: bool) -> WaitOutcome {
+    /// under (its harness) exits; and with [`WaitOutcome::Skip`] when the
+    /// agent has `wake` off, at once or as soon as a re-read shows it
+    /// turned off (a registration that changed it publishes a `Presence`
+    /// event). On sign-off, on going away and on harness exit the wait
+    /// removes the agent's files ([`clear_wait_state`]); they are kept
+    /// while the agent lives, for the next wait, and the daemon removes
+    /// them once it finds the agent gone.
+    pub async fn wait(&mut self, wake_for_unread: bool, stop_key: Option<&str>) -> WaitOutcome {
         let Some(status) = self.status(false).await else {
             return WaitOutcome::Gone;
         };
         if !status.wake {
             return WaitOutcome::Skip;
         }
-        if wake_for_unread && !status.open_questions.is_empty() {
-            // The Stop hook blocks this stop for the open questions, so the
-            // session goes on with a continuation and is not idle: a wake
-            // now would be injected into that turn. The continuation's own
-            // stop (`stop_hook_active`) starts the real wait. Nothing is
+        let address = status.address.clone();
+        let stop = match self.stop_record(&address, stop_key).await {
+            Ok(stop) => stop,
+            Err(NoLock::Busy) => return WaitOutcome::Busy,
+            Err(NoLock::Gone) => return WaitOutcome::Gone,
+            Err(NoLock::Skip) => return WaitOutcome::Skip,
+        };
+        // A busy mark newer than this counts.
+        let since = stop.as_ref().map_or(self.started, |r| r.at);
+        let blocked = match &stop {
+            Some(r) => r.block,
+            None => !status.open_questions.is_empty(),
+        };
+        if wake_for_unread && blocked {
+            // The Stop hook blocks this stop, so the session goes on with
+            // a continuation and is not idle: a wake now would be injected
+            // into that turn. The continuation's own stop
+            // (`stop_hook_active`) starts the real wait. Nothing is
             // written, so no earlier claim or wake record is disturbed.
             return WaitOutcome::Busy;
         }
-        let address = status.address.clone();
+        if busy_since(&self.paths.data_dir, &address, since) {
+            return WaitOutcome::Busy;
+        }
         let turn = state_path(&self.paths.data_dir, &address, "turn");
         // Claim the turn first, so the wait holding the lock lets go.
         let token = format!("wait {}", unique());
         let claimed = write_state(&turn, &token).is_ok();
         let _lock = match self
-            .take_waiter_lock(&address, claimed.then_some(token.as_str()))
+            .take_waiter_lock(&address, claimed.then_some(token.as_str()), since)
             .await
         {
             Ok(lock) => lock,
@@ -358,7 +426,11 @@ impl Daemon {
             Err(NoLock::Gone) => return WaitOutcome::Gone,
             Err(NoLock::Skip) => return WaitOutcome::Skip,
         };
-        let busy = || claimed && read_state(&turn).as_deref() != Some(token.as_str());
+        let data_dir = self.paths.data_dir.clone();
+        let busy = || {
+            (claimed && read_state(&turn).as_deref() != Some(token.as_str()))
+                || busy_since(&data_dir, &address, since)
+        };
         if busy() {
             return WaitOutcome::Busy;
         }
@@ -383,10 +455,14 @@ impl Daemon {
             let Some(now) = self.status_of(&address).await else {
                 return WaitOutcome::Gone;
             };
-            // Questions that opened since the first look may have made the
-            // Stop hook block after all: then only new mail counts.
+            if !now.wake {
+                return WaitOutcome::Skip;
+            }
+            // Without the Stop hook's record, questions that opened since
+            // the first look may have made it block after all: then only
+            // new mail counts.
             let known = known.get_or_insert_with(|| {
-                if wake_for_unread && now.open_questions.is_empty() {
+                if wake_for_unread && (stop.is_some() || now.open_questions.is_empty()) {
                     read_woken(&self.paths.data_dir, &address)
                 } else {
                     now.unread_ids.iter().cloned().collect()
@@ -404,6 +480,9 @@ impl Daemon {
                             let Some(now) = self.status_of(&address).await else {
                                 return WaitOutcome::Gone;
                             };
+                            if !now.wake {
+                                return WaitOutcome::Skip;
+                            }
                             if has_news(known, &now) {
                                 return self.wake(busy(), now);
                             }
@@ -415,6 +494,17 @@ impl Daemon {
                         {
                             clear_wait_state(&self.paths.data_dir, &address);
                             return WaitOutcome::Gone;
+                        }
+                        // A registration may have turned `wake` off.
+                        Some(Ok(Event::Presence { agent }))
+                            if agent.agent.address == address =>
+                        {
+                            let Some(now) = self.status_of(&address).await else {
+                                return WaitOutcome::Gone;
+                            };
+                            if !now.wake {
+                                return WaitOutcome::Skip;
+                            }
                         }
                         Some(Ok(_)) => {}
                         // The watch fell behind: watch again and compare
@@ -462,6 +552,41 @@ impl Daemon {
         self.procs.iter().all(procinfo::is_alive)
     }
 
+    /// The Stop hook's record for the stop `key`, looked for up to
+    /// [`STOP_LIMIT`] (the Stop hook runs alongside this one). `Ok(None)`
+    /// without a key, or when no record came in time. Fails with
+    /// [`NoLock::Busy`] when the record is a later stop's, or the
+    /// session was marked busy since this hook started, and with
+    /// [`NoLock::Gone`] when the hook's harness exits.
+    async fn stop_record(
+        &self,
+        address: &str,
+        key: Option<&str>,
+    ) -> Result<Option<StopRecord>, NoLock> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let path = state_path(&self.paths.data_dir, address, "stop");
+        let deadline = Instant::now() + STOP_LIMIT;
+        loop {
+            match read_state(&path).and_then(|s| s.parse::<StopRecord>().ok()) {
+                Some(r) if r.key == key => return Ok(Some(r)),
+                Some(r) if r.at > self.started => return Err(NoLock::Busy),
+                _ => {}
+            }
+            if busy_since(&self.paths.data_dir, address, self.started) {
+                return Err(NoLock::Busy);
+            }
+            if !self.procs_alive() {
+                return Err(NoLock::Gone);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
+    }
+
     /// The waiter lock for `address`, waiting for the wait it replaces to
     /// let go. With this wait's turn claim `token` written, it waits for as
     /// long as the claim stands (the old wait ends once it sees it), and
@@ -469,8 +594,15 @@ impl Daemon {
     /// Without one it waits up to [`TAKEOVER_LIMIT`], then
     /// [`WaitOutcome::Skip`]. A lock file that cannot be opened or locked
     /// is [`WaitOutcome::Skip`] too: two waits must never both run. Ends
-    /// with [`WaitOutcome::Gone`] when the hook's harness exits.
-    async fn take_waiter_lock(&self, address: &str, token: Option<&str>) -> Result<File, NoLock> {
+    /// with [`WaitOutcome::Busy`] when the session is marked busy after
+    /// `since`, and with [`WaitOutcome::Gone`] when the hook's harness
+    /// exits.
+    async fn take_waiter_lock(
+        &self,
+        address: &str,
+        token: Option<&str>,
+        since: u128,
+    ) -> Result<File, NoLock> {
         let started = Instant::now();
         let turn = state_path(&self.paths.data_dir, address, "turn");
         loop {
@@ -486,6 +618,9 @@ impl Daemon {
                 Some(_) => {}
                 None if started.elapsed() >= TAKEOVER_LIMIT => return Err(NoLock::Skip),
                 None => {}
+            }
+            if busy_since(&self.paths.data_dir, address, since) {
+                return Err(NoLock::Busy);
             }
             if !self.procs_alive() {
                 return Err(NoLock::Gone);
@@ -511,12 +646,59 @@ fn has_news(known: &mut HashSet<String>, now: &HookStatus) -> bool {
     now.unread_ids.iter().any(|id| !known.contains(id))
 }
 
+/// The wall-clock time in nanoseconds since the epoch, which hook
+/// processes compare across processes.
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
 /// A token no other hook process writes.
 fn unique() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{} {nanos}", std::process::id())
+    format!("{} {}", std::process::id(), now_nanos())
+}
+
+/// The Stop hook's decision for one stop ([`Daemon::record_stop`]), in the
+/// `stop` file as `<at> <block|idle> <key>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StopRecord {
+    /// When the Stop hook decided ([`now_nanos`]).
+    at: u128,
+    /// Whether it blocked the stop.
+    block: bool,
+    /// The stop's key (Claude Code's `prompt_id`).
+    key: String,
+}
+
+impl std::fmt::Display for StopRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let decision = if self.block { "block" } else { "idle" };
+        write!(f, "{} {decision} {}", self.at, self.key)
+    }
+}
+
+impl std::str::FromStr for StopRecord {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<StopRecord, ()> {
+        let mut parts = s.split(' ');
+        let at = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        let block = match parts.next() {
+            Some("block") => true,
+            Some("idle") => false,
+            _ => return Err(()),
+        };
+        let key = parts.next().filter(|k| !k.is_empty()).ok_or(())?;
+        if parts.next().is_some() {
+            return Err(());
+        }
+        Ok(StopRecord {
+            at,
+            block,
+            key: key.to_string(),
+        })
+    }
 }
 
 /// Where waiting hooks keep their per-agent files.
@@ -526,10 +708,13 @@ fn wait_dir(data_dir: &Path) -> PathBuf {
 
 /// `address`'s file of `kind` (one of [`STATE_KINDS`]):
 ///
-/// - `turn`: who last claimed the agent's turn: the newest wait, or a busy
-///   mark. A wait whose token is no longer there ends.
+/// - `turn`: the newest wait's claim on the agent's turn. A wait whose
+///   token is no longer there ends.
 /// - `lock`: the waiter lock ([`waiter_lock`]).
 /// - `woken`: the unread mail ids the last wake was for, one per line.
+/// - `busy`: when the session was last marked busy ([`Daemon::mark_busy`]).
+/// - `stop`: the Stop hook's decision for the latest stop
+///   ([`Daemon::record_stop`]).
 fn state_path(data_dir: &Path, address: &str, kind: &str) -> PathBuf {
     wait_dir(data_dir).join(format!("{address}.{kind}"))
 }
@@ -555,10 +740,10 @@ fn is_state_of(name: &str, address: &str) -> bool {
 }
 
 /// Remove all of `address`'s files under `data_dir` (turn, lock, woken,
-/// and temporary files a crashed write left), for an agent that signed
+/// busy, stop, and temporary files a crashed write left), for an agent that signed
 /// off, is gone, or whose harness exited. Best effort. A wait still
 /// holding the removed lock keeps it; one that opens the path afterwards
-/// gets a new file, and [`waiter_lock`] makes sure the two never both
+/// gets a new file, and `waiter_lock` makes sure the two never both
 /// count as held.
 pub fn clear_wait_state(data_dir: &Path, address: &str) {
     let Ok(entries) = std::fs::read_dir(wait_dir(data_dir)) else {
@@ -594,6 +779,13 @@ fn read_state(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Whether `address` was marked busy after `since` ([`now_nanos`]).
+fn busy_since(data_dir: &Path, address: &str, since: u128) -> bool {
+    read_state(&state_path(data_dir, address, "busy"))
+        .and_then(|s| s.trim().parse::<u128>().ok())
+        .is_some_and(|at| at > since)
+}
+
 /// The mail ids the agent's last wake was for (empty when none).
 fn read_woken(data_dir: &Path, address: &str) -> HashSet<String> {
     read_state(&state_path(data_dir, address, "woken"))
@@ -604,7 +796,8 @@ fn read_woken(data_dir: &Path, address: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Why [`Daemon::take_waiter_lock`] got no lock; the wait ends with the
+/// Why [`Daemon::take_waiter_lock`] got no lock, or
+/// [`Daemon::stop_record`] no record; the wait ends with the
 /// [`WaitOutcome`] of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoLock {
@@ -718,8 +911,10 @@ mod tests {
 
     #[test]
     fn hook_input_reads_claude_fields() {
-        let input = HookInput::parse(br#"{"session_id":"s-1","stop_hook_active":true}"#);
+        let input =
+            HookInput::parse(br#"{"session_id":"s-1","prompt_id":"p-1","stop_hook_active":true}"#);
         assert_eq!(input.session_id.as_deref(), Some("s-1"));
+        assert_eq!(input.prompt_id.as_deref(), Some("p-1"));
         assert!(input.stop_hook_active);
         assert_eq!(input.agent_id, None);
         assert!(!input.is_subagent());
@@ -734,6 +929,22 @@ mod tests {
             assert!(!input.stop_hook_active);
             assert_eq!(input.agent_id, None);
             assert_eq!(input.hook_event_name, None);
+            assert_eq!(input.prompt_id, None);
+        }
+    }
+
+    #[test]
+    fn stop_record_round_trip() {
+        for block in [false, true] {
+            let r = StopRecord {
+                at: 1_700_000_000_123_456_789,
+                block,
+                key: "8745ca22-c22c".into(),
+            };
+            assert_eq!(r.to_string().parse::<StopRecord>(), Ok(r));
+        }
+        for junk in ["", "1 idle", "x idle k", "1 maybe k", "1 block k extra"] {
+            assert!(junk.parse::<StopRecord>().is_err(), "{junk:?}");
         }
     }
 
@@ -783,6 +994,8 @@ mod tests {
         let path = |a: &str, k: &str| state_path(&paths.data_dir, a, k);
         write_state(&path("a-1", "turn"), "wait 1").unwrap();
         write_state(&path("a-1", "woken"), "m1").unwrap();
+        write_state(&path("a-1", "busy"), "1").unwrap();
+        write_state(&path("a-1", "stop"), "1 idle k").unwrap();
         write_state(&path("b-2", "turn"), "wait 1").unwrap();
         let lock = held(waiter_lock(&paths, "a-1"));
         // Temporary files a crashed write left behind go too; files of
