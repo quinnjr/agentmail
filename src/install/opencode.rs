@@ -18,15 +18,21 @@
 //! be lost): install and uninstall refuse with the entry to add or remove
 //! by hand, unless the file is already as they would leave it. The plugin
 //! is `plugin/agentmail.js`, embedded, with the binary's path in place of
-//! its placeholder; a `plugins/agentmail.js` that is not agentmail's is
-//! never replaced or removed.
+//! its placeholder; a `plugins/agentmail.js` that is not agentmail's, or
+//! is a symlink, is never replaced, and of a symlink uninstall removes
+//! only the link. opencode also loads plugins from `plugin/`: an
+//! agentmail plugin there is removed by install and uninstall alike, so
+//! only one copy ever runs.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::{ByHand, Change, Env, InstallOpts, JsonFile, bin_str, merge_keys, object_at, read_opt};
+use super::{
+    ByHand, Change, Env, InstallOpts, JsonFile, backup_path, bin_str, created_marker_path,
+    merge_keys, object_at, read_opt,
+};
 
 /// The plugin as shipped.
 const PLUGIN: &str = include_str!("../../plugin/agentmail.js");
@@ -238,16 +244,38 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
 }
 
 /// The plugin's change, if any.
+///
+/// Install never writes through a symlink (the file it points to, perhaps
+/// a source checkout, is not agentmail's to change): it refuses. Uninstall
+/// removes agentmail's plugin, and of a symlink only the link: when
+/// agentmail did not create the file (no marker) and its backup is not
+/// agentmail's plugin, that backup is put back instead.
 fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>> {
+    let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
     let before = read_opt(&path)?;
     let ours = before.as_deref().is_none_or(is_plugin);
     if !install {
-        return Ok((before.is_some() && ours).then_some(Change {
+        if before.is_none() || !ours {
+            return Ok(None);
+        }
+        let created = std::fs::symlink_metadata(created_marker_path(&path)).is_ok();
+        let restore = match read_opt(&backup_path(&path))? {
+            Some(b) if !link && !created && !is_plugin(&b) => Some(b),
+            _ => None,
+        };
+        return Ok(Some(Change {
             path,
             before,
-            after: None,
+            after: restore,
             record_anew: false,
         }));
+    }
+    if link {
+        bail!(
+            "{} is a symbolic link; agentmail does not write through it and left it unchanged. \
+             Remove the link and run the install again.",
+            path.display()
+        );
     }
     if !ours {
         bail!(
@@ -285,11 +313,17 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
         targets.push(configs[0].clone());
     }
     // All are planned before any is written: a refusal changes nothing.
+    let plugin_dir = plugin.parent().expect("a plugins directory");
+    let legacy = plugin_dir.with_file_name("plugin").join("agentmail.js");
     let plugin = plan_plugin(plugin, install, bin)?;
+    // opencode also loads `plugin/`: an agentmail plugin there would run
+    // beside the installed one, so both install and uninstall remove it.
+    let legacy = plan_plugin(legacy, false, bin)?;
     let mut changes = Vec::new();
     for path in targets {
         changes.extend(plan_config(path, install, bin)?);
     }
     changes.extend(plugin);
+    changes.extend(legacy);
     Ok(changes)
 }

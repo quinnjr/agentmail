@@ -914,7 +914,16 @@ them all.
   is refused by install and left alone by uninstall. Install rewrites an
   older agentmail plugin (a new binary path or version); uninstall
   deletes it, and the `plugins/` (and config) directories when agentmail
-  created them and they are empty.
+  created them and they are empty. When agentmail did not create the
+  plugin (no `.agentmail.created`) and its `.agentmail.bak` is not
+  agentmail's plugin, uninstall puts that backup back instead. A symlink
+  at `plugins/agentmail.js` (a dev or dotfiles setup) is never written
+  through: install refuses it, and uninstall removes only the link,
+  leaving the file it points to and any backup beside it. Since opencode
+  also loads `plugin/`, an agentmail plugin at `plugin/agentmail.js`
+  would run beside the installed one (two waiters, every urgent message
+  surfaced twice), so install and uninstall both remove it (a file there
+  that is not agentmail's is left alone).
 - The rest (backups, creation markers, keeping the file's layout, symlinks,
   modes) is the shared install machinery described under Claude Code's
   install (Task 5).

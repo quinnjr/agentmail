@@ -1774,3 +1774,90 @@ fn cli_opencode_install_and_uninstall() {
     );
     assert_eq!(v["restart"], Value::Null, "{v}");
 }
+
+#[test]
+fn opencode_symlinked_plugin_is_never_written_through() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    // A dev or dotfiles setup: the plugin is a link to a copy elsewhere.
+    let src = h.dir.path().join("src/agentmail.js");
+    let shipped = include_str!("../plugin/agentmail.js");
+    write(&src, shipped);
+    std::fs::create_dir_all(h.oc_plugin().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&src, h.oc_plugin()).unwrap();
+
+    let err = install::plan_install(&oc_opts(false, BIN), &env).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("symbolic link"), "{msg}");
+    assert!(msg.contains("agentmail.js"), "{msg}");
+    assert!(!h.oc_config().exists());
+    assert_eq!(read(&src), shipped);
+    assert!(!bak(&h.oc_plugin()).exists());
+
+    // An older install wrote through the link and saved its original:
+    // uninstall removes only the link, keeping its target and that backup.
+    write(&bak(&h.oc_plugin()), shipped);
+    let changes = uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(paths(&changes), [h.oc_plugin().as_path()]);
+    assert!(std::fs::symlink_metadata(h.oc_plugin()).is_err());
+    assert_eq!(read(&src), shipped);
+    assert_eq!(read(&bak(&h.oc_plugin())), shipped);
+}
+
+#[test]
+fn opencode_plugin_agentmail_did_not_create_is_restored_or_removed() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    // Copied by hand: no marker, no backup. Uninstall removes the file.
+    write(&h.oc_plugin(), &oc_plugin_text("/old/agentmail"));
+    let changes = uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(paths(&changes), [h.oc_plugin().as_path()]);
+    assert!(!h.oc_plugin().exists());
+
+    // A backup of a file that is not agentmail's is put back.
+    let mine = "export default { id: \"mine\", setup() {} };\n";
+    write(&h.oc_plugin(), &oc_plugin_text("/old/agentmail"));
+    write(&bak(&h.oc_plugin()), mine);
+    uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&h.oc_plugin()), mine);
+}
+
+#[test]
+fn opencode_plugin_in_singular_plugin_dir_is_removed() {
+    // opencode also loads `plugin/`: a copy there would run beside the
+    // installed one and surface every message twice.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let legacy = h.oc_dir().join("plugin/agentmail.js");
+    write(&legacy, &oc_plugin_text("/old/agentmail"));
+    let changes = install(&oc_opts(false, BIN), &env);
+    assert_eq!(
+        paths(&changes),
+        [
+            h.oc_config().as_path(),
+            h.oc_plugin().as_path(),
+            legacy.as_path()
+        ]
+    );
+    assert!(!legacy.exists());
+    assert_eq!(read(&h.oc_plugin()), oc_plugin_text(BIN));
+
+    write(&legacy, &oc_plugin_text("/old/agentmail"));
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!legacy.exists());
+    assert!(!h.oc_plugin().exists());
+
+    // One that is not agentmail's is left alone.
+    let mine = "export default { id: \"mine\", setup() {} };\n";
+    write(&legacy, mine);
+    let changes = install(&oc_opts(false, BIN), &env);
+    assert!(!paths(&changes).contains(&legacy.as_path()));
+    uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&legacy), mine);
+
+    // At project scope too.
+    let legacy = h.proj().join(".opencode/plugin/agentmail.js");
+    write(&legacy, &oc_plugin_text("/old/agentmail"));
+    install(&oc_opts(true, BIN), &env);
+    assert!(!legacy.exists());
+}

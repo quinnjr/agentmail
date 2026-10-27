@@ -139,7 +139,9 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// new file is private to its owner (mode 0600). A symlink is followed, even
 /// one whose target does not exist yet: the file it points to changes, the
 /// link stays. A file to delete (one agentmail created, emptied by an
-/// uninstall) goes with its backup and marker, and so do the directories
+/// uninstall, or agentmail's opencode plugin) goes with its backup and
+/// marker (a symlink agentmail did not create the target of: only the
+/// link and its marker), and so do the directories
 /// agentmail created for it once they are empty.
 pub fn apply(changes: &[Change]) -> Result<()> {
     for c in changes {
@@ -226,14 +228,22 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
     // Write through a symlink to its target, so the link stays a link.
     let target = resolve(&c.path)?;
     let Some(after) = &c.after else {
-        // Only a file agentmail created is deleted ([`JsonFile::change`]):
-        // any backup of it holds nothing but agentmail's entries.
-        let dirs = match std::fs::read_to_string(&marker) {
-            Ok(text) => text.lines().map(PathBuf::from).collect(),
-            Err(_) => Vec::new(),
+        // Only agentmail's own file is deleted ([`JsonFile::change`], the
+        // opencode plugin): any backup of it holds nothing but agentmail's
+        // entries. A file agentmail created (its marker says so) goes even
+        // behind a symlink, which stays. Otherwise of a symlink only the
+        // link goes, never the file it points to, and a backup beside it,
+        // which may hold that file's original (an older install wrote
+        // through links), stays.
+        let (dirs, created) = match std::fs::read_to_string(&marker) {
+            Ok(text) => (text.lines().map(PathBuf::from).collect(), true),
+            Err(_) => (Vec::new(), false),
         };
-        std::fs::remove_file(&target)?;
-        remove_if_there(&bak)?;
+        let link = std::fs::symlink_metadata(&c.path).is_ok_and(|m| m.file_type().is_symlink());
+        std::fs::remove_file(if created { &target } else { &c.path })?;
+        if created || !link {
+            remove_if_there(&bak)?;
+        }
         remove_if_there(&marker)?;
         return Ok(dirs);
     };
