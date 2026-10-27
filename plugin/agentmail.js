@@ -54,14 +54,18 @@ function bin() {
 }
 
 /**
- * The environment for agentmail commands: opencode's, without
- * `AGENTMAIL_ADDRESS`. opencode's process may have inherited one from the
- * shell it was started in; it names no session of this opencode, and the
- * CLI would act as that address instead of the session.
+ * The environment for agentmail commands: opencode's, without the
+ * variables that say who is calling. opencode's process may have inherited
+ * them from the shell it was started in, and they name no session of this
+ * opencode: with `AGENTMAIL_ADDRESS` the CLI would act as that address
+ * instead of the session, and with `AGENTMAIL_HUMAN=1` (the human's own
+ * shell) every hook would act as the human and say nothing, which would
+ * silently turn the plugin off for every session.
  */
 function childEnv(extra = {}) {
   const env = { ...process.env, ...extra };
   delete env.AGENTMAIL_ADDRESS;
+  delete env.AGENTMAIL_HUMAN;
   return env;
 }
 
@@ -97,20 +101,26 @@ async function status(sessionID, surfaceUrgent) {
 
 /**
  * One `agentmail hook wait` for `sessionID`, of at most `secs` seconds,
- * killed when `signal` aborts. `continued`: only mail that arrives from
- * now on counts (the turn that just ended was one this plugin started).
- * `known`: the `known` ids of the timed-out wait before this one, if any,
- * so mail that came between the two counts. The result is agentmail's
+ * killed when `signal` aborts. `from` says which unread mail does not
+ * count as news: `continued`, all there is now (only mail that arrives
+ * from now on counts); `afterWake`, the mail agentmail last woke the
+ * session for (the turn that just ended was started by a wake, or did not
+ * succeed); `known`, exactly these ids (the unread mail when the plugin
+ * queued open questions as a turn, or the `known` ids of the timed-out
+ * wait before this one, so mail that came between counts); none of them,
+ * mail already woken for (a plain end of turn). The result is agentmail's
  * answer (`{mail}`, `{busy}`, `{skip}`, `{gone}`), or null when it failed
- * or was killed. A mail answer printed before the kill took effect is
- * still returned, however the process ended: agentmail has recorded it as
- * a wake, so the caller must not lose it. Bun's `$` cannot be killed,
- * hence `Bun.spawn`.
+ * or was killed. agentmail catches the kill: one that comes before it
+ * recorded a wake ends it with nothing recorded, one that comes after
+ * lets it print the wake first. A mail answer is returned however the
+ * process ended, since agentmail has recorded it as a wake and the caller
+ * must not lose it. Bun's `$` cannot be killed, hence `Bun.spawn`.
  */
-async function waitOnce(sessionID, continued, known, signal, secs = WAIT_SECS) {
+async function waitOnce(sessionID, from, signal, secs = WAIT_SECS) {
   if (signal.aborted) return null;
-  const payload = { stop_hook_active: continued };
-  if (known) payload.known = known;
+  const payload = { stop_hook_active: Boolean(from.continued) };
+  if (from.afterWake) payload.after_wake = true;
+  if (from.known) payload.known = from.known;
   let proc;
   try {
     proc = Bun.spawn(
@@ -154,6 +164,20 @@ async function signoff(sessionID) {
   } catch {}
 }
 
+/** The unread mail ids in a status, or null when it has none listed. */
+function unreadIds(st) {
+  return Array.isArray(st?.unread_ids) ? st.unread_ids.filter((id) => typeof id === "string") : null;
+}
+
+/**
+ * What a turn the plugin queued with `st` (a status from just before)
+ * leaves as already there for the wait after it: the unread mail then.
+ */
+function before(st) {
+  const known = unreadIds(st);
+  return known ? { known } : { continued: true };
+}
+
 /** Resolve after `ms`, or as soon as `signal` aborts. */
 function sleep(ms, signal) {
   return new Promise((resolve) => {
@@ -192,11 +216,14 @@ async function setup(ctx) {
     if (!s) {
       // idle: no turn is running. gen: counts turn starts and ends, so a
       // handler that awaited can tell whether the session moved on.
-      // continued: the running (or last) turn was started by this plugin.
-      // waiter: the idle waiter's controller. missed: a wake was dropped
-      // (the session was busy, or queueing it failed), and the agent has
-      // not heard of its mail since. handling: turn-end handlers running.
-      s = { idle: false, gen: 0, continued: false, waiter: null, missed: false, handling: 0 };
+      // started: the running (or last) turn was started by this plugin,
+      // and what the wait after it counts as already there (`waitOnce`'s
+      // `from`: `{afterWake}` after a wake or urgent mail, `{known}` after
+      // open questions); null for a human's turn. waiter: the idle
+      // waiter's controller. missed: a wake was dropped (the session was
+      // busy, or queueing it failed), and the agent has not heard of its
+      // mail since. handling: turn-end handlers running.
+      s = { idle: false, gen: 0, started: null, waiter: null, missed: false, handling: 0 };
       sessions.set(sessionID, s);
       evict();
     } else {
@@ -215,7 +242,7 @@ async function setup(ctx) {
     if (sessions.size <= SESSIONS_MAX) return;
     for (const [id, s] of sessions) {
       if (sessions.size <= SESSIONS_MAX) break;
-      if (!s.idle || s.waiter || s.missed || s.continued || s.handling || urgentPending.has(id)) continue;
+      if (!s.idle || s.waiter || s.missed || s.started || s.handling || urgentPending.has(id)) continue;
       sessions.delete(id);
       mine.delete(id);
     }
@@ -289,15 +316,16 @@ async function setup(ctx) {
   }
 
   // Wait for mail while the session is idle; when it comes, queue the
-  // reminder as a new turn. One waiter per session. It ends when the
-  // session gets busy (stopWaiter), and when agentmail says the agent is
-  // gone or wants no waking; the session's next idle period starts a new
-  // one. A timeout (`{"mail":false}`) waits again. A wake that cannot be
-  // queued keeps waiting (for new mail only), and is tried again after
-  // each shorter wait. A `{"busy":true}` while the session is still idle
-  // (questions opened since the turn ended) re-runs the turn's end once:
-  // the questions are queued, else the waiter waits on.
-  async function runWaiter(sessionID, continued) {
+  // reminder as a new turn. One waiter per session; `from` is the first
+  // wait's (`waitOnce`). It ends when the session gets busy (stopWaiter),
+  // and when agentmail says the agent is gone or wants no waking; the
+  // session's next idle period starts a new one. A timeout
+  // (`{"mail":false}`) waits again. A wake that cannot be queued keeps
+  // waiting (for new mail only), and is tried again after each shorter
+  // wait. A `{"busy":true}` while the session is still idle (questions
+  // opened since the turn ended) re-runs the turn's end once: the
+  // questions are queued, else the waiter waits on.
+  async function runWaiter(sessionID, from) {
     const s = state(sessionID);
     if (s.waiter || stopped.signal.aborted) return;
     const ac = new AbortController();
@@ -307,16 +335,18 @@ async function setup(ctx) {
     // Queue `text` as a new turn; whether it was.
     const deliver = async (text) => {
       if (!text || !ours()) return false;
-      s.continued = true;
+      s.started = { afterWake: true };
       if (await synthetic(sessionID, text, "queue", true)) {
         s.missed = false;
         return true;
       }
-      s.continued = false;
+      s.started = null;
       return false;
     };
-    // The timed-out wait's `known` ids, for the next wait.
-    let known = null;
+    let continued = Boolean(from.continued);
+    let afterWake = Boolean(from.afterWake);
+    // The next wait's `known` ids: the timed-out wait's, or `from`'s.
+    let known = from.known ?? null;
     // Deliveries failed in a row; the busy answer was re-checked.
     let failed = 0;
     let rechecked = false;
@@ -324,7 +354,7 @@ async function setup(ctx) {
       while (!signal.aborted) {
         const started = Date.now();
         const secs = failed > 0 ? Math.min(WAIT_SECS, RETRY_SECS * 2 ** (failed - 1)) : WAIT_SECS;
-        const r = await waitOnce(sessionID, continued, known, signal, secs);
+        const r = await waitOnce(sessionID, { continued, afterWake, known }, signal, secs);
         if (!r) break;
         if (r.mail === true) {
           // agentmail recorded this mail as woken: it is this plugin's to
@@ -336,6 +366,7 @@ async function setup(ctx) {
           if (await deliver(text)) break;
           // Not queued: wait on, for new mail only, and try again.
           continued = true;
+          afterWake = false;
           known = null;
           failed++;
         } else if (r.mail === false) {
@@ -359,10 +390,10 @@ async function setup(ctx) {
           const st = await status(sessionID, false);
           if (!st || st.wake !== true || !ours()) break;
           const questions = st.text?.questions;
-          if (!continued && typeof questions === "string" && questions) {
-            s.continued = true;
+          if (!continued && !afterWake && typeof questions === "string" && questions) {
+            s.started = before(st);
             if (await synthetic(sessionID, questions, "queue", true)) break;
-            s.continued = false;
+            s.started = null;
             // They cannot continue the turn: only new mail counts.
             continued = true;
           }
@@ -385,22 +416,23 @@ async function setup(ctx) {
     const s = state(sessionID);
     s.idle = true;
     const gen = ++s.gen;
-    const continued = s.continued;
-    s.continued = false;
-    return afterTurn(sessionID, s, gen, continued, succeeded);
+    const started = s.started;
+    s.started = null;
+    return afterTurn(sessionID, s, gen, started, succeeded);
   }
 
-  async function afterTurn(sessionID, s, gen, continued, succeeded) {
+  async function afterTurn(sessionID, s, gen, started, succeeded) {
     s.handling++;
     try {
-      await handleTurnEnd(sessionID, s, gen, continued, succeeded);
+      await handleTurnEnd(sessionID, s, gen, started, succeeded);
     } finally {
       s.handling--;
       evict();
     }
   }
 
-  async function handleTurnEnd(sessionID, s, gen, continued, succeeded) {
+  // `started`: the turn that ended was this plugin's (`s.started`).
+  async function handleTurnEnd(sessionID, s, gen, started, succeeded) {
     // Still idle since this turn ended, and not deleted or unloaded.
     const current = () => sessions.get(sessionID) === s && s.gen === gen && s.idle && !stopped.signal.aborted;
     if (!(await owns(sessionID)) || !current()) return;
@@ -411,16 +443,16 @@ async function setup(ctx) {
     // started.
     let questionsFailed = false;
     const questions = st.text?.questions;
-    const ask = succeeded && !continued && typeof questions === "string" && questions;
+    const ask = succeeded && !started && typeof questions === "string" && questions;
     const urgent = urgentPending.get(sessionID);
     const parts = [urgent, ask && questions].filter(Boolean);
     if (parts.length) {
-      s.continued = true;
+      s.started = ask ? before(st) : { afterWake: true };
       if (await synthetic(sessionID, parts.join("\n\n"), "queue", true)) {
         if (urgentPending.get(sessionID) === urgent) urgentPending.delete(sessionID);
         return;
       }
-      s.continued = false;
+      s.started = null;
       if (ask) questionsFailed = true;
       if (!current()) return;
     }
@@ -428,18 +460,28 @@ async function setup(ctx) {
     // never heard of (no tool call reminded it): deliver it now.
     const reminder = st.text?.reminder;
     if (s.missed && st.wake === true && st.unread > 0 && typeof reminder === "string" && reminder) {
-      s.continued = true;
+      s.started = { afterWake: true };
       if (await synthetic(sessionID, reminder, "queue", true)) {
         s.missed = false;
         return;
       }
-      s.continued = false;
+      s.started = null;
       if (!current()) return;
     }
-    // After a turn this plugin started, or one that did not succeed, only
-    // new mail wakes the session; so too when the open questions could not
-    // be queued (they would otherwise hold the wait as a continuation).
-    if (st.wake === true) runWaiter(sessionID, continued || !succeeded || questionsFailed);
+    if (st.wake !== true) return;
+    // Which unread mail the wait counts as already there. After a turn of
+    // the open questions: the mail unread when they were queued. After a
+    // wake (or urgent mail) this plugin queued, or a turn that did not
+    // succeed: the mail agentmail last woke the session for, so mail that
+    // came during the turn (after its last tool call) still wakes it. When
+    // the questions could not be queued: the mail unread now (they would
+    // otherwise hold the wait as a continuation). Else (a human's turn):
+    // unread mail not yet woken for wakes the session at once.
+    let from = {};
+    if (started?.known) from = { known: started.known };
+    else if (questionsFailed) from = before(st);
+    else if (started || !succeeded) from = { afterWake: true };
+    runWaiter(sessionID, from);
   }
 
   // A turn started: record it at once, then forget the session if it is
@@ -479,7 +521,7 @@ async function setup(ctx) {
       case "session.inbox.enqueued": {
         // A human prompt: the next turn is not this plugin's.
         const s = sessions.get(sessionID);
-        if (s && e.data.item?.type === "user") s.continued = false;
+        if (s && e.data.item?.type === "user") s.started = null;
         return;
       }
       case "session.execution.succeeded":

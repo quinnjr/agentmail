@@ -730,7 +730,26 @@ async fn hook(event: HookEvent, harness: &str, args: &crate::hook::HookArgs<'_>)
             .read_to_end(&mut stdin);
     }
     let harness = harness_from(harness).unwrap_or(Harness::Other);
-    let out = crate::hook::run_with(harness, event, args, &stdin, &|k| std::env::var_os(k)).await;
+    let run = crate::hook::run_with(harness, event, args, &stdin, &|k| std::env::var_os(k));
+    // opencode's plugin stops a waiting `hook wait` with SIGTERM when its
+    // session gets busy. A wake records its mail (the `woken` file) and
+    // then prints it; killed in between, the plugin would never hear of a
+    // wake agentmail recorded. So SIGTERM is caught for the whole command:
+    // while the wait is still waiting it ends the command at once, with
+    // nothing recorded or printed, and once the wait has recorded a wake
+    // (in the same poll that returns it, with no await in between) the
+    // answer is printed first and the signal no longer matters.
+    let term = (harness == Harness::Opencode && event == HookEvent::Wait)
+        .then(|| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok())
+        .flatten();
+    let out = match term {
+        Some(mut term) => tokio::select! {
+            biased;
+            out = run => out,
+            _ = term.recv() => return ExitCode::from(143),
+        },
+        None => run.await,
+    };
     if !out.stdout.is_empty() {
         let _ = print_text(&out.stdout);
     }

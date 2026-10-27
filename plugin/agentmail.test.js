@@ -27,7 +27,7 @@ const i = args.indexOf("--session");
 const session = i >= 0 ? args[i + 1] : "";
 const cmd = args.slice(0, 2).join(" ");
 const stdin = cmd === "hook wait" ? fs.readFileSync(0, "utf8") : "";
-const line = { args, stdin, session_env: process.env.OPENCODE_SESSION_ID ?? "", address: process.env.AGENTMAIL_ADDRESS ?? "" };
+const line = { args, stdin, session_env: process.env.OPENCODE_SESSION_ID ?? "", address: process.env.AGENTMAIL_ADDRESS ?? "", human: process.env.AGENTMAIL_HUMAN ?? "" };
 fs.appendFileSync(dir + "/calls.log", JSON.stringify(line) + "\\n");
 if (cmd === "hook status") {
   const f = dir + "/status." + session + ".json";
@@ -73,7 +73,10 @@ beforeAll(() => {
   writeFileSync(join(root, "bin", "agentmail"), FAKE);
   chmodSync(join(root, "bin", "agentmail"), 0o755);
   process.env.PATH = `${join(root, "bin")}:${process.env.PATH}`;
+  // Inherited from the shell opencode was started in: the human's own
+  // identity there, which must not reach the plugin's agentmail calls.
   process.env.AGENTMAIL_ADDRESS = "outer-agent";
+  process.env.AGENTMAIL_HUMAN = "1";
 });
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -234,8 +237,9 @@ test("appends_reminder_after_tool", async () => {
   expect(ctx.synthetic).toEqual([]);
   const [c] = calls();
   expect(c.args).toEqual(["hook", "status", "--harness", "opencode", "--session", "ses_a", "--surface-urgent"]);
-  // The address opencode inherited never reaches agentmail.
+  // The identity opencode inherited never reaches agentmail.
   expect(c.address).toBe("");
+  expect(c.human).toBe("");
 
   // A failed tool call has no result to append to.
   const failed = { tool: "shell", sessionID: "ses_a", status: "error", error: new Error("x") };
@@ -309,12 +313,15 @@ test("waiter_wakes_on_mail_and_rearms", async () => {
   expect(first.args).toEqual(["hook", "wait", "--harness", "opencode", "--session", "ses_a", "--timeout", "300"]);
   expect(JSON.parse(first.stdin)).toEqual({ stop_hook_active: false });
   expect(first.address).toBe("");
+  expect(first.human).toBe("");
 
-  // The woken turn runs, then ends: the waiter re-arms, for new mail only.
+  // The woken turn runs, then ends: the waiter re-arms, for mail other
+  // than what it was woken for (mail that came during the woken turn
+  // counts).
   ctx.emit("session.execution.started", { sessionID: "ses_a" });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 2);
-  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: false, after_wake: true });
   await until(() => existsSync(join(fake, "waiting.ses_a.pid")));
   const pid = Number(readFileSync(join(fake, "waiting.ses_a.pid"), "utf8"));
   expect(alive(pid)).toBe(true);
@@ -569,13 +576,13 @@ test("questions_queue_failure_still_waits_for_new_mail", async () => {
       throw new Error("no");
     },
   });
-  setStatus("ses_a", registered({ unread: 1, text: { questions: "❓ q" } }));
+  setStatus("ses_a", registered({ unread: 1, unread_ids: ["q1"], text: { questions: "❓ q" } }));
   ctx.emit("session.execution.started", { sessionID: "ses_a" });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 1);
-  // The questions cannot continue the turn: wait as after a continuation,
-  // for new mail only, so the open questions do not end the wait.
-  expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: true });
+  // The questions cannot continue the turn: wait for mail other than
+  // what is unread now, and the open questions do not end the wait.
+  expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: false, known: ["q1"] });
 });
 
 test("waiter_passes_known_after_a_timeout", async () => {
@@ -608,11 +615,11 @@ test("wake_dropped_while_busy_is_delivered_at_turn_end", async () => {
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => ctx.synthetic.length === 1);
   expect(ctx.synthetic[0]).toEqual({ sessionID: "ses_a", text: "📬 1 unread", delivery: "queue", resume: true });
-  // Once.
+  // Once; the turn it starts is a wake's.
   ctx.emit("session.execution.started", { sessionID: "ses_a" });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 2);
-  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: false, after_wake: true });
   expect(ctx.synthetic).toHaveLength(1);
 });
 
@@ -644,14 +651,18 @@ test("busy_while_idle_queues_questions_that_opened_since", async () => {
   queueWaits("ses_a", { busy: true, _delay_ms: 300 });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 1);
-  setStatus("ses_a", registered({ unread: 1, open_questions: [{ id: "q1" }], text: { questions: "❓ q" } }));
+  setStatus(
+    "ses_a",
+    registered({ unread: 1, unread_ids: ["q1"], open_questions: [{ id: "q1" }], text: { questions: "❓ q" } }),
+  );
   await until(() => ctx.synthetic.length === 1);
   expect(ctx.synthetic[0]).toEqual({ sessionID: "ses_a", text: "❓ q", delivery: "queue", resume: true });
-  // The turn they start is the plugin's: its end does not queue them again.
+  // The turn they start is the plugin's: its end does not queue them
+  // again, and its wait counts mail other than what was unread then.
   ctx.emit("session.execution.started", { sessionID: "ses_a" });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 2);
-  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: false, known: ["q1"] });
   expect(ctx.synthetic).toHaveLength(1);
 });
 
@@ -774,3 +785,61 @@ test("sessions_with_a_waiter_are_not_forgotten", async () => {
   await until(() => !alive(pid));
   expect(ctx.gets.filter((id) => id === "ses_w")).toHaveLength(1);
 }, 20000);
+
+test("questions_turn_waits_for_mail_that_came_during_it", async () => {
+  // The questions are queued at a human turn's end; the wait after their
+  // turn counts as already there only the mail unread when they were
+  // queued, so mail that came during that turn wakes the session.
+  const { ctx } = await start();
+  setStatus("ses_a", registered({ unread: 2, unread_ids: ["m1", "q1"], text: { questions: "❓ q" } }));
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.synthetic.length === 1);
+  expect(waits("ses_a")).toEqual([]);
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  setStatus("ses_a", registered({ unread: 3, unread_ids: ["m1", "m2", "q1"], text: { questions: "❓ q" } }));
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: false, known: ["m1", "q1"] });
+  expect(ctx.synthetic).toHaveLength(1);
+});
+
+test("waiter_after_a_failed_or_interrupted_turn_counts_mail_since_the_last_wake", async () => {
+  const { ctx } = await start();
+  setStatus("ses_a", registered({ unread: 1, unread_ids: ["m1"], text: { questions: "❓ q" } }));
+  for (const [type, extra] of [
+    ["session.execution.failed", { error: "x" }],
+    ["session.execution.interrupted", { reason: "user" }],
+  ]) {
+    const n = waits("ses_a").length;
+    ctx.emit("session.execution.started", { sessionID: "ses_a" });
+    ctx.emit(type, { sessionID: "ses_a", ...extra });
+    await until(() => waits("ses_a").length === n + 1);
+    // Not the questions (the turn did not succeed), and the wait counts
+    // mail that came during the turn.
+    expect(JSON.parse(waits("ses_a")[n].stdin)).toEqual({ stop_hook_active: false, after_wake: true });
+  }
+  expect(ctx.synthetic).toEqual([]);
+});
+
+test("waiter_after_queued_urgent_mail_counts_mail_since_the_last_wake", async () => {
+  let fail = true;
+  const { ctx } = await start({
+    synthetic: () => {
+      if (fail) throw new Error("no");
+    },
+  });
+  setStatus("ses_a", registered({ unread: 1, urgent: [{ id: "m1" }], text: { urgent: "🚨 prod" } }));
+  // A failed tool call, and the steer fails: kept for the turn's end.
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await ctx.hooks["execute.after"]({ tool: "shell", sessionID: "ses_a", status: "error", error: new Error("x") });
+  fail = false;
+  setStatus("ses_a", registered({ unread: 1 }));
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.synthetic.length === 1);
+  expect(ctx.synthetic[0].text).toBe("🚨 prod");
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: false, after_wake: true });
+});

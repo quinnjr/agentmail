@@ -16,8 +16,8 @@
 //!   when the timeout (default [`DEFAULT_WAIT`]) passed first, so the
 //!   plugin waits again, passing `known` back (below);
 //!   `{"busy":true}` when the session is not idle (open questions continue
-//!   the turn, though never on a wait passed `known`, or a later wait took
-//!   over); `{"skip":true}` when the agent
+//!   the turn, though never on a wait passed `known` or `after_wake`, or a
+//!   later wait took over); `{"skip":true}` when the agent
 //!   does not want waking (`wake` off) or the waiter lock is unusable; and
 //!   `{"gone":true}` when the agent signed off or is gone, the session has
 //!   no agent, the daemon is down or went away, opencode exited, or the
@@ -25,15 +25,23 @@
 //!   `{"mail":false}` asks the plugin to wait again at once; it stops on
 //!   the others until the session is idle again.
 //!
-//!   The payload on stdin is `{"stop_hook_active": <bool>}`: `true` when
-//!   the turn that just ended was one the plugin started itself (a wake, or
-//!   its open questions), as Claude Code's Stop payload says. Then only
-//!   mail that arrives from now on counts; otherwise unread mail already
-//!   there wakes the session at once, once. A wait that follows a timed-out
-//!   one also passes `"known": [<ids>]`, the ids the timed-out wait did
-//!   not count as news ([`Daemon::wait_from`]): mail delivered between the
-//!   two waits is then news, rather than counted as already there by the
-//!   new wait's first look.
+//!   The payload on stdin is `{"stop_hook_active": <bool>}`, optionally
+//!   with `"after_wake": true` or `"known": [<ids>]`. Plain
+//!   (`stop_hook_active` `false`, after a human's turn): unread mail
+//!   already there wakes the session at once, once (not again for mail a
+//!   wake was already for). `stop_hook_active` `true`, as Claude Code's
+//!   Stop payload says after a continuation: only mail that arrives from
+//!   now on counts (the plugin's waiter uses it after a wake it could not
+//!   queue). `after_wake` (the turn that just ended was started by a wake,
+//!   or failed or was interrupted): mail the last wake was for does not
+//!   count, all other unread mail does, so mail that came during the turn
+//!   wakes the session. `known` (the ids the timed-out wait before this
+//!   one did not count as news, or the unread mail when the plugin queued
+//!   open questions as a turn): exactly that mail does not count
+//!   ([`Daemon::wait_from`]), so mail delivered between the two waits, or
+//!   during the questions' turn, is news rather than counted as already
+//!   there by the new wait's first look. With `after_wake` or `known`, open
+//!   questions never end the wait as `{"busy":true}`.
 //! - `signoff`: sign the session's agent off, when opencode deletes the
 //!   session: `{"signed_off":true,"address":<address>}`, or `{}` when the
 //!   session has no agent or the daemon is down. Like every hook it never
@@ -70,7 +78,7 @@ pub async fn run(
                 .known
                 .as_ref()
                 .map(|ids| ids.iter().cloned().collect());
-            let wait = d.wait_from(!input.stop_hook_active, None, &mut known);
+            let wait = d.wait_from(!input.stop_hook_active, None, &mut known, input.after_wake);
             match tokio::time::timeout(limit, wait).await {
                 Ok(outcome) => printed(&wait_json(outcome)),
                 Err(_) => printed(&timed_out_json(known)),

@@ -541,6 +541,92 @@ async fn wait_is_busy_while_questions_continue_the_turn() {
     assert_eq!(joined(wait).await["mail"], true);
 }
 
+#[tokio::test]
+async fn wait_after_a_woken_turn_wakes_for_mail_that_came_during_it() {
+    // Woken for A; B arrives while the woken turn runs (after its last
+    // tool call). The turn ends: the plugin waits with `after_wake`, and B
+    // wakes the session at once, while A (already woken for) does not.
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    let env = Env::of(&d.paths);
+    let short = Some(Duration::from_secs(1));
+    send(&d, &a, "first", false).await;
+    assert_eq!(
+        joined(spawn_wait(&env, "ses_a", false, None)).await["mail"],
+        true
+    );
+    let after_wake = json!({ "stop_hook_active": false, "after_wake": true });
+
+    // Nothing new during the woken turn: A does not wake it again.
+    let v = joined(spawn_wait_with(&env, "ses_a", after_wake.clone(), short)).await;
+    assert_eq!(v["mail"], false, "{v}");
+    assert_eq!(v["known"].as_array().unwrap().len(), 1, "{v}");
+
+    // A wake, then B during the woken turn.
+    send(&d, &a, "second", false).await;
+    assert_eq!(
+        joined(spawn_wait_with(&env, "ses_a", after_wake.clone(), short)).await["mail"],
+        true
+    );
+    send(&d, &a, "third", false).await;
+    // `stop_hook_active` alone (new mail only) misses it...
+    let v = joined(spawn_wait(&env, "ses_a", true, short)).await;
+    assert_eq!(v["mail"], false, "{v}");
+    // ...`after_wake` wakes for it at once.
+    let v = joined(spawn_wait_with(&env, "ses_a", after_wake.clone(), short)).await;
+    assert_eq!(v["mail"], true, "{v}");
+    assert!(v["text"].as_str().unwrap().contains("3 unread"), "{v}");
+
+    // Open questions do not end an `after_wake` wait as busy.
+    ask(&d, &a, "POST /orders body?").await;
+    let v = joined(spawn_wait_with(&env, "ses_a", after_wake, short)).await;
+    assert_eq!(v["mail"], true, "{v}");
+}
+
+#[tokio::test]
+async fn wait_after_a_questions_turn_counts_mail_that_came_during_it() {
+    // The plugin queued open questions as a turn, passing the unread mail
+    // it saw then as `known`. Mail that came during that turn wakes the
+    // session; the questions, still open, do not end the wait as busy.
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    let env = Env::of(&d.paths);
+    let short = Some(Duration::from_secs(1));
+    ask(&d, &a, "POST /orders body?").await;
+    let before = status(&env, "ses_a", false).await["unread_ids"].clone();
+    assert_eq!(before.as_array().unwrap().len(), 1, "{before}");
+    let payload = json!({ "stop_hook_active": false, "known": before });
+
+    let v = joined(spawn_wait_with(&env, "ses_a", payload.clone(), short)).await;
+    assert_eq!(v["mail"], false, "{v}");
+
+    send(&d, &a, "during", false).await;
+    let v = joined(spawn_wait_with(&env, "ses_a", payload, short)).await;
+    assert_eq!(v["mail"], true, "{v}");
+}
+
+#[tokio::test]
+async fn status_latency_under_20ms() {
+    // The plugin awaits `hook status --surface-urgent` after every tool
+    // call: with the daemon up it must stay cheap.
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    send(&d, &a, "schema", false).await;
+    let env = Env::of(&d.paths);
+    // Warm up.
+    status(&env, "ses_a", true).await;
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let started = std::time::Instant::now();
+        let v = status(&env, "ses_a", true).await;
+        times.push(started.elapsed());
+        assert_eq!(v["unread"], 1, "{v}");
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    assert!(median < Duration::from_millis(20), "median {median:?}");
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_agentmail");
 
 fn cli(paths: &Paths, args: &[&str], stdin: &str) -> std::process::Output {
@@ -691,4 +777,56 @@ fn cli_daemon_down_prints_empty_status_and_gone() {
     assert!(!paths.socket.exists(), "a daemon socket appeared");
     assert!(!paths.lock.exists(), "a daemon lock appeared");
     assert!(!paths.db.exists(), "a database appeared");
+}
+
+// The daemon runs in this process: the blocking CLI call needs another
+// worker thread to serve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_wait_ends_on_sigterm_with_nothing_recorded() {
+    // The plugin kills a waiting `hook wait` (SIGTERM) when its session
+    // gets busy. While it is still waiting, the command ends at once and
+    // prints nothing; no wake was recorded, so the mail that comes next
+    // still wakes the session.
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    let mut child = std::process::Command::new(BIN)
+        .args([
+            "hook",
+            "wait",
+            "--harness",
+            "opencode",
+            "--session",
+            "ses_a",
+        ])
+        .env("AGENTMAIL_DATA_DIR", &d.paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &d.paths.socket)
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("OPENCODE_SESSION_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(child.try_wait().unwrap().is_none(), "the wait ended early");
+    // SAFETY: plain kill(2) on our own child.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(143), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+
+    send(&d, &a, "schema", false).await;
+    let env = Env::of(&d.paths);
+    let v = joined(spawn_wait(
+        &env,
+        "ses_a",
+        false,
+        Some(Duration::from_secs(5)),
+    ))
+    .await;
+    assert_eq!(v["mail"], true, "{v}");
 }

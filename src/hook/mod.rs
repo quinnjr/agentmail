@@ -137,8 +137,14 @@ pub struct HookInput {
     pub prompt_id: Option<String>,
     /// opencode's plugin: the unread mail ids a timed-out `wait` did not
     /// count as news (its `known`), passed back to the wait that follows,
-    /// so mail that came between the two is news. `None` when absent.
+    /// so mail that came between the two is news; or the unread mail
+    /// before a turn the plugin started with open questions. `None` when
+    /// absent.
     pub known: Option<Vec<String>>,
+    /// opencode's plugin: the turn that just ended was started by a wake
+    /// (or failed or was interrupted), so the wait counts mail not in the
+    /// `woken` file as news ([`Daemon::wait_from`]'s `after_wake`).
+    pub after_wake: bool,
 }
 
 impl HookInput {
@@ -172,6 +178,7 @@ impl HookInput {
                     .filter_map(|id| id.as_str().map(str::to_string))
                     .collect()
             }),
+            after_wake: raw["after_wake"].as_bool().unwrap_or(false),
             raw,
         }
     }
@@ -427,12 +434,12 @@ impl Daemon {
     /// questions): the session goes on with a continuation, so it is not
     /// idle, and the continuation's own stop starts the wait. That
     /// decision is the Stop hook's, read from its record
-    /// ([`Daemon::record_stop`], looked for up to 6 s); only
-    /// without one (no key, or no record in time) does the wait decide by
-    /// itself from the agent's open questions. Otherwise unread mail
-    /// already there counts, unless a wait already woke it for that mail
-    /// (the `woken` file): mail it
-    /// chose to leave unread wakes it once, not after every human turn.
+    /// ([`Daemon::record_stop`], looked for up to 6 s); only without one
+    /// (no key, or no record in time) does the wait decide by itself from
+    /// the agent's open questions. Otherwise unread mail already there
+    /// counts, unless a wait already woke it for that mail (the `woken`
+    /// file): mail it chose to leave unread wakes it once, not after every
+    /// human turn.
     /// Otherwise (the agent was just woken, or blocked, and stopped again
     /// without reading) only mail that arrives from now on counts, so
     /// mail it chose to leave unread never wakes it twice. Which mail is
@@ -461,22 +468,31 @@ impl Daemon {
     /// while the agent lives, for the next wait, and the daemon removes
     /// them once it finds the agent gone.
     pub async fn wait(&mut self, wake_for_unread: bool, stop_key: Option<&str>) -> WaitOutcome {
-        self.wait_from(wake_for_unread, stop_key, &mut None).await
+        self.wait_from(wake_for_unread, stop_key, &mut None, false)
+            .await
     }
 
     /// [`Daemon::wait`], with the unread mail that does not count as news
     /// in `known`. `None` lets the first look decide (as `wait` does);
-    /// `Some` (a timed-out wait's set, passed back by opencode's plugin)
-    /// is used as is, and the wait never ends as `Busy` for open questions
-    /// (the stop they would block was the timed-out wait's, not blocked). The wait keeps `known` up to date (mail read
-    /// meanwhile drops out), so a caller that stops it (a timeout) can
-    /// hand it to the wait that follows: mail that came in between is then
-    /// news, not counted as already there.
+    /// `Some` (a timed-out wait's set, or the unread mail before a turn,
+    /// passed back by opencode's plugin) is used as is, and the wait never
+    /// ends as `Busy` for open questions (the stop they would block was
+    /// the timed-out wait's, not blocked, or the turn was not one to
+    /// continue). With `after_wake` and `known` `None`, `known` is the
+    /// mail the last wake was for (the `woken` file), whatever the open
+    /// questions, and the wait never ends as `Busy` for them either: the
+    /// turn that just ended was started by a wake (or failed), so mail
+    /// that came during it is news, as after a woken turn's plain stop.
+    /// The wait keeps `known` up to date (mail read meanwhile drops out),
+    /// so a caller that stops it (a timeout) can hand it to the wait that
+    /// follows: mail that came in between is then news, not counted as
+    /// already there.
     pub async fn wait_from(
         &mut self,
         wake_for_unread: bool,
         stop_key: Option<&str>,
         known: &mut Option<HashSet<String>>,
+        after_wake: bool,
     ) -> WaitOutcome {
         let Some(status) = self.status(false).await else {
             return WaitOutcome::Gone;
@@ -485,6 +501,9 @@ impl Daemon {
             return WaitOutcome::Skip;
         }
         let address = status.address.clone();
+        if after_wake && known.is_none() {
+            *known = Some(read_woken(&self.paths.data_dir, &address));
+        }
         let stop = match self.stop_record(&address, stop_key).await {
             Ok(stop) => stop,
             Err(NoLock::Busy) => return WaitOutcome::Busy,
@@ -498,8 +517,10 @@ impl Daemon {
             None => !status.open_questions.is_empty(),
         };
         // A wait passed a timed-out wait's `known` (a re-wait) follows a
-        // stop that was already found not blocked: questions opened since
-        // are mail like any other, so they do not end it as `Busy`.
+        // stop that was already found not blocked, and one after a wake
+        // (or with the unread mail before the turn) follows a turn whose
+        // questions are not queued: questions opened since are mail like
+        // any other, so they do not end it as `Busy`.
         let rewait = known.is_some();
         if wake_for_unread && blocked && !rewait {
             // The Stop hook blocks this stop, so the session goes on with
@@ -851,11 +872,11 @@ fn is_state_of(name: &str, address: &str) -> bool {
 }
 
 /// Remove all of `address`'s files under `data_dir` (turn, lock, woken,
-/// busy, stop, and temporary files a crashed write left), for an agent that signed
-/// off, is gone, or whose harness exited. Best effort. A wait still
-/// holding the removed lock keeps it; one that opens the path afterwards
-/// gets a new file, and `waiter_lock` makes sure the two never both
-/// count as held.
+/// busy, stop, and temporary files a crashed write left), for an agent
+/// that signed off, is gone, or whose harness exited. Best effort. A wait
+/// still holding the removed lock keeps it; one that opens the path
+/// afterwards gets a new file, and `waiter_lock` makes sure the two never
+/// both count as held.
 pub fn clear_wait_state(data_dir: &Path, address: &str) {
     let Ok(entries) = std::fs::read_dir(wait_dir(data_dir)) else {
         return;
@@ -1029,6 +1050,10 @@ mod tests {
         assert!(input.stop_hook_active);
         assert_eq!(input.agent_id, None);
         assert!(!input.is_subagent());
+        assert!(!input.after_wake);
+        let input = HookInput::parse(br#"{"stop_hook_active":false,"after_wake":true}"#);
+        assert!(input.after_wake);
+        assert_eq!(input.known, None);
         for junk in [
             &b""[..],
             b"not json",
@@ -1041,6 +1066,7 @@ mod tests {
             assert_eq!(input.agent_id, None);
             assert_eq!(input.hook_event_name, None);
             assert_eq!(input.prompt_id, None);
+            assert!(!input.after_wake);
         }
     }
 
