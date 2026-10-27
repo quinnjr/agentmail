@@ -130,7 +130,7 @@ loginctl enable-linger "$USER"         # optional: keep it running while logged 
 ```
 
 It writes the unit below to `~/.config/systemd/user/agentmail.service` (or
-under `$XDG_CONFIG_HOME`), with `ExecStart` running the binary you invoked by
+under `$XDG_CONFIG_HOME`, when it is absolute), with `ExecStart` running the binary you invoked by
 the path you invoked it as (a symlink stays a symlink, so a unit pointing at
 `~/.local/bin/agentmail` follows it to a newer version; a path that is not
 this binary, or one with `..` in it, gives way to the binary's resolved
@@ -153,7 +153,11 @@ one below, whatever its `ExecStart`): one it created and you then edited is
 saved as the backup first, and any other unit is left in place with the
 commands to remove it by hand. The service uses the default data directory
 and socket, whatever `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you
-run the install.
+run the install, as the systemd user manager's environment sets them
+(`XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `HOME`); install notes when those put
+them elsewhere than the defaults in your shell. When a command fails after
+the unit is written (or, on uninstall, before or after it is removed), the
+error says what is left and how to finish or undo it.
 
 To set it up by hand instead, add a user unit at
 `~/.config/systemd/user/agentmail.service`:

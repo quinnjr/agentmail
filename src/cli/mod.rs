@@ -1002,6 +1002,11 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
             service::steps(&bin, &unset, !uninstall, stop_daemon, restart)
         }
     };
+    // A service already running this unit runs the daemon: there is no
+    // daemon on demand to stop, and stopping its own would only drop its
+    // clients. (`is-active` only reads.)
+    let stop_daemon = || !(changes.is_empty() && service::is_active(&env));
+    let path = service::unit_path(&env);
     let mut steps = steps_for(true);
     let mut notes = Vec::new();
     if !uninstall && !unset.is_empty() {
@@ -1012,20 +1017,41 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
             if unset.len() == 1 { "is" } else { "are" }
         ));
     }
-    if !dry_run && !steps.is_empty() {
+    if !uninstall {
+        notes.extend(service::location_mismatch(&env));
+    }
+    if dry_run {
+        if !uninstall {
+            steps = steps_for(stop_daemon());
+        }
+    } else if !steps.is_empty() {
         service::check(&env, &|| service::manual(&bin, &env, !uninstall))?;
+        let shown = inst::shell_quote(&path.to_string_lossy());
         if uninstall {
-            service::stop(&env)?;
+            service::stop(&env).with_context(|| {
+                format!(
+                    "the unit {shown} is kept; run `agentmail uninstall --service` again to \
+                     remove it"
+                )
+            })?;
             inst::apply(&changes)?;
-            service::reload(&env)?;
+            service::reload(&env).with_context(|| {
+                format!(
+                    "the unit {shown} is removed and the service disabled, but systemd still \
+                     has it loaded; run `systemctl --user daemon-reload` to finish"
+                )
+            })?;
         } else {
-            // A service already running this unit runs the daemon: there
-            // is no daemon on demand to stop, and stopping its own would
-            // only drop its clients.
-            let stop_daemon = !(changes.is_empty() && service::is_active(&env));
+            let stop_daemon = stop_daemon();
             steps = steps_for(stop_daemon);
             inst::apply(&changes)?;
-            service::start(&bin, &env, stop_daemon, restart)?;
+            service::start(&bin, &env, stop_daemon, restart).with_context(|| {
+                format!(
+                    "the unit {shown} is written but the service may not be running; run \
+                     `agentmail install --service` again to finish, or \
+                     `agentmail uninstall --service` to undo it"
+                )
+            })?;
         }
     }
     let action = |c: &inst::Change| match (&c.before, &c.after) {
@@ -1033,7 +1059,6 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         (Some(_), Some(_)) => "update",
         (Some(_), None) => "delete",
     };
-    let path = service::unit_path(&env);
     let backup = (!dry_run)
         .then(|| service::backup_kept(&path))
         .flatten()
@@ -1046,7 +1071,11 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
                     "path": c.path.display().to_string(),
                     "action": action(c),
                     "backup": backup.as_ref().map(|b| b.display().to_string()),
-                    "saved": null,
+                    "saved": c
+                        .save
+                        .as_ref()
+                        .filter(|_| !dry_run)
+                        .map(|p| p.display().to_string()),
                 })
             })
             .collect();

@@ -52,6 +52,68 @@ pub fn location_overrides(env: &Env) -> Vec<&'static str> {
         .collect()
 }
 
+/// The data directory and socket the service's daemon uses, from the
+/// systemd user manager's environment (`systemctl --user show-environment`,
+/// whose `HOME` defaults to `env`'s), when they differ from the defaults
+/// here, which `daemon stop` (and every client here not told otherwise)
+/// uses: then a note saying so. The defaults depend on `XDG_DATA_HOME` and
+/// `XDG_RUNTIME_DIR`, which a shell (say, an ssh session without
+/// pam_systemd) may set differently from the manager. Nothing when the
+/// manager cannot be asked, or a value cannot be read.
+pub fn location_mismatch(env: &Env) -> Option<String> {
+    let out = Command::new(systemctl(env))
+        .args(["--user", "show-environment"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut manager: std::collections::HashMap<&str, &str> =
+        text.lines().filter_map(|l| l.split_once('=')).collect();
+    // A value with special characters is shown quoted (`$'...'`).
+    if manager.values().any(|v| v.starts_with("$'")) {
+        return None;
+    }
+    let home = env.home.to_str()?;
+    manager.entry("HOME").or_insert(home);
+    let service =
+        crate::paths::Paths::from_vars(|k| manager.get(k).map(std::ffi::OsString::from)).ok()?;
+    let here = crate::paths::Paths::from_vars(|k| {
+        if LOCATION_VARS.contains(&k) {
+            None
+        } else if k == "HOME" {
+            Some(env.home.clone().into_os_string())
+        } else {
+            env.var(k).map(std::ffi::OsString::from)
+        }
+    })
+    .ok()?;
+    let mut diff = Vec::new();
+    if service.socket != here.socket {
+        diff.push(format!(
+            "socket {} (default here: {})",
+            service.socket.display(),
+            here.socket.display()
+        ));
+    }
+    if service.data_dir != here.data_dir {
+        diff.push(format!(
+            "data directory {} (default here: {})",
+            service.data_dir.display(),
+            here.data_dir.display()
+        ));
+    }
+    if diff.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the service gets the {} from the systemd user manager's environment, which sets \
+         XDG_RUNTIME_DIR, XDG_DATA_HOME or HOME differently: `daemon stop` and clients run \
+         here use a daemon of their own, not the service's. Set the same values here, or in \
+         the manager with `systemctl --user set-environment`.",
+        diff.join(" and the ")
+    ))
+}
+
 /// The binary the unit runs: this one, by the path it was invoked as
 /// (`argv0`, taken from the working directory or found on `PATH`) when
 /// that names this same file (so a symlink, say to a versioned install,
@@ -144,9 +206,12 @@ fn exec_arg(bin: &Path) -> Result<String> {
 }
 
 /// Where the unit goes: `$XDG_CONFIG_HOME/systemd/user/agentmail.service`,
-/// else under `~/.config`.
+/// else under `~/.config`. A relative `XDG_CONFIG_HOME` is ignored, as the
+/// XDG spec says and systemd does.
 pub fn unit_path(env: &Env) -> PathBuf {
-    env.dir_var("XDG_CONFIG_HOME")
+    env.var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .unwrap_or_else(|| env.home.join(".config"))
         .join("systemd/user")
         .join(format!("{NAME}.service"))

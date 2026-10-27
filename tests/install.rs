@@ -2954,7 +2954,9 @@ fn service_unit_quotes_the_binary_for_systemd() {
 
 /// A temporary home for `install --service`: a fake `systemctl` that logs
 /// each call (with whether the test's daemon at the default location was
-/// up then), and the daemon's default data directory and socket inside it.
+/// up then) but the read-only `show-environment`, which prints
+/// `FAKE_ENV`, and fails a call holding `FAKE_FAIL`; and the daemon's
+/// default data directory and socket inside it.
 struct ServiceHome {
     h: Home,
 }
@@ -2966,8 +2968,14 @@ impl ServiceHome {
         write(
             &fake,
             r#"#!/bin/sh
+case "$*" in
+  *show-environment*) printf '%s' "$FAKE_ENV"; exit 0 ;;
+esac
 if env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET "$AGENTMAIL_TEST_BIN" daemon status >/dev/null 2>&1; then up=up; else up=down; fi
 echo "$* [$up]" >> "$FAKE_LOG"
+if [ -n "$FAKE_FAIL" ]; then
+  case "$*" in *"$FAKE_FAIL"*) echo "Failed to $FAKE_FAIL" >&2; exit 1 ;; esac
+fi
 case "$*" in
   *is-system-running*) echo "${FAKE_STATE:-running}"; exit "${FAKE_RC:-0}" ;;
   *is-active*) [ "$FAKE_ACTIVE" = active ]; exit $? ;;
@@ -3022,7 +3030,9 @@ exit 0
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("FAKE_STATE")
             .env_remove("FAKE_RC")
-            .env_remove("FAKE_ACTIVE");
+            .env_remove("FAKE_ACTIVE")
+            .env_remove("FAKE_ENV")
+            .env_remove("FAKE_FAIL");
         c
     }
 
@@ -3218,6 +3228,128 @@ fn service_dry_run_changes_and_runs_nothing() {
     );
     assert!(!s.unit().exists());
     assert!(s.log().is_empty());
+    assert!(!out.contains("note:"), "{out}");
+
+    // Once installed, a dry run shows `daemon stop` only where a real run
+    // would run it: not while the service runs this unit.
+    s.cli().args(["install", "--service"]).assert().success();
+    let dry = |active: bool| {
+        let mut c = s.cli();
+        if active {
+            c.env("FAKE_ACTIVE", "active");
+        }
+        let out = c
+            .args(["install", "--service", "--dry-run"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    let out = dry(true);
+    assert!(out.contains("nothing to change"), "{out}");
+    assert!(!out.contains("daemon stop"), "{out}");
+    assert!(
+        out.contains("systemctl --user enable --now agentmail"),
+        "{out}"
+    );
+    let out = dry(false);
+    assert!(out.contains("daemon stop"), "{out}");
+}
+
+#[test]
+fn service_notes_a_manager_with_other_default_locations() {
+    // The systemd user manager's XDG_RUNTIME_DIR puts the service's socket
+    // elsewhere than the default here (none set): said so.
+    let s = ServiceHome::new();
+    let out = s
+        .cli()
+        .env("FAKE_ENV", "LANG=C\nXDG_RUNTIME_DIR=/run/user/4242\n")
+        .args(["--json", "install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    let note = v["notes"][0].as_str().unwrap();
+    assert!(note.contains("socket /run/user/4242/agentmail.sock"), "{v}");
+    assert!(!note.contains("data directory"), "{v}");
+    // Matching values: no note.
+    let run = s.h.dir.path().join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let out = s
+        .cli()
+        .env("XDG_RUNTIME_DIR", &run)
+        .env("FAKE_ENV", format!("XDG_RUNTIME_DIR={}\n", run.display()))
+        .args(["--json", "install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["notes"], json!([]), "{v}");
+}
+
+#[test]
+fn service_failure_after_writing_the_unit_says_so() {
+    let s = ServiceHome::new();
+    let out = s
+        .cli()
+        .env("FAKE_FAIL", "enable")
+        .args(["install", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(
+        err.contains(&format!("the unit {} is written", s.unit().display())),
+        "{err}"
+    );
+    assert!(
+        err.contains("run `agentmail install --service` again"),
+        "{err}"
+    );
+    assert!(err.contains("Failed to enable"), "{err}");
+    assert!(s.unit().exists());
+    // Running it again finishes it.
+    s.cli().args(["install", "--service"]).assert().success();
+    assert!(s.log().last().unwrap().contains("enable --now agentmail"));
+
+    // Uninstall: a failed disable keeps the unit.
+    let out = s
+        .cli()
+        .env("FAKE_FAIL", "disable")
+        .args(["uninstall", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(
+        err.contains(&format!("the unit {} is kept", s.unit().display())),
+        "{err}"
+    );
+    assert!(s.unit().exists());
+    // A failed reload, once the unit is removed, says what is left to do.
+    let out = s
+        .cli()
+        .env("FAKE_FAIL", "daemon-reload")
+        .args(["uninstall", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("systemctl --user daemon-reload"), "{err}");
+    assert!(err.contains("is removed"), "{err}");
+    assert!(!s.unit().exists());
 }
 
 #[test]
@@ -3352,6 +3484,19 @@ fn service_respects_home_without_xdg_config() {
             .join(".config/systemd/user/agentmail.service")
             .exists()
     );
+    // A relative XDG_CONFIG_HOME, which systemd ignores, is ignored too.
+    let s = ServiceHome::new();
+    s.cli()
+        .env("XDG_CONFIG_HOME", "rel")
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert!(
+        s.h.home()
+            .join(".config/systemd/user/agentmail.service")
+            .exists()
+    );
+    assert!(!s.h.proj().join("rel").exists());
 }
 
 #[test]
@@ -3447,6 +3592,27 @@ fn service_keeps_edits_to_its_unit() {
     s.cli().args(["install", "--service"]).assert().success();
     assert_eq!(read(&bak(&s.unit())), edited);
     assert!(!marker(&s.unit()).exists());
+
+    // `--json` names the saved unit.
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    std::fs::remove_file(bak(&s.unit())).unwrap();
+    s.cli().args(["install", "--service"]).assert().success();
+    write(&s.unit(), &edited);
+    let out = s
+        .cli()
+        .args(["--json", "uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        v["changes"][0]["saved"],
+        json!(bak(&s.unit()).display().to_string()),
+        "{v}"
+    );
+    assert_eq!(read(&bak(&s.unit())), edited);
 }
 
 #[test]
