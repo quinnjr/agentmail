@@ -116,9 +116,30 @@ pub fn default_paths(env: &Env) -> Option<crate::paths::Paths> {
 /// writes none, is taken as on demand). Install stops only such a daemon:
 /// a supervised one is the service's own (or another supervisor's), and
 /// stopping it would only drop its clients while it is restarted.
+///
+/// A daemon that has just taken the lock records itself a moment later:
+/// until then the record is its predecessor's, whose process is gone. Such
+/// a record is read again for up to a second before it is believed.
 pub fn on_demand_daemon(env: &Env) -> bool {
-    default_paths(env)
-        .is_some_and(|p| p.lock_held() && !p.lock_record().is_some_and(|r| r.supervised))
+    let Some(p) = default_paths(env) else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if !p.lock_held() {
+            return false;
+        }
+        match p.lock_record() {
+            None => return true,
+            Some(r)
+                if crate::procinfo::proc_id(r.pid).is_none()
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Some(r) => return !r.supervised,
+        }
+    }
 }
 
 /// The data directory and socket the service's daemon uses, from the
@@ -373,6 +394,43 @@ pub fn unit_path(env: &Env) -> PathBuf {
     unit_dir(env.var("XDG_CONFIG_HOME"), &env.home).join(format!("{NAME}.service"))
 }
 
+/// The drop-in directory of the unit at `path` (`agentmail.service.d`,
+/// where `systemctl --user edit` puts `override.conf`). Install and
+/// uninstall never touch it, so the user's settings there outlive both.
+pub fn dropin_dir(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".d");
+    path.with_file_name(name)
+}
+
+/// The settings of the unit `text` (one install replaces) that agentmail's
+/// unit for `bin` lacks, `ExecStart` aside: say, an `Environment=` line,
+/// which the service no longer gets once it is replaced.
+pub fn dropped_settings(text: &str, bin: &Path) -> Vec<String> {
+    let ours = unit(bin).unwrap_or_default();
+    let ours: Vec<&str> = ours.lines().map(str::trim).collect();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with(['#', ';', '['])
+                && !l.starts_with("ExecStart=")
+                && !ours.contains(l)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// `k=v` as an `Environment=` line of a unit: quoted, with `\` and `"`
+/// escaped and `%` (specifiers) doubled.
+pub fn environment_line(k: &str, v: &str) -> String {
+    let kv = format!("{k}={v}")
+        .replace('\\', r"\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("Environment=\"{kv}\"")
+}
+
 /// The change that installs the unit for `bin` (none when it is already
 /// there), or, on uninstall, removes it (none when it is not there). A
 /// unit that was there before agentmail's is kept as its backup, also once
@@ -412,6 +470,22 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
     let created = std::fs::symlink_metadata(created_marker_path(&c.path)).is_ok();
     if generated.is_some() && created {
         return Ok(vec![c]);
+    }
+    if install && created {
+        // agentmail's unit, edited by the user beyond its `ExecStart`:
+        // replacing it would silently drop what the edits configure (say,
+        // the `Environment=` that moves the daemon's data directory).
+        bail!(
+            "{} is the unit agentmail installed, edited since; installing would drop these \
+             edits, so agentmail leaves the unit and nothing was changed:\n{}\
+             Keep such settings in a drop-in, which install and uninstall never touch: run \
+             `systemctl --user edit {NAME}` (it saves {}), put them there, then remove the \
+             unit (rm {}) and run `agentmail install --service` again.",
+            c.path.display(),
+            super::diff(&c),
+            dropin_dir(&c.path).join("override.conf").display(),
+            shell_quote(&c.path.to_string_lossy())
+        );
     }
     let bak = backup_path(&c.path);
     let backup = match std::fs::read(&bak) {
@@ -847,6 +921,33 @@ mod tests {
             .replace("[Service]\n", "[Service]\nEnvironment=A=1\n");
         assert!(!is_generated(&edited));
         assert!(!is_generated(&UNIT.replace("{exec}", "")));
+    }
+
+    #[test]
+    fn environment_line_quotes_for_a_unit() {
+        assert_eq!(environment_line("A", "/x/y"), "Environment=\"A=/x/y\"");
+        assert_eq!(
+            environment_line("A", "/a b/%h\\\"q"),
+            r#"Environment="A=/a b/%%h\\\"q""#
+        );
+    }
+
+    #[test]
+    fn dropin_dir_is_next_to_the_unit() {
+        assert_eq!(
+            dropin_dir(Path::new("/c/systemd/user/agentmail.service")),
+            Path::new("/c/systemd/user/agentmail.service.d")
+        );
+    }
+
+    #[test]
+    fn dropped_settings_lists_what_agentmail_unit_lacks() {
+        let bin = Path::new("/x/agentmail");
+        assert!(dropped_settings(&unit(bin).unwrap(), bin).is_empty());
+        assert!(dropped_settings(&UNIT.replace("{exec}", "%h/a"), bin).is_empty());
+        let mine = "[Service]\n# note\nExecStart=/old daemon run\nEnvironment=A=1\n\
+                    Restart=always\nUser=x\n";
+        assert_eq!(dropped_settings(mine, bin), ["Environment=A=1", "User=x"]);
     }
 
     #[test]

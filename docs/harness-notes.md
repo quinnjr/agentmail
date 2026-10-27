@@ -1206,7 +1206,14 @@ Deviations from the plan, and why:
   stopping first would leave a gap in which a client starts another
   daemon on demand, which the service's would then wait behind
   indefinitely. Skipping the stop for a supervised daemon keeps a re-run
-  from dropping the service's own clients.
+  from dropping the service's own clients. Install checks for an
+  on-demand daemon again once the service is started and stops one found
+  only then: a client may start one between the first check and the
+  service's daemon taking the lock, and the service's would wait behind it
+  for as long as it runs. A daemon records itself in the lock file a
+  moment after taking the lock, so a record whose process is gone is read
+  again (up to a second) before it is believed; otherwise a service daemon
+  that just took over from an on-demand one could be taken for it.
 - **Manager states.** The plan says install errors out when `systemctl
   --user is-system-running` fails. That command exits 1 for `degraded`
   (some other unit failed) and for `starting`/`initializing` (still
@@ -1241,3 +1248,16 @@ Deviations from the plan, and why:
   binary path is indistinguishable from agentmail's and is treated as
   such: with a different unit already kept as the backup, it is replaced
   or removed without being saved (it holds nothing but that path).
+- **The user's settings live in a drop-in.** The README used to tell
+  users to add `Environment=` lines to `agentmail.service` itself; a later
+  install took that edited unit for the user's, kept it as the backup and
+  wrote the plain unit, so the service silently moved back to the default
+  data directory. Settings now go in a drop-in
+  (`systemctl --user edit agentmail`, saved as
+  `agentmail.service.d/override.conf`), which install and uninstall never
+  touch (uninstall notes it is left in place), and the location-override
+  note prints the `Environment=` lines to put there. Install refuses,
+  changing nothing, to replace a unit agentmail created that was edited
+  beyond its `ExecStart`, showing the edits and how to move them to a
+  drop-in; replacing a unit of the user's notes any settings it had that
+  agentmail's unit lacks.

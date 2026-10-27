@@ -2964,8 +2964,9 @@ fn service_unit_quotes_the_binary_for_systemd() {
 /// (by default, the manager's `XDG_CONFIG_HOME` the same as the CLI's),
 /// `show -p UnitPath`, which prints the manager's unit search path
 /// `FAKE_UNITPATH` (by default, nothing), and `show`, which prints
-/// `FAKE_SHOW` (by default, no unit file), and
-/// fails a call holding `FAKE_FAIL`; and the daemon's default data
+/// `FAKE_SHOW` (by default, no unit file), starts a daemon on demand at
+/// the default location during `enable --now` with `FAKE_START_ON_ENABLE`,
+/// and fails a call holding `FAKE_FAIL`; and the daemon's default data
 /// directory and socket inside it.
 struct ServiceHome {
     h: Home,
@@ -2992,6 +2993,10 @@ if env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET "$AGENTMAIL_TEST_BIN" daemon st
 echo "$* [$up]" >> "$FAKE_LOG"
 case "$*" in
   *disable*) if [ -n "$FAKE_RO" ]; then chmod 555 "$FAKE_RO"; fi ;;
+  *"enable --now"*)
+    if [ -n "$FAKE_START_ON_ENABLE" ]; then
+      env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET "$AGENTMAIL_TEST_BIN" daemon start >/dev/null 2>&1
+    fi ;;
 esac
 if [ -n "$FAKE_FAIL" ]; then
   case "$*" in *"$FAKE_FAIL"*) echo "Failed to $FAKE_FAIL" >&2; exit 1 ;; esac
@@ -3057,6 +3062,7 @@ exit 0
             .env_remove("FAKE_SHOW")
             .env_remove("FAKE_UNITPATH")
             .env_remove("FAKE_FAIL")
+            .env_remove("FAKE_START_ON_ENABLE")
             .env_remove("FAKE_RO");
         c
     }
@@ -3291,6 +3297,18 @@ fn service_notes_the_location_overrides() {
     let v: Value = serde_json::from_slice(&out).unwrap();
     let note = v["notes"][0].as_str().unwrap();
     assert!(note.starts_with("AGENTMAIL_SOCKET is set here"), "{v}");
+    // It says how to give the service the same, in a drop-in that install
+    // and uninstall leave alone, with the value as a unit takes it.
+    assert!(note.contains("systemctl --user edit agentmail"), "{v}");
+    assert!(
+        note.contains(&format!(
+            "Environment=\"AGENTMAIL_SOCKET={}\"",
+            s.h.dir.path().join("sock").display()
+        )),
+        "{v}"
+    );
+    assert!(note.contains("agentmail.service.d/override.conf"), "{v}");
+    assert!(!note.contains("AGENTMAIL_DATA_DIR"), "{v}");
 }
 
 #[test]
@@ -4340,13 +4358,55 @@ fn service_keeps_edits_to_its_unit() {
     assert!(!s.unit().exists());
     assert_eq!(read(&bak(&s.unit())), edited);
 
-    // Install over an edited unit agentmail created keeps it too.
+    // Install over an edited unit agentmail created refuses: replacing it
+    // would drop the edits from the running service. It shows them and
+    // says how to keep them (a drop-in) and go on.
     std::fs::remove_file(bak(&s.unit())).unwrap();
     s.cli().args(["install", "--service"]).assert().success();
     write(&s.unit(), &edited);
+    let n = s.log().len();
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("edited since"), "{err}");
+    assert!(err.contains("-Environment=FOO=1"), "{err}");
+    assert!(err.contains("systemctl --user edit agentmail"), "{err}");
+    assert!(
+        err.contains(
+            &s.unit()
+                .with_file_name("agentmail.service.d/override.conf")
+                .display()
+                .to_string()
+        ),
+        "{err}"
+    );
+    assert!(err.contains(&format!("rm {}", s.unit().display())), "{err}");
+    assert_eq!(read(&s.unit()), edited);
+    assert!(!bak(&s.unit()).exists());
+    assert!(marker(&s.unit()).exists());
+    assert_eq!(s.log().len(), n, "{:?}", s.log());
+    // A dry run refuses alike.
+    s.cli()
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .failure();
+    assert_eq!(read(&s.unit()), edited);
+    // An edit only to `ExecStart` is agentmail's to replace.
+    let exec_only = install::service::unit(Path::new("/elsewhere/agentmail")).unwrap();
+    write(&s.unit(), &exec_only);
     s.cli().args(["install", "--service"]).assert().success();
-    assert_eq!(read(&bak(&s.unit())), edited);
-    assert!(!marker(&s.unit()).exists());
+    assert_eq!(
+        read(&s.unit()),
+        install::service::unit(Path::new(&bin_path())).unwrap()
+    );
+    assert!(!bak(&s.unit()).exists());
+    write(&s.unit(), &edited);
 
     // `--json` names the saved unit.
     s.cli().args(["uninstall", "--service"]).assert().success();
@@ -4414,4 +4474,141 @@ fn service_install_keeps_a_unit_already_kept() {
     write(&bak(&s.unit()), a);
     s.cli().args(["install", "--service"]).assert().success();
     assert_eq!(read(&bak(&s.unit())), a);
+}
+
+#[test]
+fn service_environment_in_a_drop_in_survives_install_and_uninstall() {
+    // The README's way to give the service a data directory: a drop-in,
+    // which install and uninstall never touch, so a second install (here,
+    // run by another path, which changes `ExecStart`) keeps it applying.
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    let dropin = s.unit().with_file_name("agentmail.service.d/override.conf");
+    let conf = "[Service]\nEnvironment=AGENTMAIL_DATA_DIR=%h/agentmail-data\n";
+    write(&dropin, conf);
+    let link = s.h.dir.path().join("bin/agentmail");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_agentmail"), &link).unwrap();
+    s.cli_as(&link)
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert_eq!(read(&s.unit()), install::service::unit(&link).unwrap());
+    assert_eq!(read(&dropin), conf);
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!s.unit().exists());
+    assert_eq!(read(&dropin), conf);
+    assert!(
+        out.contains(&format!(
+            "note: the service's drop-ins in {} are left in place",
+            dropin.parent().unwrap().display()
+        )),
+        "{out}"
+    );
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(read(&dropin), conf);
+}
+
+#[test]
+fn service_notes_settings_of_a_replaced_unit() {
+    // A unit of the user's (the README's, written by hand) with an
+    // `Environment=` line: install keeps it as the backup and says the
+    // service no longer gets that line, and where to put it.
+    let s = ServiceHome::new();
+    let mine = readme_unit().replace(
+        "[Service]\n",
+        "[Service]\nEnvironment=AGENTMAIL_DATA_DIR=%h/agentmail-data\n",
+    );
+    write(&s.unit(), &mine);
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(read(&bak(&s.unit())), mine);
+    assert!(
+        out.contains(&format!(
+            "note: the unit replaced (kept as {}) also set \
+             `Environment=AGENTMAIL_DATA_DIR=%h/agentmail-data`, which the service no longer gets",
+            bak(&s.unit()).display()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("systemctl --user edit agentmail"), "{out}");
+    // The README's unit as is sets nothing more: no note.
+    let s = ServiceHome::new();
+    write(&s.unit(), &readme_unit());
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("also set"), "{out}");
+}
+
+#[test]
+fn service_stops_a_daemon_started_on_demand_while_it_starts() {
+    // No daemon runs when install looks, but a client starts one on
+    // demand before the service's takes the lock: install stops it, so
+    // the service's does not wait behind it.
+    let s = ServiceHome::new();
+    let out = s
+        .cli()
+        .env("FAKE_START_ON_ENABLE", "1")
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        s.log()
+            .iter()
+            .any(|l| l == "--user enable --now agentmail [down]"),
+        "{:?}",
+        s.log()
+    );
+    assert!(
+        out.contains(&format!("ran {} daemon stop", bin_path())),
+        "{out}"
+    );
+    assert!(!s.daemon_up(s.cli()));
+    // The JSON lists it too.
+    let out = s
+        .cli()
+        .env("FAKE_START_ON_ENABLE", "1")
+        .args(["--json", "install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_str().unwrap().ends_with("daemon stop")),
+        "{v}"
+    );
+    assert!(!s.daemon_up(s.cli()));
 }

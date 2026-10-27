@@ -1004,11 +1004,12 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     // --now`, and restarting it then would only drop the clients of the
     // daemon it just started. Asked before anything starts it.
     let restart = !uninstall && !changes.is_empty() && service::is_active(&env);
-    // Only a daemon started on demand is stopped, decided before the
-    // service starts: a supervised one (the service's own, say, on a
-    // re-run) would only drop its clients while it is restarted.
-    let stop_daemon = !uninstall && service::on_demand_daemon(&env);
-    let steps = if uninstall && changes.is_empty() {
+    // Only a daemon started on demand is stopped: a supervised one (the
+    // service's own, say, on a re-run) would only drop its clients while
+    // it is restarted. Asked before the service starts, and again once it
+    // has (see below).
+    let mut stop_daemon = !uninstall && service::on_demand_daemon(&env);
+    let mut steps = if uninstall && changes.is_empty() {
         orphan
             .as_ref()
             .map(service::orphan_steps)
@@ -1019,11 +1020,59 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     let path = service::unit_path(&env);
     let mut notes = Vec::new();
     if !uninstall && !unset.is_empty() {
+        // A drop-in, not the unit: install replaces the unit, and would
+        // drop the lines from it.
+        let lines: String = unset
+            .iter()
+            .map(|k| {
+                format!(
+                    "\n  {}",
+                    service::environment_line(k, env.var(k).unwrap_or_default())
+                )
+            })
+            .collect();
         notes.push(format!(
             "{} {} set here but not in the service, which uses the default data directory \
-             and socket.",
+             and socket. To give the service the same, run `systemctl --user edit {}`, add \
+             under [Service]:{lines}\nand restart it (`systemctl --user restart {}`). That \
+             drop-in ({}) is never touched by install or uninstall.",
             unset.join(" and "),
-            if unset.len() == 1 { "is" } else { "are" }
+            if unset.len() == 1 { "is" } else { "are" },
+            service::NAME,
+            service::NAME,
+            service::dropin_dir(&path).join("override.conf").display()
+        ));
+    }
+    if !uninstall {
+        // A unit of the user's replaced: what it set beyond agentmail's
+        // unit is kept only in its backup, and no longer applies.
+        for c in changes.iter().filter(|c| c.record_anew) {
+            let dropped = service::dropped_settings(c.before.as_deref().unwrap_or(""), &bin);
+            if !dropped.is_empty() {
+                notes.push(format!(
+                    "the unit replaced (kept as {}) also set {}, which the service no longer \
+                     gets; to keep {}, put {} in a drop-in with `systemctl --user edit {}`, \
+                     which install and uninstall never touch.",
+                    inst::backup_path(&c.path).display(),
+                    dropped
+                        .iter()
+                        .map(|l| format!("`{l}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if dropped.len() == 1 { "it" } else { "them" },
+                    if dropped.len() == 1 { "it" } else { "them" },
+                    service::NAME
+                ));
+            }
+        }
+    }
+    let dropins = service::dropin_dir(&path);
+    if uninstall && dropins.is_dir() {
+        notes.push(format!(
+            "the service's drop-ins in {} are left in place (a later install uses them again); \
+             remove them with: rm -r {}",
+            dropins.display(),
+            inst::shell_quote(&dropins.to_string_lossy())
         ));
     }
     if !uninstall {
@@ -1103,6 +1152,13 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
                      `agentmail uninstall --service` to undo it"
                 )
             })?;
+            // A client may have started a daemon on demand since the
+            // check above, before the service's daemon took the lock: the
+            // service's would wait behind it for as long as it runs.
+            if !stop_daemon && service::on_demand_daemon(&env) {
+                stop_daemon = true;
+                steps = service::steps(&bin, &unset, true, true, restart);
+            }
             if stop_daemon {
                 service::stop_on_demand(&bin).with_context(|| {
                     "the service is enabled and running, but stopping the daemon started on \

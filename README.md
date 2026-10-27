@@ -140,7 +140,12 @@ kept as the backup (its `ExecStart` a path as agentmail writes it). Any
 other unit already there, also one you wrote by hand from this README, is
 saved as `agentmail.service.agentmail.bak` first, and install refuses to
 replace it when that backup already keeps a different one, so that neither
-is lost. It then runs the commands below, `daemon-reload` and
+is lost; when that unit set more than the unit below (say, an
+`Environment=` line), install notes what the service no longer gets. A unit
+agentmail created that you have since edited (beyond its `ExecStart`)
+install refuses to replace, changing nothing, and shows your edits: keep
+such settings in a drop-in instead (see below), which install and uninstall
+never touch. It then runs the commands below, `daemon-reload` and
 `enable --now`, and, when the service was already running (on the unit it
 replaced, or on one removed by hand), `systemctl --user try-restart
 agentmail`, since enabling a running service does not restart it on the new
@@ -151,7 +156,9 @@ it is supervised), it runs `agentmail daemon stop` (with `AGENTMAIL_DATA_DIR`
 and `AGENTMAIL_SOCKET` unset, so it stops the daemon at the default location,
 the one the service replaces): the service's daemon, already waiting for the
 lock, takes over as the on-demand one exits, so no client can start another
-on demand in between. With no daemon running, or the service's own
+on demand in between. It looks again once the service is started, so a
+daemon a client started on demand while systemd was starting the service
+(which the service's would otherwise wait behind) is stopped too. With no daemon running, or the service's own
 (supervised) one, it skips that step, so a re-run leaves the service's daemon
 alone; should the step fail, the service is running all the same, and the
 error says to stop the on-demand daemon yourself. It refuses, changing
@@ -186,9 +193,12 @@ unit. A service named `agentmail` loaded from elsewhere (say,
 `~/.local/share/systemd/user` or a package's), and a link to it, are yours,
 and left alone with a note saying so. The service uses
 the default data directory and socket, whatever `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you
-run the install, as the systemd user manager's environment sets them
-(`XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `HOME`); install notes when those put
-them elsewhere than the defaults in your shell. When a command fails after
+run the install (install notes those it finds set, with the drop-in lines
+that give the service the same; see below), as the systemd user manager's
+environment sets them (`XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `HOME`); install
+notes when those put them elsewhere than the defaults in your shell.
+Uninstall leaves the service's drop-ins in place (and says so), so a later
+install uses them again. When a command fails after
 the unit is written (or, on uninstall, before or after it is removed), the
 error says what is left and how to finish or undo it.
 
@@ -310,15 +320,22 @@ The systemd user manager does not read your shell profile. If you set
 `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` there, the unit would serve a
 different data directory or socket than your clients use (they then report
 the data directory mismatch, or start a daemon of their own). Either leave
-them unset, or give the unit the same values, with `Environment=` lines in
-`[Service]`:
+them unset, or give the service the same values, with `Environment=` lines
+in a drop-in. Run `systemctl --user edit agentmail`, which saves what you
+add to `~/.config/systemd/user/agentmail.service.d/override.conf`:
 
 ```ini
+[Service]
 Environment=AGENTMAIL_DATA_DIR=%h/agentmail-data
 ```
 
-or by importing them from your shell before starting it (this lasts only
-until the user manager restarts, so `Environment=` is the durable choice):
+then `systemctl --user restart agentmail`. Do not add them to
+`agentmail.service` itself: that file is agentmail's, and `agentmail install
+--service` refuses to replace it once you have edited it (it would drop your
+lines), while it never touches the drop-in, nor does uninstall.
+
+Alternatively, import them from your shell before starting it (this lasts
+only until the user manager restarts, so the drop-in is the durable choice):
 
 ```sh
 systemctl --user import-environment XDG_DATA_HOME AGENTMAIL_DATA_DIR AGENTMAIL_SOCKET
