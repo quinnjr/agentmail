@@ -991,8 +991,8 @@ fn cli_json_reports_changes() {
     assert_eq!(
         v,
         json!({"dry_run": false, "changes": [
-            {"path": settings, "action": "update", "backup": bak(&h.settings()).display().to_string()},
-            {"path": mcp, "action": "create", "backup": null},
+            {"path": settings, "action": "update", "backup": bak(&h.settings()).display().to_string(), "saved": null},
+            {"path": mcp, "action": "create", "backup": null, "saved": null},
         ], "restart": "Restart running Claude Code sessions to load it.", "notes": []})
     );
     let out = cli(&h)
@@ -1012,8 +1012,8 @@ fn cli_json_reports_changes() {
     assert_eq!(
         v,
         json!({"dry_run": true, "changes": [
-            {"path": settings, "action": "update", "backup": null},
-            {"path": mcp, "action": "delete", "backup": null},
+            {"path": settings, "action": "update", "backup": null, "saved": null},
+            {"path": mcp, "action": "delete", "backup": null, "saved": null},
         ], "restart": null, "notes": []})
     );
 }
@@ -1917,6 +1917,182 @@ fn opencode_plugin_in_singular_plugin_dir_is_removed() {
     write(&legacy, &oc_plugin_text("/old/agentmail"));
     install(&oc_opts(true, BIN), &env);
     assert!(!legacy.exists());
+}
+
+/// An agentmail plugin the user edited by hand.
+fn oc_edited_plugin(bin: &str) -> String {
+    oc_plugin_text(bin).replacen('\n', "\n// my own tweak\n", 1)
+}
+
+#[test]
+fn opencode_edited_plugin_agentmail_did_not_create_is_kept_on_install() {
+    // A hand-placed `plugin/agentmail.js` with the user's own edits: install
+    // removes it (it would shadow the installed plugin) but keeps its text
+    // as its backup, and says so.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let legacy = h.oc_dir().join("plugin/agentmail.js");
+    let edited = oc_edited_plugin("/old/agentmail");
+    write(&legacy, &edited);
+    let changes = install(&oc_opts(false, BIN), &env);
+    assert!(paths(&changes).contains(&legacy.as_path()));
+    assert!(!legacy.exists());
+    assert_eq!(read(&bak(&legacy)), edited);
+    // Nothing more to do, and uninstall keeps the copy.
+    assert!(
+        install::plan_install(&oc_opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+    uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&bak(&legacy)), edited);
+
+    // A plugin agentmail would write goes with no copy.
+    let h = Home::new();
+    let legacy = h.oc_dir().join("plugin/agentmail.js");
+    write(&legacy, &oc_plugin_text("/old/agentmail"));
+    install(&oc_opts(false, BIN), &h.env(&[]));
+    assert!(!legacy.exists());
+    assert!(!bak(&legacy).exists());
+}
+
+#[test]
+fn opencode_edited_plugin_is_kept_on_uninstall() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    // Copied by hand and edited: uninstall keeps its text as the backup.
+    let edited = oc_edited_plugin("/old/agentmail");
+    write(&h.oc_plugin(), &edited);
+    let changes = uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(
+        changes[0].save.as_deref(),
+        Some(bak(&h.oc_plugin()).as_path())
+    );
+    assert!(!h.oc_plugin().exists());
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+
+    // A new install keeps that copy (not the record of an earlier file),
+    // and its uninstall too.
+    install(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&h.oc_plugin()), oc_plugin_text(BIN));
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!h.oc_plugin().exists());
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+
+    // Edited again with that copy there: saved beside it.
+    let again = oc_edited_plugin("/other/agentmail");
+    write(&h.oc_plugin(), &again);
+    let changes = uninstall(&oc_opts(false, BIN), &env);
+    let spare = PathBuf::from(format!("{}.1", bak(&h.oc_plugin()).display()));
+    assert_eq!(changes[0].save.as_deref(), Some(spare.as_path()));
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+    assert_eq!(read(&spare), again);
+
+    // Installed by agentmail, then edited: kept too.
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&oc_opts(false, BIN), &env);
+    let edited = oc_edited_plugin(BIN);
+    write(&h.oc_plugin(), &edited);
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!h.oc_plugin().exists());
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+    assert!(!marker(&h.oc_plugin()).exists());
+}
+
+#[test]
+fn opencode_edited_plugin_is_kept_when_its_backup_is_restored() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    let mine = "export default { id: \"mine\", setup() {} };\n";
+    let edited = oc_edited_plugin("/old/agentmail");
+    write(&h.oc_plugin(), &edited);
+    write(&bak(&h.oc_plugin()), mine);
+    uninstall(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&h.oc_plugin()), mine);
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+}
+
+#[test]
+fn opencode_edited_plugin_is_kept_on_reinstall() {
+    // A backup is written only where there is none: with one there, an
+    // edited plugin that install replaces is saved beside it.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let first = oc_edited_plugin("/first/agentmail");
+    write(&h.oc_plugin(), &first);
+    install(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&bak(&h.oc_plugin())), first);
+    let second = oc_edited_plugin("/second/agentmail");
+    write(&h.oc_plugin(), &second);
+    install(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&h.oc_plugin()), oc_plugin_text(BIN));
+    assert_eq!(read(&bak(&h.oc_plugin())), first);
+    let spare = PathBuf::from(format!("{}.1", bak(&h.oc_plugin()).display()));
+    assert_eq!(read(&spare), second);
+
+    // An edited plugin over a backup agentmail would write replaces it.
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(&bak(&h.oc_plugin()), &oc_plugin_text("/old/agentmail"));
+    let edited = oc_edited_plugin("/old/agentmail");
+    write(&h.oc_plugin(), &edited);
+    install(&oc_opts(false, BIN), &env);
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+}
+
+#[test]
+fn cli_opencode_says_where_an_edited_plugin_went() {
+    let h = Home::new();
+    let legacy = h.oc_dir().join("plugin/agentmail.js");
+    write(&legacy, &oc_edited_plugin("/old/agentmail"));
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["install", "--harness", "opencode", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let kept = bak(&legacy).display().to_string();
+    assert!(out.contains(&format!("would be kept as {kept}")), "{out}");
+    assert!(legacy.exists());
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["install", "--harness", "opencode"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!(
+            "removed {} (edited copy kept as {kept})",
+            legacy.display()
+        )),
+        "{out}"
+    );
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--json", "uninstall", "--harness", "opencode"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["saved"].is_null()),
+        "{v}"
+    );
+    assert!(bak(&legacy).exists());
 }
 
 #[test]

@@ -827,9 +827,15 @@ fn install(
         let list: Vec<Value> = changes
             .iter()
             .map(|c| {
-                let backup = (c.before.is_some() && c.after.is_some() && !dry_run)
+                let backup = (c.before.is_some() && (c.after.is_some() || c.keep_backup)
+                    && !dry_run)
                     .then(|| inst::backup_path(&c.path).display().to_string());
-                json!({"path": c.path.display().to_string(), "action": action(c), "backup": backup})
+                let saved = c
+                    .save
+                    .as_ref()
+                    .filter(|_| !dry_run)
+                    .map(|p| p.display().to_string());
+                json!({"path": c.path.display().to_string(), "action": action(c), "backup": backup, "saved": saved})
             })
             .collect();
         let restart = (!dry_run)
@@ -844,6 +850,13 @@ fn install(
     if dry_run {
         for c in &changes {
             print_text(&inst::diff(c))?;
+            if let Some(save) = &c.save {
+                print_line(&format!(
+                    "(the edited {} would be kept as {})",
+                    c.path.display(),
+                    save.display()
+                ))?;
+            }
         }
         if changes.is_empty() {
             print_line("nothing to change")?;
@@ -859,15 +872,24 @@ fn install(
             "update" => "updated",
             _ => "removed",
         };
-        let backup = if c.before.is_some() && c.after.is_some() {
-            format!(
-                " (original kept as {})",
-                inst::backup_path(&c.path).display()
-            )
-        } else {
+        let bak = inst::backup_path(&c.path);
+        let mut kept = Vec::new();
+        if c.before.is_some() && c.after.is_some() && c.save.as_ref() != Some(&bak) {
+            kept.push(format!("original kept as {}", bak.display()));
+        }
+        match &c.save {
+            Some(save) => kept.push(format!("edited copy kept as {}", save.display())),
+            None if c.after.is_none() && c.keep_backup => {
+                kept.push(format!("backup kept as {}", bak.display()))
+            }
+            None => {}
+        }
+        let kept = if kept.is_empty() {
             String::new()
+        } else {
+            format!(" ({})", kept.join("; "))
         };
-        print_line(&format!("{verb} {}{backup}", c.path.display()))?;
+        print_line(&format!("{verb} {}{kept}", c.path.display()))?;
     }
     let summary = match (uninstall, changes.is_empty()) {
         (false, true) => format!("agentmail is already installed for {name}."),

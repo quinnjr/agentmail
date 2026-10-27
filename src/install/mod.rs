@@ -9,7 +9,10 @@
 //! twice in a row finds nothing more to do. Before a file is first changed
 //! its original is saved next to it as `<file>.agentmail.bak`; a file
 //! agentmail creates is marked as such by `<file>.agentmail.created`, and
-//! only such a file is ever deleted again. An install into a file holding
+//! only such a file is ever deleted again, or one holding nothing but
+//! agentmail's own content: an emptied config, or agentmail's opencode
+//! plugin, whose text is first saved ([`Change::save`]) when the user
+//! edited it. An install into a file holding
 //! none of agentmail's entries takes that record anew, so an earlier
 //! install's record never outlives an uninstall.
 
@@ -54,6 +57,12 @@ pub struct Change {
     /// Deleting `path`, a symlink, removes only the link (and its marker),
     /// never the file it points to, even one agentmail created.
     pub unlink: bool,
+    /// Before the change, `before` is written here: it is agentmail's file
+    /// with edits of the user's (the opencode plugin), never discarded.
+    pub save: Option<PathBuf>,
+    /// Deleting `path` leaves its backup, which holds something to keep
+    /// (such as an edited copy of agentmail's file).
+    pub keep_backup: bool,
 }
 
 /// The environment the config locations depend on.
@@ -148,15 +157,17 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// `<path>.agentmail.created`. With [`Change::record_anew`] the earlier
 /// record is dropped first: the backup is replaced (or removed, for a file
 /// that does not exist) and any marker removed (and, for a file that does
-/// not exist, written again). The file is replaced atomically (a temporary
-/// file in the same directory, renamed over it), keeping its permissions; a
-/// new file is private to its owner (mode 0600). A symlink is followed, even
-/// one whose target does not exist yet: the file it points to changes, the
-/// link stays. A file to delete (one agentmail created, emptied by an
-/// uninstall, or agentmail's opencode plugin) goes with its backup and
-/// marker (a symlink agentmail did not create the target of, or one
-/// [`Change::unlink`] marks: only the link and its marker), and so do the directories
-/// agentmail created for it once they are empty.
+/// not exist, written again). Where [`Change::save`] says, `before` is
+/// first saved. The file is replaced atomically (a temporary file in the
+/// same directory, renamed over it), keeping its permissions; a new file is
+/// private to its owner (mode 0600). A symlink is followed, even one whose
+/// target does not exist yet: the file it points to changes, the link
+/// stays. A file to delete (one agentmail created, emptied by an
+/// uninstall, or agentmail's opencode plugin) goes with its marker and,
+/// unless [`Change::keep_backup`] or [`Change::save`] keeps it, its backup
+/// (a symlink agentmail did not create the target of, or one
+/// [`Change::unlink`] marks: only the link and its marker), and so do the
+/// directories agentmail created for it once they are empty.
 pub fn apply(changes: &[Change]) -> Result<()> {
     for c in changes {
         if read_opt(&c.path)? != c.before {
@@ -241,11 +252,17 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
     let marker = created_marker_path(&c.path);
     // Write through a symlink to its target, so the link stays a link.
     let target = resolve(&c.path)?;
+    if let (Some(save), Some(before)) = (&c.save, &c.before) {
+        replace_file(save, perms.as_ref(), before.as_bytes())
+            .with_context(|| format!("writing {}", save.display()))?;
+    }
     let Some(after) = &c.after else {
         // Only agentmail's own file is deleted ([`JsonFile::change`], the
         // opencode plugin): any backup of it holds nothing but agentmail's
-        // entries. A file agentmail created (its marker says so) goes even
-        // behind a symlink, which stays, unless [`Change::unlink`] says
+        // entries, unless [`Change::keep_backup`] says it holds more (and
+        // [`Change::save`] has already put the file's edited text away). A
+        // file agentmail created (its marker says so) goes even behind a
+        // symlink, which stays, unless [`Change::unlink`] says
         // only the link goes. Otherwise of a symlink only the link goes,
         // never the file it points to, and a backup beside it, which may
         // hold that file's original (an older install wrote through
@@ -260,7 +277,7 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
         } else {
             &c.path
         })?;
-        if created || !link {
+        if (created || !link) && !c.keep_backup && c.save.as_ref() != Some(&bak) {
             remove_if_there(&bak)?;
         }
         remove_if_there(&marker)?;
@@ -545,6 +562,8 @@ impl JsonFile {
             after,
             record_anew,
             unlink: false,
+            save: None,
+            keep_backup: false,
         })
     }
 }
@@ -913,6 +932,8 @@ mod tests {
             after: Some(after),
             record_anew: false,
             unlink: false,
+            save: None,
+            keep_backup: false,
         });
         assert_eq!(
             d,
@@ -925,6 +946,8 @@ mod tests {
             after: Some("a\n".into()),
             record_anew: false,
             unlink: false,
+            save: None,
+            keep_backup: false,
         });
         assert_eq!(d, "--- /dev/null\n+++ /f\n@@ -0,0 +1,1 @@\n+a\n");
     }

@@ -20,7 +20,9 @@
 //! is `plugin/agentmail.js`, embedded, with the binary's path in place of
 //! its placeholder; a `plugins/agentmail.js` that is not agentmail's, or
 //! is a symlink, is never replaced, and of a symlink uninstall removes
-//! only the link, even when agentmail created the file it replaced.
+//! only the link, even when agentmail created the file it replaced. A
+//! plugin the user edited is saved as its backup (or beside it) before it
+//! is replaced or removed, whether or not agentmail created it.
 //!
 //! opencode loads the user scope's `plugin/` and `plugins/`, then the
 //! project's, but runs only the first plugin of each `id`: an agentmail
@@ -330,27 +332,71 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
     Ok(file.change(new, !install, &strip))
 }
 
+/// Whether `text` is a plugin agentmail would write (for some binary):
+/// not a copy the user edited, nor an older agentmail's.
+fn pristine(text: &str) -> bool {
+    plugin_bin(text)
+        .and_then(|b| plugin_text(&b).ok())
+        .is_some_and(|t| t == text)
+}
+
+/// Where to save `before`, agentmail's plugin at `path`, before it is
+/// replaced or deleted, so that edits of the user's are never lost: nowhere
+/// when it is a plugin agentmail would write or its backup `bak` already
+/// holds it; else that backup, unless it holds something else to keep
+/// (`bak_kept`), then the first free `<backup>.<n>`.
+fn save_edits(path: &Path, before: &str, bak: Option<&str>, bak_kept: bool) -> Option<PathBuf> {
+    if pristine(before) || bak == Some(before) {
+        return None;
+    }
+    let backup = backup_path(path);
+    if !bak_kept {
+        return Some(backup);
+    }
+    (1..)
+        .map(|n| {
+            let mut s = backup.as_os_str().to_owned();
+            s.push(format!(".{n}"));
+            PathBuf::from(s)
+        })
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+}
+
 /// The plugin's change, if any.
 ///
 /// Install never writes through a symlink (the file it points to, perhaps
 /// a source checkout, is not agentmail's to change): it refuses. Uninstall
 /// removes agentmail's plugin, and of a symlink only the link: when
 /// agentmail did not create the file (no marker) and its backup is not
-/// agentmail's plugin, that backup is put back instead.
+/// agentmail's plugin, that backup is put back instead. A plugin the user
+/// edited (one agentmail would not write) is saved before it is replaced
+/// or deleted ([`save_edits`]), and a backup holding such a copy (or one
+/// that is not agentmail's plugin and is not put back) is kept; a new
+/// install keeps it too.
 fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>> {
     let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
     let before = read_opt(&path)?;
     let ours = before.as_deref().is_none_or(is_plugin);
+    let bak = read_opt(&backup_path(&path))?;
+    let bak_worth = bak.as_deref().is_some_and(|b| !pristine(b));
     if !install {
-        if before.is_none() || !ours {
+        let Some(text) = before.as_deref().filter(|_| ours) else {
             return Ok(None);
-        }
+        };
         let created = std::fs::symlink_metadata(created_marker_path(&path)).is_ok();
-        let restore = match read_opt(&backup_path(&path))? {
-            Some(b) if !link && !created && !is_plugin(&b) => Some(b),
+        let restore = match &bak {
+            Some(b) if !link && !created && !is_plugin(b) => Some(b.clone()),
             _ => None,
         };
+        // A restored backup is used up; any other worth keeping stays.
+        let keep_backup = restore.is_none() && bak_worth;
+        // The file a link points to is never touched: nothing to save.
+        let save = (!link)
+            .then(|| save_edits(&path, text, bak.as_deref(), keep_backup))
+            .flatten();
         return Ok(Some(Change {
+            keep_backup: keep_backup || save.as_ref() == Some(&backup_path(&path)),
+            save,
             path,
             before,
             after: restore,
@@ -377,14 +423,25 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
     if before.as_deref() == Some(after.as_str()) {
         return Ok(None);
     }
+    // A backup is written only where there is none: with one there already,
+    // an edited plugin is saved beside it.
+    let save = match (&before, &bak) {
+        (Some(text), Some(_)) => save_edits(&path, text, bak.as_deref(), bak_worth),
+        _ => None,
+    };
+    // A plugin that is not there yet starts a new record: any backup or
+    // marker of an earlier one no longer describes it, except a backup
+    // holding an edited agentmail plugin, which is kept.
+    let record_anew =
+        before.is_none() && !bak.as_deref().is_some_and(|b| is_plugin(b) && bak_worth);
     Ok(Some(Change {
         path,
-        // A plugin that is not there yet starts a new record: any backup or
-        // marker of an earlier one no longer describes it.
-        record_anew: before.is_none(),
+        record_anew,
         before,
         after: Some(after),
         unlink: false,
+        save,
+        keep_backup: false,
     }))
 }
 

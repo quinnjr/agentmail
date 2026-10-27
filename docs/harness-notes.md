@@ -916,7 +916,16 @@ them all.
   deletes it, and the `plugins/` (and config) directories when agentmail
   created them and they are empty. When agentmail did not create the
   plugin (no `.agentmail.created`) and its `.agentmail.bak` is not
-  agentmail's plugin, uninstall puts that backup back instead. A symlink
+  agentmail's plugin, uninstall puts that backup back instead. A plugin
+  file the user edited (its text is not what agentmail would write for
+  any binary, which includes an older agentmail's plugin) is never
+  discarded: before install or uninstall replaces or deletes it, its text
+  is saved as its `.agentmail.bak` (or, when that backup already holds
+  something else to keep, the first free `.agentmail.bak.<n>`), and the
+  command prints where (`removed ... (edited copy kept as ...)`, a line
+  after the diff with `--dry-run`, `saved` in `--json`). A backup holding
+  an edited agentmail plugin is kept by uninstall and by a new install;
+  one holding a plugin agentmail would write goes with the plugin. A symlink
   at `plugins/agentmail.js` (a dev or dotfiles setup) is never written
   through: install refuses it, and uninstall removes only the link,
   leaving the file it points to and any backup beside it, also when
