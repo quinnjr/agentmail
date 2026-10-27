@@ -397,6 +397,30 @@ fn copy_new(from: &Path, to: &Path) -> std::io::Result<()> {
     copied
 }
 
+/// What to do by hand with a config agentmail cannot read.
+enum ByHand<'a> {
+    /// Install: the entry to add (a snippet), made only when needed.
+    Add(&'a dyn Fn() -> String),
+    /// Uninstall: where agentmail's entry is, to remove.
+    Remove(&'a str),
+}
+
+impl ByHand<'_> {
+    /// The advice, for a file that cannot be parsed (`unparsable`) or is
+    /// not a JSON object.
+    fn advice(&self, unparsable: bool) -> String {
+        match self {
+            ByHand::Add(entry) if unparsable => {
+                format!("Fix it, or add this by hand:\n{}", entry())
+            }
+            ByHand::Add(entry) => format!("Add this by hand:\n{}", entry()),
+            ByHand::Remove(entry) => format!(
+                "Fix it, or remove agentmail's entry ({entry}) by hand, then run the uninstall again."
+            ),
+        }
+    }
+}
+
 /// A JSON config file as read for planning.
 ///
 /// Later install tasks build on it: [`JsonFile::read`] the file, edit a
@@ -414,21 +438,21 @@ struct JsonFile {
 
 impl JsonFile {
     /// Read `path`; a missing or blank file is an empty object. Text that is
-    /// not a JSON object is refused, naming `entry` (what agentmail would
-    /// add) so the user can add it by hand.
-    fn read(path: PathBuf, entry: &dyn Fn() -> String) -> Result<JsonFile> {
+    /// not a JSON object is refused with `hand`'s advice: the entry to add
+    /// by hand on install, the one to remove on uninstall.
+    fn read(path: PathBuf, hand: ByHand) -> Result<JsonFile> {
         let before = read_opt(&path)?;
         let value = match json::parse(before.as_deref().unwrap_or("")) {
             Ok(Value::Object(m)) => m,
             Ok(_) => bail!(
-                "{} is not a JSON object; agentmail left it unchanged. Add this by hand:\n{}",
+                "{} is not a JSON object; agentmail left it unchanged. {}",
                 path.display(),
-                entry()
+                hand.advice(false)
             ),
             Err(e) => bail!(
-                "cannot parse {}: {e}; agentmail left it unchanged. Fix it, or add this by hand:\n{}",
+                "cannot parse {}: {e}; agentmail left it unchanged. {}",
                 path.display(),
-                entry()
+                hand.advice(true)
             ),
         };
         // Only the marker says agentmail created the file. A backup, even

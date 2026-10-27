@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::{Change, Env, InstallOpts, JsonFile, bin_str, merge_keys, object_at, read_opt};
+use super::{ByHand, Change, Env, InstallOpts, JsonFile, bin_str, merge_keys, object_at, read_opt};
 
 /// The plugin as shipped.
 const PLUGIN: &str = include_str!("../../plugin/agentmail.js");
@@ -153,23 +153,35 @@ fn has_entry(v: &Map<String, Value>) -> bool {
 
 /// The config at `path` parsed as opencode reads it (JSONC), and whether
 /// it has JSONC syntax; `None` when it does not exist.
-fn load(path: &Path, bin: &str) -> Result<Option<(Map<String, Value>, bool)>> {
+fn load(path: &Path, install: bool, bin: &str) -> Result<Option<(Map<String, Value>, bool)>> {
     let Some(text) = read_opt(path)? else {
         return Ok(None);
     };
     let bare = super::json::strip_jsonc(&text);
+    let entry = || snippet(bin);
+    let hand = by_hand(install, &entry);
     match super::json::parse(bare.as_deref().unwrap_or(&text)) {
         Ok(Value::Object(m)) => Ok(Some((m, bare.is_some()))),
         Ok(_) => bail!(
-            "{} is not a JSON object; agentmail left it unchanged. Add this by hand:\n{}",
+            "{} is not a JSON object; agentmail left it unchanged. {}",
             path.display(),
-            snippet(bin)
+            hand.advice(false)
         ),
         Err(e) => bail!(
-            "cannot parse {}: {e}; agentmail left it unchanged. Fix it, or add this by hand:\n{}",
+            "cannot parse {}: {e}; agentmail left it unchanged. {}",
             path.display(),
-            snippet(bin)
+            hand.advice(true)
         ),
+    }
+}
+
+/// What to do by hand with a config that cannot be read: add `entry` on
+/// install, remove agentmail's entries on uninstall.
+fn by_hand<'a>(install: bool, entry: &'a dyn Fn() -> String) -> ByHand<'a> {
+    if install {
+        ByHand::Add(entry)
+    } else {
+        ByHand::Remove("`mcp.servers.agentmail` / `mcp.agentmail`")
     }
 }
 
@@ -184,7 +196,7 @@ fn snippet(bin: &str) -> String {
 
 /// The config's change, if any.
 fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>> {
-    if let Some((value, true)) = load(&path, bin)? {
+    if let Some((value, true)) = load(&path, install, bin)? {
         // JSONC: check whether the file is already as it should be; never
         // write it.
         let mut new = value.clone();
@@ -218,7 +230,8 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
             path.display()
         );
     }
-    let file = JsonFile::read(path, &|| snippet(bin))?;
+    let entry = || snippet(bin);
+    let file = JsonFile::read(path, by_hand(install, &entry))?;
     let mut new = file.value.clone();
     edit(&mut new, install, bin, &file.path)?;
     Ok(file.change(new, !install, &strip))
@@ -264,7 +277,7 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
     // uninstall removes it from all.
     let mut targets = Vec::new();
     for path in configs.iter().chain(&overrides) {
-        if !install || load(path, bin)?.is_some_and(|(v, _)| has_entry(&v)) {
+        if !install || load(path, install, bin)?.is_some_and(|(v, _)| has_entry(&v)) {
             targets.push(path.clone());
         }
     }

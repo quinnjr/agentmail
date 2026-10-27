@@ -764,6 +764,31 @@ fn invalid_json_is_refused_unchanged() {
 }
 
 #[test]
+fn unparsable_config_on_uninstall_says_remove_not_add() {
+    let h = Home::new();
+    for (path, text) in [
+        (h.settings(), "{\"hooks\": "),
+        (h.settings(), "[]\n"),
+        (h.user_mcp(), "{\"mcpServers\": "),
+        (h.user_mcp(), "[]\n"),
+    ] {
+        let _ = std::fs::remove_file(h.settings());
+        let _ = std::fs::remove_file(h.user_mcp());
+        write(&path, text);
+        let err = install::plan_uninstall(&opts(false, BIN), &h.env(&[])).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains("remove agentmail's entry"), "{msg}");
+        assert!(msg.contains("run the uninstall again"), "{msg}");
+        assert!(!msg.contains("add this by hand"), "{msg}");
+        assert!(!msg.contains("Add this by hand"), "{msg}");
+        assert!(!msg.contains("PreToolUse"), "no hook snippet: {msg}");
+        assert!(!msg.contains("\"command\""), "no snippet: {msg}");
+        assert_eq!(read(&path), text);
+    }
+}
+
+#[test]
 fn apply_refuses_file_changed_since_plan() {
     let h = Home::new();
     write(&h.settings(), "{}\n");
@@ -1382,6 +1407,30 @@ fn opencode_legacy_entry_beside_servers_entry_is_carried_over() {
         v["mcp"]["servers"]["agentmail"],
         json!({"type": "local", "command": [BIN, "mcp"], "timeout": 9, "codemode": false, "environment": {"A": "1"}, "cwd": "/w", "protocol": "x", "disabled": true})
     );
+}
+
+#[test]
+fn opencode_unparsable_config_on_uninstall_says_remove_not_add() {
+    let h = Home::new();
+    for text in ["{\"mcp\": ", "[]\n"] {
+        write(&h.oc_config(), text);
+        let err = install::plan_uninstall(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("opencode.json"), "{msg}");
+        assert!(msg.contains("remove agentmail's entry"), "{msg}");
+        assert!(msg.contains("mcp.servers.agentmail"), "{msg}");
+        assert!(msg.contains("run the uninstall again"), "{msg}");
+        assert!(!msg.contains("add this by hand"), "{msg}");
+        assert!(!msg.contains("Add this by hand"), "{msg}");
+        assert!(!msg.contains("\"codemode\""), "no snippet: {msg}");
+        assert_eq!(read(&h.oc_config()), text);
+        // Install still offers the entry to add.
+        let err = install::plan_install(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("\"codemode\": false"),
+            "{err:#}"
+        );
+    }
 }
 
 #[test]

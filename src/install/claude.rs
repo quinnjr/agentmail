@@ -15,8 +15,8 @@ use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
 
 use super::{
-    Change, Env, InstallOpts, JsonFile, bin_str, merge_keys, object_at, owns_hook, shell_quote,
-    shell_words,
+    ByHand, Change, Env, InstallOpts, JsonFile, bin_str, merge_keys, object_at, owns_hook,
+    shell_quote, shell_words,
 };
 
 /// Timeout for the quick hooks, in seconds.
@@ -264,7 +264,14 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
             .collect();
         super::json::pretty(&json!({"hooks": hooks}), "  ", "")
     };
-    let settings = JsonFile::read(settings_path, &snippet)?;
+    let settings = JsonFile::read(
+        settings_path,
+        if install {
+            ByHand::Add(&snippet)
+        } else {
+            ByHand::Remove("the `agentmail hook` commands under `hooks`")
+        },
+    )?;
     let mut new = settings.value.clone();
     if install {
         let hooks = object_at(&mut new, "hooks", &settings.path)?;
@@ -275,7 +282,14 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
 
     let mcp_snippet =
         || super::json::pretty(&json!({"mcpServers": {"agentmail": server(bin)}}), "  ", "");
-    let mcp = JsonFile::read(mcp_path, &mcp_snippet)?;
+    let mcp = JsonFile::read(
+        mcp_path,
+        if install {
+            ByHand::Add(&mcp_snippet)
+        } else {
+            ByHand::Remove("`mcpServers.agentmail`")
+        },
+    )?;
     let mut new_mcp = mcp.value.clone();
     if install {
         let servers = object_at(&mut new_mcp, "mcpServers", &mcp.path)?;
