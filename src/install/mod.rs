@@ -152,7 +152,8 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// Make `changes`. First checks that every file still has the text it was
 /// planned from (else nothing is written: run the command again). Then, per
 /// file: saves the original as `<path>.agentmail.bak` unless a backup is
-/// already there, or, for a file that does not exist yet, records that
+/// already there or agentmail created the file (its marker is there: there
+/// is no original), or, for a file that does not exist yet, records that
 /// agentmail creates it (and the directories it creates for it) in
 /// `<path>.agentmail.created`. With [`Change::record_anew`] the earlier
 /// record is dropped first: the backup is replaced (or removed, for a file
@@ -297,7 +298,11 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
                 remove_if_there(&marker)?;
             }
         }
-    } else if let Some(before) = &c.before {
+    } else if let Some(before) = &c.before
+        // A file agentmail created had no original to keep: a backup of
+        // agentmail's own earlier text would only be left behind.
+        && std::fs::symlink_metadata(&marker).is_err()
+    {
         write_backup(&bak, perms.as_ref(), |f| f.write_all(before.as_bytes()))
             .with_context(|| format!("writing {}", bak.display()))?;
     }

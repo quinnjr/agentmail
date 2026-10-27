@@ -414,17 +414,19 @@ fn claude_uninstall_keeps_files_that_were_empty_objects() {
 
 #[test]
 fn claude_files_agentmail_created_go_even_after_reinstall() {
-    // A reinstall backs up the file agentmail itself created; uninstall
-    // still sees that agentmail created it.
+    // A reinstall keeps no backup of the file agentmail itself created (it
+    // had no original); uninstall still sees that agentmail created it.
     let h = Home::new();
     let env = h.env(&[]);
     install(&opts(false, "/old/agentmail"), &env);
     install(&opts(false, BIN), &env);
-    assert!(bak(&h.settings()).exists());
+    assert!(!bak(&h.settings()).exists());
+    assert!(!bak(&h.user_mcp()).exists());
+    assert!(marker(&h.settings()).exists());
     uninstall(&opts(false, BIN), &env);
     assert!(!h.settings().exists());
     assert!(!h.user_mcp().exists());
-    // The backups held only agentmail's entries: nothing is left behind.
+    // Nothing is left behind.
     assert!(!bak(&h.settings()).exists());
     assert!(!bak(&h.user_mcp()).exists());
     assert!(!marker(&h.settings()).exists());
@@ -1100,13 +1102,34 @@ fn oc_server(bin: &str) -> Value {
     json!({"type": "local", "command": [bin, "mcp"], "codemode": false})
 }
 
-/// The plugin as shipped, with `bin` in place of the placeholder.
+/// The plugin as shipped, with `bin` in place of the placeholder, signed.
 fn oc_plugin_text(bin: &str) -> String {
     let src = include_str!("../plugin/agentmail.js");
-    src.replace(
+    oc_sign(src.replace(
         "\"__AGENTMAIL_BIN__\"",
         &serde_json::to_string(bin).unwrap(),
-    )
+    ))
+}
+
+/// `body` with the digest line agentmail ends its plugin with: FNV-1a (64
+/// bits) of the text above it.
+fn oc_sign(mut body: String) -> String {
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let digest = body.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    body.push_str(&format!("// agentmail-digest: fnv1a64:{digest:016x}\n"));
+    body
+}
+
+/// The plugin an older agentmail installed for `bin`: other text, signed
+/// as every version signs it.
+fn oc_older_plugin(bin: &str, version: u32) -> String {
+    let text = oc_plugin_text(bin);
+    let body = &text[..text.trim_end_matches('\n').rfind('\n').unwrap() + 1];
+    oc_sign(body.replacen('\n', &format!("\n// shipped by agentmail 0.{version}\n"), 1))
 }
 
 /// A user's opencode.json in the V2 shape, with another server, a plugin
@@ -2002,6 +2025,66 @@ fn opencode_edited_plugin_is_kept_on_uninstall() {
 }
 
 #[test]
+fn opencode_upgrade_of_a_plugin_agentmail_created_leaves_no_backup() {
+    // Each agentmail version ships its own plugin text: replacing an older
+    // version's (untouched) plugin keeps no copy of it, and uninstall
+    // leaves nothing behind, not even the `plugins/` directory agentmail
+    // created.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let plugins = h.oc_plugin().parent().unwrap().to_path_buf();
+    install(&oc_opts(false, BIN), &env);
+    assert!(marker(&h.oc_plugin()).exists());
+    for version in [1, 2] {
+        write(&h.oc_plugin(), &oc_older_plugin(BIN, version));
+        let changes = install(&oc_opts(false, BIN), &env);
+        let plugin = changes.iter().find(|c| c.path == h.oc_plugin()).unwrap();
+        assert_eq!(plugin.save, None);
+        assert_eq!(read(&h.oc_plugin()), oc_plugin_text(BIN));
+        assert!(!bak(&h.oc_plugin()).exists());
+    }
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!h.oc_plugin().exists());
+    assert!(!bak(&h.oc_plugin()).exists());
+    assert!(!plugins.exists(), "{}", plugins.display());
+
+    // An older version's plugin agentmail did not create: its backup holds
+    // that plugin, no edits are kept beside it on upgrade, and uninstall
+    // removes both.
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(&h.oc_plugin(), &oc_older_plugin("/old/agentmail", 1));
+    install(&oc_opts(false, BIN), &env);
+    write(&h.oc_plugin(), &oc_older_plugin(BIN, 2));
+    let changes = install(&oc_opts(false, BIN), &env);
+    let plugin = changes.iter().find(|c| c.path == h.oc_plugin()).unwrap();
+    assert_eq!(plugin.save, None);
+    let spare = PathBuf::from(format!("{}.1", bak(&h.oc_plugin()).display()));
+    assert!(!spare.exists());
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!h.oc_plugin().exists());
+    assert!(!bak(&h.oc_plugin()).exists());
+}
+
+#[test]
+fn opencode_edited_plugin_agentmail_created_is_saved_on_upgrade() {
+    // With no backup (agentmail created the file), an edited plugin that
+    // install replaces is saved as the backup, which uninstall keeps.
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&oc_opts(false, "/old/agentmail"), &env);
+    let edited = oc_edited_plugin("/old/agentmail");
+    write(&h.oc_plugin(), &edited);
+    let changes = install(&oc_opts(false, BIN), &env);
+    let plugin = changes.iter().find(|c| c.path == h.oc_plugin()).unwrap();
+    assert_eq!(plugin.save.as_deref(), Some(bak(&h.oc_plugin()).as_path()));
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!h.oc_plugin().exists());
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
+}
+
+#[test]
 fn opencode_edited_plugin_is_kept_when_its_backup_is_restored() {
     let h = Home::new();
     let env = h.env(&[]);
@@ -2040,6 +2123,48 @@ fn opencode_edited_plugin_is_kept_on_reinstall() {
     write(&h.oc_plugin(), &edited);
     install(&oc_opts(false, BIN), &env);
     assert_eq!(read(&bak(&h.oc_plugin())), edited);
+}
+
+#[test]
+fn cli_opencode_upgrade_keeps_no_original_it_did_not_find() {
+    // agentmail created the plugin: replacing an older version's keeps no
+    // "original", and says none.
+    let h = Home::new();
+    let plugin = h.oc_plugin();
+    let run = |args: &[&str]| {
+        let out = cli(&h)
+            .env_remove("XDG_CONFIG_HOME")
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    run(&["install", "--harness", "opencode"]);
+    write(&plugin, &oc_older_plugin("/old/agentmail", 1));
+    let out = run(&["install", "--harness", "opencode"]);
+    assert!(
+        out.contains(&format!("updated {}\n", plugin.display())),
+        "{out}"
+    );
+    assert!(!out.contains("kept as"), "{out}");
+    write(&plugin, &oc_older_plugin("/old/agentmail", 2));
+    let out = run(&["--json", "install", "--harness", "opencode"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let entry = v["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == plugin.display().to_string())
+        .unwrap();
+    assert_eq!(entry["backup"], Value::Null, "{out}");
+    assert_eq!(entry["saved"], Value::Null, "{out}");
+    run(&["uninstall", "--harness", "opencode"]);
+    assert!(!plugin.exists());
+    assert!(!bak(&plugin).exists());
+    assert!(!plugin.parent().unwrap().exists());
 }
 
 #[test]

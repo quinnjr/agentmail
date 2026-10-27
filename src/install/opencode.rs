@@ -21,7 +21,8 @@
 //! its placeholder; a `plugins/agentmail.js` that is not agentmail's, or
 //! is a symlink, is never replaced, and of a symlink uninstall removes
 //! only the link, even when agentmail created the file it replaced. A
-//! plugin the user edited is saved as its backup (or beside it) before it
+//! plugin the user edited (one without the digest line that ends every
+//! plugin agentmail writes) is saved as its backup (or beside it) before it
 //! is replaced or removed, whether or not agentmail created it.
 //!
 //! opencode loads the user scope's `plugin/` and `plugins/`, then the
@@ -47,6 +48,9 @@ const PLUGIN: &str = include_str!("../../plugin/agentmail.js");
 const PLACEHOLDER: &str = "\"__AGENTMAIL_BIN__\"";
 /// The plugin's first line, which marks a file as agentmail's plugin.
 const PLUGIN_HEAD: &str = "// agentmail for opencode";
+/// The start of the plugin's last line as installed, which signs the text
+/// above it (see [`sign`]).
+const DIGEST_PREFIX: &str = "// agentmail-digest: fnv1a64:";
 
 /// The keys of the MCP server entry that agentmail sets; others (such as
 /// `environment` or `disabled`) are kept.
@@ -173,12 +177,38 @@ fn server(bin: &str) -> Value {
     json!({"type": "local", "command": [bin, "mcp"], "codemode": false})
 }
 
-/// The plugin with `bin` in place of its placeholder.
+/// The plugin with `bin` in place of its placeholder, signed ([`sign`]).
 fn plugin_text(bin: &str) -> Result<String> {
     if PLUGIN.matches(PLACEHOLDER).count() != 1 {
         bail!("the embedded opencode plugin has no single binary placeholder");
     }
-    Ok(PLUGIN.replacen(PLACEHOLDER, &serde_json::to_string(bin)?, 1))
+    Ok(sign(PLUGIN.replacen(
+        PLACEHOLDER,
+        &serde_json::to_string(bin)?,
+        1,
+    )))
+}
+
+/// `body` with a last line holding its digest: whatever text a version of
+/// agentmail installs, the file says itself that agentmail wrote it as it
+/// is, so a plugin an older agentmail installed is told from one the user
+/// edited ([`pristine`]) without a list of every plugin ever shipped. The
+/// digest (FNV-1a, 64 bits, of the text above the line) only tells edits
+/// apart; it must never change, or every plugin installed before would
+/// count as edited.
+fn sign(mut body: String) -> String {
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let digest = fnv1a64(body.as_bytes());
+    body.push_str(&format!("{DIGEST_PREFIX}{digest:016x}\n"));
+    body
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn is_plugin(text: &str) -> bool {
@@ -332,19 +362,24 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
     Ok(file.change(new, !install, &strip))
 }
 
-/// Whether `text` is a plugin agentmail would write (for some binary):
-/// not a copy the user edited, nor an older agentmail's.
+/// Whether `text` is a plugin some version of agentmail wrote, as it
+/// wrote it (for any binary): its last line is the digest of the text
+/// above ([`sign`]). A copy the user edited is not.
 fn pristine(text: &str) -> bool {
-    plugin_bin(text)
-        .and_then(|b| plugin_text(&b).ok())
-        .is_some_and(|t| t == text)
+    let Some(body) = text.strip_suffix('\n') else {
+        return false;
+    };
+    let cut = body.rfind('\n').map_or(0, |i| i + 1);
+    let (body, last) = text.split_at(cut);
+    is_plugin(body) && last.starts_with(DIGEST_PREFIX) && sign(body.to_string()) == text
 }
 
 /// Where to save `before`, agentmail's plugin at `path`, before it is
 /// replaced or deleted, so that edits of the user's are never lost: nowhere
-/// when it is a plugin agentmail would write or its backup `bak` already
-/// holds it; else that backup, unless it holds something else to keep
-/// (`bak_kept`), then the first free `<backup>.<n>`.
+/// when it is a plugin some agentmail version wrote, as it wrote it
+/// ([`pristine`]), or its backup `bak` already holds it; else that backup,
+/// unless it holds something else to keep (`bak_kept`), then the first free
+/// `<backup>.<n>`.
 fn save_edits(path: &Path, before: &str, bak: Option<&str>, bak_kept: bool) -> Option<PathBuf> {
     if pristine(before) || bak == Some(before) {
         return None;
@@ -423,10 +458,15 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
     if before.as_deref() == Some(after.as_str()) {
         return Ok(None);
     }
-    // A backup is written only where there is none: with one there already,
-    // an edited plugin is saved beside it.
+    // A backup of the file before agentmail is written only where there is
+    // none and agentmail did not create the file (an earlier version's
+    // plugin is no original to keep: [`apply`] writes none). Otherwise an
+    // edited plugin is saved, as the backup when there is none, else
+    // beside it.
+    let created = std::fs::symlink_metadata(created_marker_path(&path)).is_ok();
     let save = match (&before, &bak) {
         (Some(text), Some(_)) => save_edits(&path, text, bak.as_deref(), bak_worth),
+        (Some(text), None) if created => save_edits(&path, text, None, false),
         _ => None,
     };
     // A plugin that is not there yet starts a new record: any backup or

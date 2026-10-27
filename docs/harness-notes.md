@@ -515,7 +515,9 @@ Checked live against Claude Code 2.1.311 in a throwaway
   first writes `<file>.agentmail.created`, listing the directories it
   creates for the file (`.claude/` in a project, `~/.claude/` or
   `$CLAUDE_CONFIG_DIR`). An uninstall that empties such a file deletes it
-  with its backup and marker, then those directories once empty. Any other
+  with its backup and marker, then those directories once empty. A
+  reinstall into a file agentmail created writes no backup (there was no
+  original), so the file says "updated" with no "original kept as". Any other
   file is kept, even one that held only agentmail's entries (one added by
   hand with `claude mcp add`, say): it is left as `{}` and its backup
   stays.
@@ -917,15 +919,23 @@ them all.
   created them and they are empty. When agentmail did not create the
   plugin (no `.agentmail.created`) and its `.agentmail.bak` is not
   agentmail's plugin, uninstall puts that backup back instead. A plugin
-  file the user edited (its text is not what agentmail would write for
-  any binary, which includes an older agentmail's plugin) is never
-  discarded: before install or uninstall replaces or deletes it, its text
+  file the user edited is never discarded. Install ends the plugin with
+  a digest line (`// agentmail-digest: fnv1a64:<hex>`, FNV-1a of the text
+  above it), so any version's plugin, as that version wrote it for any
+  binary, is told from an edited one without a list of every plugin ever
+  shipped; one without a matching digest counts as edited, and so is
+  never lost: before install or uninstall replaces or deletes it, its text
   is saved as its `.agentmail.bak` (or, when that backup already holds
   something else to keep, the first free `.agentmail.bak.<n>`), and the
   command prints where (`removed ... (edited copy kept as ...)`, a line
   after the diff with `--dry-run`, `saved` in `--json`). A backup holding
   an edited agentmail plugin is kept by uninstall and by a new install;
-  one holding a plugin agentmail would write goes with the plugin. A symlink
+  one holding a plugin agentmail would write goes with the plugin. An
+  upgrade over an untouched older plugin keeps no copy of it, and when
+  agentmail created the plugin no `.agentmail.bak` of its own earlier
+  text is written either (it had no original; this holds for every file
+  agentmail created), so upgrades leave no backups behind and uninstall
+  still removes `plugins/`. A symlink
   at `plugins/agentmail.js` (a dev or dotfiles setup) is never written
   through: install refuses it, and uninstall removes only the link,
   leaving the file it points to and any backup beside it, also when

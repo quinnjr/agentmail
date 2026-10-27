@@ -823,11 +823,18 @@ fn install(
         (Some(_), Some(_)) => "update",
         (Some(_), None) => "delete",
     };
+    // An updated file's original is kept as its backup, unless agentmail
+    // created the file (its marker is still there): it had none.
+    let original_kept = |c: &inst::Change| {
+        c.before.is_some()
+            && c.after.is_some()
+            && std::fs::symlink_metadata(inst::created_marker_path(&c.path)).is_err()
+    };
     if json {
         let list: Vec<Value> = changes
             .iter()
             .map(|c| {
-                let backup = (c.before.is_some() && (c.after.is_some() || c.keep_backup)
+                let backup = ((original_kept(c) || (c.before.is_some() && c.keep_backup))
                     && !dry_run)
                     .then(|| inst::backup_path(&c.path).display().to_string());
                 let saved = c
@@ -874,7 +881,7 @@ fn install(
         };
         let bak = inst::backup_path(&c.path);
         let mut kept = Vec::new();
-        if c.before.is_some() && c.after.is_some() && c.save.as_ref() != Some(&bak) {
+        if original_kept(c) && c.save.as_ref() != Some(&bak) {
             kept.push(format!("original kept as {}", bak.display()));
         }
         match &c.save {
