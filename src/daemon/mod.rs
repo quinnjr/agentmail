@@ -32,7 +32,8 @@ use crate::protocol::{
 };
 use crate::store::Store;
 
-/// How often the daemon checks that its socket file is still its own.
+/// How often the daemon checks that its socket and lock files are still its
+/// own.
 const SOCKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// How many times a starting daemon tries to take the lock before deciding
 /// another daemon holds it: about half a second in all. A probe holds the
@@ -319,8 +320,8 @@ fn fired<F: Future<Output = ()>>(stop: Pin<&mut F>) -> bool {
     stop.now_or_never().is_some()
 }
 
-/// Run the daemon until a client sends `Shutdown` or the socket file is
-/// removed or replaced. See [`serve_until`].
+/// Run the daemon until a client sends `Shutdown` or the socket or lock
+/// file is removed or replaced. See [`serve_until`].
 pub async fn serve(cfg: DaemonConfig) -> Result<()> {
     serve_until(cfg, std::future::pending()).await
 }
@@ -427,6 +428,14 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     }
     write_lock_record(&lock, &paths.lock, &record);
     drop(waiter);
+    // The lock file this daemon holds. Once it is gone (the data directory
+    // was removed, say a test's temporary one) the daemon stops serving:
+    // its store is gone with it, and a successor could take a new lock.
+    let lock_id = lock
+        .metadata()
+        .map(|m| (m.dev(), m.ino()))
+        .with_context(|| format!("reading {}", paths.lock.display()))
+        .map_err(|e| record_startup_error(&paths, e))?;
 
     let Some(store) = open_store(&paths.db, stop.as_mut())
         .await
@@ -496,7 +505,9 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
                 }
             },
             _ = check.tick() => {
-                if file_id(&paths.socket) != Some(socket_id) {
+                if file_id(&paths.socket) != Some(socket_id)
+                    || file_id(&paths.lock) != Some(lock_id)
+                {
                     break;
                 }
             }

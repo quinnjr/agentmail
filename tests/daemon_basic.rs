@@ -682,6 +682,24 @@ async fn daemon_exits_when_its_socket_is_removed() {
     }
 }
 
+#[tokio::test]
+async fn daemon_exits_when_its_lock_file_is_removed() {
+    // As when the data directory goes (a test's temporary one) while the
+    // socket file is left, or is created after the removal began.
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let mut c = Client::connect_or_spawn_with(&paths, &bin()).await.unwrap();
+    let pid = hello_pid(&mut c).await;
+    assert_sole_daemon(&paths.data_dir, pid as u32);
+    std::fs::remove_file(&paths.lock).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !daemons_for(&paths.data_dir).is_empty() {
+        assert!(Instant::now() < deadline, "daemon kept running");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!paths.socket.exists(), "the socket was left behind");
+}
+
 #[test]
 fn daemon_cli_start_status_stop() {
     let dir = TempDir::new().unwrap();
