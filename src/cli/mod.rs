@@ -814,6 +814,7 @@ fn install(
     } else {
         inst::plan_install(&o, &env)?
     };
+    let notes = inst::notes(&o, &env, !uninstall)?;
     if !dry_run {
         inst::apply(&changes)?;
     }
@@ -834,7 +835,9 @@ fn install(
         let restart = (!dry_run)
             .then(|| restart_hint(harness, uninstall, &changes))
             .flatten();
-        print_json(&json!({"dry_run": dry_run, "changes": list, "restart": restart}))?;
+        print_json(
+            &json!({"dry_run": dry_run, "changes": list, "restart": restart, "notes": notes}),
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
     let name = harness_title(harness);
@@ -844,6 +847,9 @@ fn install(
         }
         if changes.is_empty() {
             print_line("nothing to change")?;
+        }
+        for n in &notes {
+            print_line(n)?;
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -880,6 +886,9 @@ fn install(
     print_line(&summary)?;
     if let Some(hint) = restart_hint(harness, uninstall, &changes) {
         print_line(&hint)?;
+    }
+    for n in &notes {
+        print_line(n)?;
     }
     Ok(ExitCode::SUCCESS)
 }

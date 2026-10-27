@@ -993,7 +993,7 @@ fn cli_json_reports_changes() {
         json!({"dry_run": false, "changes": [
             {"path": settings, "action": "update", "backup": bak(&h.settings()).display().to_string()},
             {"path": mcp, "action": "create", "backup": null},
-        ], "restart": "Restart running Claude Code sessions to load it."})
+        ], "restart": "Restart running Claude Code sessions to load it.", "notes": []})
     );
     let out = cli(&h)
         .args([
@@ -1014,7 +1014,7 @@ fn cli_json_reports_changes() {
         json!({"dry_run": true, "changes": [
             {"path": settings, "action": "update", "backup": null},
             {"path": mcp, "action": "delete", "backup": null},
-        ], "restart": null})
+        ], "restart": null, "notes": []})
     );
 }
 
@@ -1824,8 +1824,9 @@ fn opencode_plugin_agentmail_did_not_create_is_restored_or_removed() {
 
 #[test]
 fn opencode_plugin_in_singular_plugin_dir_is_removed() {
-    // opencode also loads `plugin/`: a copy there would run beside the
-    // installed one and surface every message twice.
+    // opencode also loads `plugin/`, before `plugins/`, and runs only the
+    // first plugin of each id: a copy there would shadow the installed one,
+    // which would never run.
     let h = Home::new();
     let env = h.env(&[]);
     let legacy = h.oc_dir().join("plugin/agentmail.js");
@@ -1860,4 +1861,119 @@ fn opencode_plugin_in_singular_plugin_dir_is_removed() {
     write(&legacy, &oc_plugin_text("/old/agentmail"));
     install(&oc_opts(true, BIN), &env);
     assert!(!legacy.exists());
+}
+
+#[test]
+fn opencode_plugin_in_other_scope_is_noted() {
+    // opencode runs one plugin per id, the first loaded, and loads the user
+    // scope before the project: the user's agentmail plugin shadows the
+    // project's.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let dev = "/home/dev/agentmail/target/debug/agentmail";
+    let project = h.proj().join(".opencode/plugins/agentmail.js");
+    let user = h.oc_plugin().display().to_string();
+    // Nothing in the other scope: no note.
+    assert!(
+        install::notes(&oc_opts(true, dev), &env, true)
+            .unwrap()
+            .is_empty()
+    );
+    install(&oc_opts(false, BIN), &env);
+    // The same binary in both scopes: no note.
+    assert!(
+        install::notes(&oc_opts(true, BIN), &env, true)
+            .unwrap()
+            .is_empty()
+    );
+    // A project install for another binary: the user's plugin wins.
+    let notes = install::notes(&oc_opts(true, dev), &env, true).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("note: "), "{notes:?}");
+    assert!(!notes[0].contains('\n'), "{notes:?}");
+    assert!(notes[0].contains(&user), "{notes:?}");
+    assert!(notes[0].contains(BIN), "{notes:?}");
+    install(&oc_opts(true, dev), &env);
+    // A user install for another binary than the project's: it wins there.
+    let notes = install::notes(&oc_opts(false, "/usr/bin/agentmail"), &env, true).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(&project.display().to_string()),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains(dev), "{notes:?}");
+    // Uninstalling the user scope hands over to the project's plugin.
+    let notes = install::notes(&oc_opts(false, BIN), &env, false).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(&project.display().to_string()),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains(dev), "{notes:?}");
+    // Uninstalling the project scope changes nothing that runs.
+    assert!(
+        install::notes(&oc_opts(true, dev), &env, false)
+            .unwrap()
+            .is_empty()
+    );
+    uninstall(&oc_opts(false, BIN), &env);
+    // With no user plugin left, uninstalling the user scope notes nothing.
+    assert!(
+        install::notes(&oc_opts(false, BIN), &env, false)
+            .unwrap()
+            .is_empty()
+    );
+    // The other scope's `plugin/` counts too, and a plugin there whose
+    // binary cannot be read differs from any.
+    let legacy = h.oc_dir().join("plugin/agentmail.js");
+    write(
+        &legacy,
+        "// agentmail for opencode (an old one)\nexport default {};\n",
+    );
+    let notes = install::notes(&oc_opts(true, dev), &env, true).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(&legacy.display().to_string()),
+        "{notes:?}"
+    );
+    // Not for Claude Code.
+    assert!(
+        install::notes(&opts(true, BIN), &env, true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cli_opencode_notes_plugin_in_other_scope() {
+    let h = Home::new();
+    let user = h.oc_plugin();
+    write(&user, &oc_plugin_text("/somewhere/else/agentmail"));
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["install", "--harness", "opencode", "--project"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let note = out
+        .lines()
+        .find(|l| l.starts_with("note: "))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(note.contains(&user.display().to_string()), "{out}");
+    assert!(note.contains("/somewhere/else/agentmail"), "{out}");
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--json", "install", "--harness", "opencode", "--project"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    let notes = v["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "{v}");
+    assert!(notes[0].as_str().unwrap().starts_with("note: "), "{v}");
 }

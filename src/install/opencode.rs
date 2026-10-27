@@ -20,9 +20,14 @@
 //! is `plugin/agentmail.js`, embedded, with the binary's path in place of
 //! its placeholder; a `plugins/agentmail.js` that is not agentmail's, or
 //! is a symlink, is never replaced, and of a symlink uninstall removes
-//! only the link. opencode also loads plugins from `plugin/`: an
-//! agentmail plugin there is removed by install and uninstall alike, so
-//! only one copy ever runs.
+//! only the link.
+//!
+//! opencode loads the user scope's `plugin/` and `plugins/`, then the
+//! project's, but runs only the first plugin of each `id`: an agentmail
+//! plugin left in `plugin/` would shadow the installed one, which would
+//! never run, so install and uninstall alike remove it. Likewise the user
+//! scope's plugin shadows the project's; [`notes`] says when the one that
+//! runs is for another binary (see `docs/harness-notes.md`).
 
 use std::path::{Path, PathBuf};
 
@@ -62,22 +67,102 @@ fn files(o: &InstallOpts, env: &Env) -> (Vec<PathBuf>, Vec<PathBuf>, PathBuf) {
             .filter(|p| std::fs::symlink_metadata(p).is_ok())
             .collect()
     };
-    let (dir, overrides, plugins) = if o.project {
-        let dot = env.cwd.join(".opencode");
-        (env.cwd.clone(), existing(&dot), dot.join("plugins"))
+    let (dir, overrides) = if o.project {
+        (env.cwd.clone(), existing(&env.cwd.join(".opencode")))
     } else {
-        let dir = match env.dir_var("XDG_CONFIG_HOME") {
-            Some(d) => d.join("opencode"),
-            None => env.home.join(".config").join("opencode"),
-        };
-        let plugins = dir.join("plugins");
-        (dir, Vec::new(), plugins)
+        (user_dir(env), Vec::new())
     };
     let mut configs = existing(&dir);
     if configs.is_empty() {
         configs.push(dir.join("opencode.json"));
     }
-    (configs, overrides, plugins.join("agentmail.js"))
+    (
+        configs,
+        overrides,
+        plugin_dir(o.project, env).join("agentmail.js"),
+    )
+}
+
+/// The user scope's config directory.
+fn user_dir(env: &Env) -> PathBuf {
+    match env.dir_var("XDG_CONFIG_HOME") {
+        Some(d) => d.join("opencode"),
+        None => env.home.join(".config").join("opencode"),
+    }
+}
+
+/// The directory a scope's plugin is installed in (`plugins/`).
+fn plugin_dir(project: bool, env: &Env) -> PathBuf {
+    if project {
+        env.cwd.join(".opencode").join("plugins")
+    } else {
+        user_dir(env).join("plugins")
+    }
+}
+
+/// The agentmail plugin opencode would run from a scope: the first that is
+/// agentmail's of `plugin/agentmail.js` and `plugins/agentmail.js`, the
+/// order opencode loads them in, with the binary it runs (`None`: not
+/// readable from the file).
+fn scope_plugin(project: bool, env: &Env) -> Result<Option<(PathBuf, Option<String>)>> {
+    let plugins = plugin_dir(project, env);
+    for dir in [plugins.with_file_name("plugin"), plugins] {
+        let path = dir.join("agentmail.js");
+        if let Some(text) = read_opt(&path)?
+            && is_plugin(&text)
+        {
+            return Ok(Some((path, plugin_bin(&text))));
+        }
+    }
+    Ok(None)
+}
+
+/// The binary an agentmail plugin's text runs: the string literal where
+/// the shipped plugin has its placeholder.
+fn plugin_bin(text: &str) -> Option<String> {
+    let line = PLUGIN.lines().find(|l| l.contains(PLACEHOLDER))?;
+    let prefix = &line[..line.find(PLACEHOLDER)?];
+    let rest = text.lines().find_map(|l| l.strip_prefix(prefix))?;
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<String>()
+        .next()?
+        .ok()
+}
+
+/// What to tell the user about the other scope's agentmail plugin: opencode
+/// runs only one, the user scope's when both are there. Install notes
+/// when the one that runs (in the current project) is for another binary
+/// than `o.bin`; uninstall at user scope, when it hands over to the
+/// project's.
+pub(super) fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
+    let bin = bin_str(o)?;
+    let Some((other, other_bin)) = scope_plugin(!o.project, env)? else {
+        return Ok(Vec::new());
+    };
+    let runs = match &other_bin {
+        Some(b) => format!("runs {b}"),
+        None => "runs a binary agentmail cannot read from it".to_string(),
+    };
+    let other = other.display();
+    let note = match (install, o.project) {
+        _ if install && other_bin.as_deref() == Some(bin) => None,
+        (true, true) => Some(format!(
+            "note: opencode runs only one agentmail plugin, the user scope's when both are there: \
+             in this project the user-scope {other} ({runs}) runs, not the one installed here \
+             for {bin}."
+        )),
+        (true, false) => Some(format!(
+            "note: opencode runs only one agentmail plugin, the user scope's when both are there: \
+             in this project the one installed now for {bin} runs, not the project's {other} \
+             ({runs})."
+        )),
+        (false, false) if scope_plugin(false, env)?.is_some() => Some(format!(
+            "note: in this project opencode now runs the project's agentmail plugin {other} \
+             ({runs})."
+        )),
+        (false, _) => None,
+    };
+    Ok(note.into_iter().collect())
 }
 
 fn server(bin: &str) -> Value {
@@ -316,8 +401,9 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
     let plugin_dir = plugin.parent().expect("a plugins directory");
     let legacy = plugin_dir.with_file_name("plugin").join("agentmail.js");
     let plugin = plan_plugin(plugin, install, bin)?;
-    // opencode also loads `plugin/`: an agentmail plugin there would run
-    // beside the installed one, so both install and uninstall remove it.
+    // opencode also loads `plugin/`, before `plugins/`, and runs only the
+    // first plugin of each id: an agentmail plugin there would shadow the
+    // installed one, so both install and uninstall remove it.
     let legacy = plan_plugin(legacy, false, bin)?;
     let mut changes = Vec::new();
     for path in targets {

@@ -919,11 +919,31 @@ them all.
   agentmail's plugin, uninstall puts that backup back instead. A symlink
   at `plugins/agentmail.js` (a dev or dotfiles setup) is never written
   through: install refuses it, and uninstall removes only the link,
-  leaving the file it points to and any backup beside it. Since opencode
-  also loads `plugin/`, an agentmail plugin at `plugin/agentmail.js`
-  would run beside the installed one (two waiters, every urgent message
-  surfaced twice), so install and uninstall both remove it (a file there
-  that is not agentmail's is left alone).
+  leaving the file it points to and any backup beside it.
+- **One agentmail plugin per opencode.** opencode loads the user scope's
+  `plugin/` and `plugins/`, then the project's `.opencode/plugin/` and
+  `.opencode/plugins/`, in that order, but runs `setup()` for only one
+  plugin per `id`, the first loaded; plugins with different ids all run.
+  Checked live (opencode 2.0.27, private `HOME` and `XDG_*`, `opencode run
+  --standalone --print-logs` in a project) with probe plugins whose
+  `setup()` writes a marker file: with an `id: "agentmail"` probe in all
+  four dirs and an `id: "other"` one in the project's `plugins/`, the log
+  has `loading plugin` for all five, but only the user `plugin/` copy's
+  and the `other` probe's `setup()` ran; with only the two `plugins/`
+  copies, only the user one ran; with only the project one, it ran. So
+  an agentmail plugin left at `plugin/agentmail.js` does not run twice:
+  it shadows the installed `plugins/agentmail.js`, which never runs, and
+  the install would silently do nothing. Install and uninstall therefore
+  both remove it from the scope they work on (a file there that is not
+  agentmail's is left alone). Likewise the user scope's plugin shadows
+  the project's: with both installed, only the user one runs in that
+  project. The command says so in a one-line `note:` (also listed in
+  `--json` as `notes`): `install --project` when the user scope's plugin
+  (in `plugin/` or `plugins/`) runs another binary than this one (or one
+  it cannot read), so the project's plugin will not run; `install` at user
+  scope when the current project's plugin runs another binary, so it
+  stops running there; and `uninstall` at user scope when the current
+  project has an agentmail plugin, which then runs there.
 - The rest (backups, creation markers, keeping the file's layout, symlinks,
   modes) is the shared install machinery described under Claude Code's
   install (Task 5).

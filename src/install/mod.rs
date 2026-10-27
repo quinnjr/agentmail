@@ -109,6 +109,17 @@ pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
     }
 }
 
+/// One-line notes for the user about installing (`install`) or
+/// uninstalling agentmail for `o.harness`, from the files as they are
+/// before the change: for opencode, when the agentmail plugin that runs is
+/// not the one this command installs or removes.
+pub fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
+    match o.harness {
+        Harness::Opencode => opencode::notes(o, env, install),
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Where the original of `path` is kept: `<path>.agentmail.bak`.
 pub fn backup_path(path: &Path) -> PathBuf {
     with_suffix(path, ".agentmail.bak")
