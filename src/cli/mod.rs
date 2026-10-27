@@ -617,9 +617,14 @@ pub async fn main() -> ExitCode {
         Ok(cli) => cli,
         // A hook must never fail its harness: Claude Code reads exit 2 as
         // "block", kiro reads 1 as "continue the turn". A hook this binary
-        // does not know (a newer config, an older binary) stays silent.
+        // does not know (a newer config, an older binary) stays silent:
+        // it runs on every tool call, and a harness may show hook stderr.
+        // Only a person running it by hand sees the usage error.
         Err(e) if e.use_stderr() && is_hook(std::env::args_os().skip(1)) => {
-            let _ = e.print();
+            use std::io::IsTerminal;
+            if std::io::stderr().is_terminal() {
+                let _ = e.print();
+            }
             return ExitCode::SUCCESS;
         }
         Err(e) => return clap_exit(&e),
@@ -814,6 +819,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         session,
     } = cli.command
     {
+        // `--as human` is the human, like `AGENTMAIL_HUMAN=1`: a hook run
+        // as the human has nothing to say (`--as` takes no other value).
+        if cli.as_who.is_some() {
+            return Ok(ExitCode::SUCCESS);
+        }
         return Ok(hook(event, &harness, session.as_deref()).await);
     }
     let paths = Paths::from_env()?;

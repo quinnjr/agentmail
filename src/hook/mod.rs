@@ -15,7 +15,7 @@
 //! kiro). Unlike the CLI, a hook never acts as `AGENTMAIL_ADDRESS`: that
 //! variable is inherited, so a harness started from a registered agent's
 //! shell would otherwise act as the outer agent. A hook run as the human
-//! (`AGENTMAIL_HUMAN=1`) has nothing to say.
+//! (`AGENTMAIL_HUMAN=1`, or the CLI's `--as human`) has nothing to say.
 //!
 //! Entry points for the per-harness modules (Tasks 6 and 8 build on these,
 //! not on the plan's sketch):
@@ -299,9 +299,12 @@ impl Daemon {
 
     /// Block until the idle agent has mail to be woken for.
     ///
-    /// With `wake_for_unread`, unread mail already there counts, unless the
-    /// agent also has open questions (a Stop hook deals with those) or a
-    /// wait already woke it for that mail (the `woken` file): mail it
+    /// With `wake_for_unread` (a plain stop), the wait ends at once with
+    /// [`WaitOutcome::Busy`] when the agent has open questions: the Stop
+    /// hook blocks that stop, so the session is not idle, and the
+    /// continuation's own stop starts the wait. Otherwise unread mail
+    /// already there counts, unless a wait already woke it for that mail
+    /// (the `woken` file): mail it
     /// chose to leave unread wakes it once, not after every human turn.
     /// Otherwise (the agent was just woken, or blocked, and stopped again
     /// without reading) only mail that arrives from now on counts, so
@@ -332,6 +335,14 @@ impl Daemon {
         };
         if !status.wake {
             return WaitOutcome::Skip;
+        }
+        if wake_for_unread && !status.open_questions.is_empty() {
+            // The Stop hook blocks this stop for the open questions, so the
+            // session goes on with a continuation and is not idle: a wake
+            // now would be injected into that turn. The continuation's own
+            // stop (`stop_hook_active`) starts the real wait. Nothing is
+            // written, so no earlier claim or wake record is disturbed.
+            return WaitOutcome::Busy;
         }
         let address = status.address.clone();
         let turn = state_path(&self.paths.data_dir, &address, "turn");
@@ -372,6 +383,8 @@ impl Daemon {
             let Some(now) = self.status_of(&address).await else {
                 return WaitOutcome::Gone;
             };
+            // Questions that opened since the first look may have made the
+            // Stop hook block after all: then only new mail counts.
             let known = known.get_or_insert_with(|| {
                 if wake_for_unread && now.open_questions.is_empty() {
                     read_woken(&self.paths.data_dir, &address)

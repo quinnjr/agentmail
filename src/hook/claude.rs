@@ -16,9 +16,13 @@
 //!   wakes it.
 //! - Subagents: Claude Code runs the tool hooks for a subagent's tool
 //!   calls too, with `agent_id` in the payload. The agent's mail is not
-//!   the subagent's: those hooks only mark the session busy and print
-//!   nothing, so urgent mail stays unsurfaced for the main agent's next
-//!   tool call, and the subagent is never told it is the agent.
+//!   the subagent's: those hooks do nothing and print nothing, so urgent
+//!   mail stays unsurfaced for the main agent's next tool call, and the
+//!   subagent is never told it is the agent. They do not mark the session
+//!   busy either: a background subagent's tool calls go on after the main
+//!   agent's Stop while the main session is idle, and its wait must still
+//!   wake it (a foreground subagent runs inside a turn whose prompt
+//!   already marked the session busy).
 //! - Waking needs the interactive terminal UI (`CLAUDE_CODE_ENTRYPOINT`
 //!   unset or `cli`); see [`wait`].
 
@@ -43,7 +47,7 @@ pub async fn run(
     env: &(dyn Fn(&str) -> Option<OsString> + Sync),
 ) -> HookOutput {
     if input.is_subagent() {
-        return subagent(d, event).await;
+        return HookOutput::default();
     }
     match event {
         HookEvent::SessionStart => context(d, "SessionStart").await,
@@ -80,19 +84,6 @@ async fn context(d: &mut Daemon, event_name: &str) -> HookOutput {
         text.push_str(&r);
     }
     additional_context(event_name, text)
-}
-
-/// A hook for a subagent: its tool calls are part of the agent's busy
-/// turn, but nothing is said to it and no urgent mail is used up.
-async fn subagent(d: &mut Daemon, event: HookEvent) -> HookOutput {
-    if matches!(
-        event,
-        HookEvent::SessionStart | HookEvent::Prompt | HookEvent::PostTool
-    ) && let Some(status) = d.status(false).await
-    {
-        d.mark_busy(&status.address);
-    }
-    HookOutput::default()
 }
 
 async fn post_tool(d: &mut Daemon, input: &HookInput) -> HookOutput {

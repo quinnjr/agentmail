@@ -284,13 +284,29 @@ come from the binary's bundled settings schema.
   The binary adds `agent_id` to every hook's base input when the hook runs
   in a subagent's context. So by ancestry alone a subagent's hooks act as
   the agent. agentmail's hooks check `agent_id`: when it is non-empty,
-  `session-start`, `prompt` and `post-tool` only mark the session busy
-  (a subagent runs inside the agent's turn) and print nothing, and
-  `stop`/`wait` print nothing. Urgent mail is then not marked surfaced, so
-  the main agent's next tool call still gets it in full, and the subagent
-  is never told "you are <address>". If a payload was cut short (over the
-  CLI's 16 MiB read limit) and is not JSON, `agent_id` is still read from
-  the base fields before `hook_event_name`.
+  every hook does nothing and prints nothing. Urgent mail is then not
+  marked surfaced, so the main agent's next tool call still gets it in
+  full, and the subagent is never told "you are <address>". If a payload
+  was cut short (over the CLI's 16 MiB read limit) and is not JSON,
+  `agent_id` is still read from the base fields before `hook_event_name`.
+- **Background subagents** (`run_in_background`), checked live
+  interactively (2.1.311, haiku, a logging hook on every event): the main
+  agent launched one and ended its turn; its `Stop` fired, then the
+  subagent's `PreToolUse`/`PostToolUse` kept firing (with `agent_id`) for
+  the next 30 s while the main session sat idle ("Waiting for 1
+  background agent to finish"). When it finished, `SubagentStop` fired and
+  Claude Code started a main turn by itself for the completion
+  notification (`UserPromptSubmit`, then `Stop`). A stub `asyncRewake`
+  Stop hook fired while the subagent was still running started a main
+  turn at once (`UserPromptSubmit`, the model answered the wake, `Stop`),
+  and the subagent ran on undisturbed. So the main session is idle while
+  a background subagent works, and subagent hooks must not mark it busy:
+  if they did, the subagent's first tool call would end the idle wait and
+  mail arriving meanwhile would wait for the subagent to finish. agentmail
+  marks the session busy only from main-agent events (`session-start`,
+  `prompt`, `post-tool` without `agent_id`). A foreground subagent runs
+  inside a turn whose `UserPromptSubmit` already marked it busy, so it
+  needs no mark of its own.
 - **End to end with agentmail itself** (debug build, private data dir):
   hooks installed as below, the agent registered with `register --pid
   <claude pid>`, the session left idle; `agentmail --as human send` woke it
@@ -349,15 +365,20 @@ How `agentmail hook wait` behaves under it:
   the claim, after at most a status call and a tick), and exits 0 if a
   later claim or a busy mark replaces it meanwhile. With a lock file that
   cannot be opened or locked it exits 0 at once: two waits never both run.
-- The `session-start`, `prompt` and `post-tool` hooks mark the session
-  busy, and a wait exits 0 within half a second of that (it also checks
+- The `session-start`, `prompt` and `post-tool` hooks of the main agent
+  (not of a subagent, see above) mark the session busy, and a wait exits 0 within half a second of that (it also checks
   just before waking). So a wait started by one Stop never outlives the
   idle period: mail that arrives during a later turn is that turn's
   (the `post-tool` reminder tells it), and the turn's own Stop starts a
   fresh wait.
-- On a plain stop, unread mail already there wakes at once, unless the
-  agent also has open questions (the Stop hook's `decision: block` handles
-  those) or a wait already woke it for that mail. This includes mail that
+- On a plain stop with open questions, the Stop hook's `decision: block`
+  continues the turn, so the session is not idle: the wait that stop
+  started exits 0 at once and writes nothing (were it to wait, mail coming
+  during a text-only continuation, which runs no busy-marking hook, would
+  be injected into it). The continuation's own Stop (`stop_hook_active:
+  true`) starts the real wait.
+- On a plain stop, unread mail already there wakes at once, unless a
+  wait already woke it for that mail. This includes mail that
   came mid-turn and was left unread: the agent gets one wake for it, not
   one after every human turn (a wake records the unread ids it was for in
   `<address>.woken`, and later plain stops do not count those). After a
@@ -376,7 +397,11 @@ How `agentmail hook wait` behaves under it:
   the turn file every 0.5 s and otherwise sleeps on the daemon's event
   stream (no polling of mail).
 - A `hook` command line this binary cannot parse (a newer config, an older
-  binary) prints the usage error and exits 0, so it never blocks a stop.
+  binary) exits 0 and prints nothing (the usage error only when stderr is
+  a terminal, for a person running it by hand), so it never blocks a stop
+  and never shows up in a harness. A hook run with `--as human` is the
+  human, like `AGENTMAIL_HUMAN=1`: it exits 0 and prints nothing (`--as`
+  accepts no other value; any other is a usage error, silent as above).
   It counts as a `hook` command line when its first positional argument
   (after global options such as `--json` or `--as human`, before any
   `--`) is `hook`.
@@ -384,10 +409,12 @@ How `agentmail hook wait` behaves under it:
   `<address>.lock`, `<address>.woken`) exist only for agents that have
   had a wait (a busy mark rewrites an existing turn file and never
   creates one). The daemon removes them, with any temporary
-  `<address>.<kind>.<pid>-<nanos>` file a crashed write left, whenever it
-  finds the agent gone (signed off, unbound, or its process dead) while
-  computing its presence: on sign-off, on a registration that unbinds it,
-  and on any listing or lookup that includes it. A running wait also
+  `<address>.<kind>.<pid>-<nanos>` file a crashed write left, when the
+  agent becomes gone: on sign-off, on a registration that unbinds it, and
+  the first time a listing or lookup finds its process dead. It remembers
+  which gone agents it cleared (until it restarts), so later listings do
+  not scan the directory again; an agent seen active again (reclaimed) is
+  forgotten, and cleared anew when it next goes. A running wait also
   removes them when it ends on sign-off, on the agent going away, or on
   its harness exiting. So a Claude Code closed mid-turn, with no wait
   running, leaves its files only until the daemon next looks at the
@@ -405,7 +432,7 @@ and a `claude` started from that shell would inherit it, so its hooks
 would wake for and surface the outer agent's mail, the very case the
 `CLAUDE_PID` cut exists for. On opencode the variable on the server
 process would override `--session` for every session. `AGENTMAIL_HUMAN=1`
-still silences a hook. Tests bind their agent to the test process's parent
+still silences a hook, and so does `--as human`. Tests bind their agent to the test process's parent
 (in the hook's ancestry) instead.
 
 ### Interfaces for later hook tasks (Tasks 6 and 8)

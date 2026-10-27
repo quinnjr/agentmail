@@ -34,6 +34,10 @@ pub struct Handler {
     /// The daemon's data directory, for the files waiting hooks keep
     /// there; `None` in tests that serve no hooks.
     data_dir: Option<std::path::PathBuf>,
+    /// Gone agents whose hook wait files were already removed, so a
+    /// listing or lookup does not scan the directory again for each one.
+    /// An agent seen active again (reclaimed) leaves the set.
+    cleared: Mutex<HashSet<String>>,
 }
 
 /// Map a store error to the code clients see.
@@ -546,11 +550,12 @@ impl Handler {
             store,
             hub,
             data_dir: None,
+            cleared: Mutex::new(HashSet::new()),
         }
     }
 
     /// Serve hooks whose files live under `data_dir`: an agent's are
-    /// removed when it signs off.
+    /// removed when it signs off, is unbound, or is first found gone.
     pub fn with_data_dir(mut self, data_dir: &std::path::Path) -> Handler {
         self.data_dir = Some(data_dir.to_path_buf());
         self
@@ -1125,21 +1130,44 @@ impl Handler {
         }
     }
 
-    /// The agent as others see it. An agent found gone has its hook wait
-    /// files removed ([`crate::hook::clear_wait_state`]): no wait of its
+    /// The agent as others see it. An agent first found gone has its hook
+    /// wait files removed ([`Handler::clear_wait_state`]): no wait of its
     /// may run on, and a harness that exited mid-turn leaves them behind.
+    /// Later views of the same gone agent leave the directory alone.
     fn view(&self, agent: Agent, is_contact: bool) -> AgentView {
         let presence = Store::presence(&agent, &procinfo::is_alive);
-        if presence == Presence::Gone
-            && let Some(dir) = &self.data_dir
-        {
-            crate::hook::clear_wait_state(dir, &agent.address);
+        if self.data_dir.is_some() {
+            let mut cleared = self.cleared.lock().unwrap_or_else(PoisonError::into_inner);
+            match presence {
+                Presence::Gone if !cleared.contains(&agent.address) => {
+                    drop(cleared);
+                    self.clear_wait_state(&agent.address);
+                }
+                Presence::Gone => {}
+                _ => {
+                    cleared.remove(&agent.address);
+                }
+            }
         }
         AgentView {
             presence,
             is_contact,
             agent,
         }
+    }
+
+    /// Remove `address`'s hook wait files ([`crate::hook::clear_wait_state`])
+    /// and remember that they are gone. For an agent that just signed off
+    /// or was unbound, and for one first found gone.
+    fn clear_wait_state(&self, address: &str) {
+        let Some(dir) = &self.data_dir else {
+            return;
+        };
+        crate::hook::clear_wait_state(dir, address);
+        self.cleared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(address.to_string());
     }
 
     fn contact_set(&self, owner: &str) -> Result<HashSet<String>, ClientError> {
@@ -1227,7 +1255,7 @@ impl Handler {
                     return Err(human_has_no("session to sign off"));
                 }
                 self.store.signoff(&me).map_err(store_err)?;
-                // The view finds the agent gone and removes its hook files.
+                self.clear_wait_state(&me);
                 let view = self.agent_view(&me)?;
                 self.publish_presence(&view);
                 to_json(&view)
@@ -1431,6 +1459,7 @@ impl Handler {
             if let Ok(Some(other)) = self.store.get_agent(addr)
                 && other.proc_id.is_none()
             {
+                self.clear_wait_state(addr);
                 let other = self.view(other, false);
                 self.publish_presence(&other);
             }

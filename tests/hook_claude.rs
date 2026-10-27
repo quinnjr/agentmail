@@ -320,16 +320,30 @@ async fn subagent_hooks_say_nothing() {
 }
 
 #[tokio::test]
-async fn subagent_tool_call_marks_the_session_busy() {
-    // A subagent runs inside the main agent's turn: the session is busy.
+async fn background_subagent_does_not_end_the_idle_wait() {
+    // A background subagent (`run_in_background`) keeps making tool calls
+    // after the main agent's Stop, while the main session sits idle. Its
+    // hooks must not count as the session getting busy: mail that comes
+    // meanwhile still wakes the idle main agent. (A foreground subagent
+    // runs inside a turn whose prompt already marked the session busy.)
     let d = TestDaemon::start().await;
-    register_here(&d, "backend", true).await;
+    let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     let h = spawn(&env, HookEvent::Wait, "stop");
     assert!(still_waiting(&h, 0.5).await);
-    run(&env, HookEvent::PostTool, "post-tool-subagent").await;
+    for (event, payload) in [
+        (HookEvent::PostTool, "post-tool-subagent"),
+        (HookEvent::PreTool, "post-tool-subagent"),
+    ] {
+        run(&env, event, payload).await;
+    }
+    assert!(
+        still_waiting(&h, 1.0).await,
+        "a subagent tool call ended it"
+    );
+    send(&d, &a, "schema", "see the PR", false).await;
     let out = finish(h).await;
-    assert!(silent(&out), "{out:?}");
+    assert_eq!(out.exit, 2, "{out:?}");
 }
 
 #[tokio::test]
@@ -456,15 +470,28 @@ async fn wait_after_a_wake_waits_for_new_mail() {
 
 #[tokio::test]
 async fn wait_leaves_open_questions_to_the_stop_hook() {
-    // The Stop hook already blocks for an open question; waking as well
-    // would run a second turn for it.
+    // The Stop hook blocks a plain stop for an open question, so the
+    // session goes on with a continuation and is not idle. The wait that
+    // stop started ends at once, writing nothing: mail coming while the
+    // continuation runs must not be injected into it as a wake.
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     ask(&d, &a, "POST /orders body?").await;
-    let h = spawn(&env, HookEvent::Wait, "stop");
-    assert!(still_waiting(&h, 0.5).await, "woke for the open question");
-    h.abort();
+    let started = Instant::now();
+    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    assert!(silent(&out), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
+    // Mail during the continuation wakes nothing.
+    send(&d, &a, "schema", "see the PR", false).await;
+    // The continuation's own stop starts the real wait, which wakes for
+    // mail that comes after it.
+    let h = spawn(&env, HookEvent::Wait, "stop-active");
+    assert!(still_waiting(&h, 0.5).await, "woke for old mail");
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
 }
 
 #[tokio::test]
@@ -684,6 +711,29 @@ async fn signoff_after_a_wait_leaves_no_files() {
 }
 
 #[tokio::test]
+async fn gone_agents_are_cleared_once() {
+    // Listings and lookups view every agent, gone ones included; the
+    // daemon removes a gone agent's files when it first finds it gone, not
+    // with a directory scan on every later view.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let mut c = d.client().await;
+    c.call(&agent(&a), Request::Signoff).await.unwrap();
+    let dir = d.paths.data_dir.join("hook-wait");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Not something a hook writes for a signed-off agent: a marker that
+    // shows whether a later view scanned the directory.
+    std::fs::write(dir.join(format!("{a}.turn")), "x").unwrap();
+    let list = Request::Agents {
+        name_prefix: None,
+        repo: None,
+        all: true,
+    };
+    c.call(&Caller::Human, list).await.unwrap();
+    assert_eq!(wait_files(&d.paths), vec![format!("{a}.turn")]);
+}
+
+#[tokio::test]
 async fn hook_latency_under_20ms() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
@@ -787,6 +837,7 @@ fn cli_hook_unknown_event_is_silent() {
     );
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -905,14 +956,54 @@ fn cli_hook_unknown_event_after_a_global_flag_is_silent() {
             "claude-code",
         ][..],
         &["--as", "human", "hook", "no-such-event"][..],
+        &["--as", "nobody", "hook", "stop", "--harness", "claude-code"][..],
     ] {
         let out = cli(&paths, args, "stop");
         assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
         assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
     }
     // Not a hook: a usage error still fails.
     let out = cli(&paths, &["--json", "no-such-command"], "stop");
     assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+// The daemon runs in this process: the blocking CLI call needs another
+// worker thread to serve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_hook_as_human_is_silent() {
+    // `--as human` is the human, as with AGENTMAIL_HUMAN=1: the hook says
+    // nothing and uses up no urgent mail.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    send(&d, &a, "prod down", "roll back", true).await;
+    for (event, payload) in [
+        ("session-start", "session-start"),
+        ("prompt", "prompt"),
+        ("post-tool", "post-tool"),
+        ("stop", "stop"),
+        ("wait", "stop"),
+    ] {
+        let out = cli(
+            &d.paths,
+            &["--as", "human", "hook", event, "--harness", "claude-code"],
+            payload,
+        );
+        assert_eq!(out.status.code(), Some(0), "{event}: {out:?}");
+        assert!(out.stdout.is_empty(), "{event}: {out:?}");
+        assert!(out.stderr.is_empty(), "{event}: {out:?}");
+    }
+    // The urgent mail is still unsurfaced: the agent's own hook gets it.
+    let out = cli(
+        &d.paths,
+        &["hook", "post-tool", "--harness", "claude-code"],
+        "post-tool",
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("roll back"), "{ctx}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
