@@ -1940,8 +1940,40 @@ fn opencode_plugin_agentmail_did_not_create_is_restored_or_removed() {
     let mine = "export default { id: \"mine\", setup() {} };\n";
     write(&h.oc_plugin(), &oc_plugin_text("/old/agentmail"));
     write(&bak(&h.oc_plugin()), mine);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        set(&h.oc_plugin(), 0o600).unwrap();
+        set(&bak(&h.oc_plugin()), 0o644).unwrap();
+    }
     uninstall(&oc_opts(false, BIN), &env);
     assert_eq!(read(&h.oc_plugin()), mine);
+    // The backup is used up, and the file is as it was, mode and all.
+    assert!(!bak(&h.oc_plugin()).exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(h.oc_plugin())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+    // Later runs find nothing of agentmail's there.
+    let err = install::plan_install(&oc_opts(false, BIN), &env).unwrap_err();
+    assert!(err.to_string().contains("not agentmail's plugin"), "{err}");
+    assert!(uninstall(&oc_opts(false, BIN), &env).is_empty());
+
+    // An edited agentmail plugin takes the place of the backup put back.
+    let edited = oc_edited_plugin("/old/agentmail");
+    write(&bak(&h.oc_plugin()), mine);
+    write(&h.oc_plugin(), &edited);
+    let changes = uninstall(&oc_opts(false, BIN), &env);
+    let c = changes.iter().find(|c| c.path == h.oc_plugin()).unwrap();
+    assert_eq!(c.save.as_deref(), Some(bak(&h.oc_plugin()).as_path()));
+    assert_eq!(read(&h.oc_plugin()), mine);
+    assert_eq!(read(&bak(&h.oc_plugin())), edited);
 }
 
 #[test]
@@ -2208,6 +2240,55 @@ fn cli_opencode_upgrade_keeps_no_original_it_did_not_find() {
     assert!(!plugin.exists());
     assert!(!bak(&plugin).exists());
     assert!(!plugin.parent().unwrap().exists());
+}
+
+#[test]
+fn cli_opencode_says_a_plugin_was_restored() {
+    // Uninstall puts back a backup that is not agentmail's plugin: it says
+    // so, not that an original was kept.
+    let h = Home::new();
+    let plugin = h.oc_plugin();
+    let mine = "export default { id: \"mine\", setup() {} };\n";
+    let run = |args: &[&str]| {
+        let out = cli(&h)
+            .env_remove("XDG_CONFIG_HOME")
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    let setup = || {
+        run(&["install", "--harness", "opencode"]);
+        write(&bak(&plugin), mine);
+        std::fs::remove_file(marker(&plugin)).unwrap();
+    };
+    setup();
+    let out = run(&["uninstall", "--harness", "opencode"]);
+    assert!(
+        out.contains(&format!("restored {} from its backup\n", plugin.display())),
+        "{out}"
+    );
+    assert!(!out.contains("kept as"), "{out}");
+    assert_eq!(read(&plugin), mine);
+    assert!(!bak(&plugin).exists());
+
+    std::fs::remove_file(&plugin).unwrap();
+    setup();
+    let out = run(&["--json", "uninstall", "--harness", "opencode"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let entry = v["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == plugin.display().to_string())
+        .unwrap();
+    assert_eq!(entry["action"], "restore", "{out}");
+    assert_eq!(entry["backup"], Value::Null, "{out}");
+    assert_eq!(entry["saved"], Value::Null, "{out}");
+    assert!(!bak(&plugin).exists());
 }
 
 #[test]

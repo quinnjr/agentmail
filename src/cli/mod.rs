@@ -819,14 +819,17 @@ fn install(
         inst::apply(&changes)?;
     }
     let action = |c: &inst::Change| match (&c.before, &c.after) {
+        _ if c.restore => "restore",
         (None, _) => "create",
         (Some(_), Some(_)) => "update",
         (Some(_), None) => "delete",
     };
     // An updated file's original is kept as its backup, unless agentmail
     // created the file (its marker is still there): it had none.
+    // A backup put back is used up: it keeps nothing.
     let original_kept = |c: &inst::Change| {
-        c.before.is_some()
+        !c.restore
+            && c.before.is_some()
             && c.after.is_some()
             && std::fs::symlink_metadata(inst::created_marker_path(&c.path)).is_err()
     };
@@ -834,7 +837,8 @@ fn install(
         let list: Vec<Value> = changes
             .iter()
             .map(|c| {
-                let backup = ((original_kept(c) || (c.before.is_some() && c.keep_backup))
+                let backup = ((original_kept(c)
+                    || (c.before.is_some() && c.keep_backup && !c.restore))
                     && !dry_run)
                     .then(|| inst::backup_path(&c.path).display().to_string());
                 let saved = c
@@ -877,6 +881,7 @@ fn install(
         let verb = match action(c) {
             "create" => "created",
             "update" => "updated",
+            "restore" => "restored",
             _ => "removed",
         };
         let bak = inst::backup_path(&c.path);
@@ -896,7 +901,8 @@ fn install(
         } else {
             format!(" ({})", kept.join("; "))
         };
-        print_line(&format!("{verb} {}{kept}", c.path.display()))?;
+        let from = if c.restore { " from its backup" } else { "" };
+        print_line(&format!("{verb} {}{from}{kept}", c.path.display()))?;
     }
     let summary = match (uninstall, changes.is_empty()) {
         (false, true) => format!("agentmail is already installed for {name}."),

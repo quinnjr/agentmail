@@ -425,7 +425,9 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
             Some(b) if !link && !created && !is_plugin(b) => Some(b.clone()),
             _ => None,
         };
-        // A restored backup is used up; any other worth keeping stays.
+        // A restored backup is used up (moved into place, before any
+        // edits are saved, which may take its place); any other worth
+        // keeping stays.
         let keep_backup = restore.is_none() && bak_worth;
         // The file a link points to is never touched: nothing to save.
         let save = (!link)
@@ -436,6 +438,7 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
             save,
             path,
             before,
+            restore: restore.is_some(),
             after: restore,
             record_anew: false,
             // The file a link points to is never agentmail's to delete,
@@ -484,6 +487,7 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
         unlink: false,
         save,
         keep_backup: false,
+        restore: false,
     }))
 }
 

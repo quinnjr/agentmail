@@ -63,6 +63,10 @@ pub struct Change {
     /// Deleting `path` leaves its backup, which holds something to keep
     /// (such as an edited copy of agentmail's file).
     pub keep_backup: bool,
+    /// `after` is the file's backup, which is put back in place of `path`
+    /// (the opencode plugin, on uninstall): moved there, so it keeps its
+    /// own permissions and is no longer left beside the file.
+    pub restore: bool,
 }
 
 /// The environment the config locations depend on.
@@ -253,9 +257,21 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
     let marker = created_marker_path(&c.path);
     // Write through a symlink to its target, so the link stays a link.
     let target = resolve(&c.path)?;
+    // The backup becomes the file again: renamed into place, it keeps its
+    // permissions and is used up, before any edited text is saved (perhaps
+    // as that backup). Never through a link (none is planned): the link
+    // itself would be replaced.
+    if c.restore {
+        std::fs::rename(&bak, &c.path)
+            .with_context(|| format!("restoring {} from {}", c.path.display(), bak.display()))?;
+        remove_if_there(&marker)?;
+    }
     if let (Some(save), Some(before)) = (&c.save, &c.before) {
         replace_file(save, perms.as_ref(), before.as_bytes())
             .with_context(|| format!("writing {}", save.display()))?;
+    }
+    if c.restore {
+        return Ok(Vec::new());
     }
     let Some(after) = &c.after else {
         // Only agentmail's own file is deleted ([`JsonFile::change`], the
@@ -569,6 +585,7 @@ impl JsonFile {
             unlink: false,
             save: None,
             keep_backup: false,
+            restore: false,
         })
     }
 }
@@ -939,6 +956,7 @@ mod tests {
             unlink: false,
             save: None,
             keep_backup: false,
+            restore: false,
         });
         assert_eq!(
             d,
@@ -953,6 +971,7 @@ mod tests {
             unlink: false,
             save: None,
             keep_backup: false,
+            restore: false,
         });
         assert_eq!(d, "--- /dev/null\n+++ /f\n@@ -0,0 +1,1 @@\n+a\n");
     }
