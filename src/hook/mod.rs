@@ -35,6 +35,7 @@
 //!   it finds the agent gone (signed off, unbound, or its process dead).
 
 pub mod claude;
+pub mod kiro;
 pub mod opencode;
 pub mod text;
 
@@ -294,6 +295,9 @@ pub struct HookArgs<'a> {
     /// mail (opencode's plugin; its default is
     /// [`opencode::DEFAULT_WAIT`]). Claude Code bounds its hooks itself.
     pub timeout: Option<Duration>,
+    /// `--wake`: kiro's `stop` waits for mail while the agent is idle
+    /// (installed by `install --kiro-wake`; see [`kiro`]).
+    pub wake: bool,
 }
 
 /// [`run`] with everything the command line gave ([`HookArgs`]).
@@ -321,7 +325,8 @@ pub async fn run_with(
     match harness {
         Harness::ClaudeCode => claude::run(&mut daemon, event, &input, env).await,
         Harness::Opencode => opencode::run(&mut daemon, event, args, &input).await,
-        Harness::Kiro | Harness::Other => HookOutput::default(),
+        Harness::Kiro => kiro::run(&mut daemon, event, args).await,
+        Harness::Other => HookOutput::default(),
     }
 }
 

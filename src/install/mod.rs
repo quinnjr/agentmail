@@ -18,6 +18,7 @@
 
 mod claude;
 pub mod json;
+mod kiro;
 mod opencode;
 
 use std::collections::HashMap;
@@ -37,8 +38,13 @@ pub struct InstallOpts {
     pub project: bool,
     /// Show the changes without making them.
     pub dry_run: bool,
-    /// Make agentmail's agent the harness's default (kiro only).
+    /// Make agentmail's agent the harness's default (kiro only). kiro-cli
+    /// V3 loads agentmail's hooks file for every agent, so this changes
+    /// nothing; install says so.
     pub set_default: bool,
+    /// kiro only: install the Stop hook that waits for mail to wake an
+    /// idle agent, and have kiro agents register with `wake` on.
+    pub kiro_wake: bool,
     /// The absolute path of the `agentmail` binary the harness should run.
     pub bin: PathBuf,
 }
@@ -112,6 +118,7 @@ pub fn plan_install(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
     match o.harness {
         Harness::ClaudeCode => claude::plan(o, env, true),
         Harness::Opencode => opencode::plan(o, env, true),
+        Harness::Kiro => kiro::plan(o, env, true),
         h => bail!("agentmail cannot install into {} yet", h.as_str()),
     }
 }
@@ -121,6 +128,7 @@ pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
     match o.harness {
         Harness::ClaudeCode => claude::plan(o, env, false),
         Harness::Opencode => opencode::plan(o, env, false),
+        Harness::Kiro => kiro::plan(o, env, false),
         h => bail!("agentmail cannot uninstall from {} yet", h.as_str()),
     }
 }
@@ -128,10 +136,12 @@ pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
 /// One-line notes for the user about installing (`install`) or
 /// uninstalling agentmail for `o.harness`, from the files as they are
 /// before the change: for opencode, when the agentmail plugin that runs is
-/// not the one this command installs or removes.
+/// not the one this command installs or removes; for kiro, that only its V3
+/// engine is supported, and what `--kiro-wake` and `--set-default` do.
 pub fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
     match o.harness {
         Harness::Opencode => opencode::notes(o, env, install),
+        Harness::Kiro => Ok(kiro::notes(o, install)),
         _ => Ok(Vec::new()),
     }
 }

@@ -64,6 +64,7 @@ fn opts(project: bool, bin: &str) -> InstallOpts {
         project,
         dry_run: false,
         set_default: false,
+        kiro_wake: false,
         bin: PathBuf::from(bin),
     }
 }
@@ -2457,4 +2458,364 @@ fn cli_opencode_notes_plugin_in_other_scope() {
     let notes = v["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 1, "{v}");
     assert!(notes[0].as_str().unwrap().starts_with("note: "), "{v}");
+}
+
+// kiro-cli (V3).
+
+fn kiro_opts(project: bool, bin: &str) -> InstallOpts {
+    InstallOpts {
+        harness: Harness::Kiro,
+        ..opts(project, bin)
+    }
+}
+
+impl Home {
+    fn kiro_dir(&self) -> PathBuf {
+        self.home().join(".kiro")
+    }
+
+    fn kiro_mcp(&self) -> PathBuf {
+        self.kiro_dir().join("settings/mcp.json")
+    }
+
+    fn kiro_hooks(&self) -> PathBuf {
+        self.kiro_dir().join("hooks/agentmail.json")
+    }
+}
+
+fn kiro_hook(bin: &str, trigger: &str, event: &str) -> Value {
+    json!({
+        "name": format!("agentmail-{event}"),
+        "trigger": trigger,
+        "action": {"type": "command", "command": format!("{bin} hook {event} --harness kiro")},
+        "timeout": 10
+    })
+}
+
+/// The hooks file agentmail installs for kiro, with `--kiro-wake` or not.
+fn kiro_expected_hooks(bin: &str, wake: bool) -> Value {
+    let pre = json!({
+        "name": "agentmail-pre-tool",
+        "trigger": "PreToolUse",
+        "matcher": ".*",
+        "action": {"type": "command", "command": format!("{bin} hook pre-tool --harness kiro")},
+        "timeout": 10
+    });
+    let stop = match wake {
+        false => kiro_hook(bin, "Stop", "stop"),
+        true => json!({
+            "name": "agentmail-stop",
+            "trigger": "Stop",
+            "action": {"type": "command", "command": format!("{bin} hook stop --harness kiro --wake")},
+            "timeout": 0
+        }),
+    };
+    json!({
+        "version": "v1",
+        "hooks": [
+            kiro_hook(bin, "SessionStart", "session-start"),
+            kiro_hook(bin, "UserPromptSubmit", "prompt"),
+            pre,
+            stop,
+        ]
+    })
+}
+
+fn kiro_server(bin: &str) -> Value {
+    json!({"command": bin, "args": ["mcp"]})
+}
+
+/// A kiro `settings/mcp.json` with someone else's servers.
+const FOREIGN_KIRO_MCP: &str = r#"{
+    "mcpServers": {
+      "gmail": {
+        "type": "http",
+        "url": "http://127.0.0.1:3016/mcp",
+        "disabled": false
+      }
+    }
+  }
+"#;
+
+#[test]
+fn kiro_install_mcp_merge() {
+    let h = Home::new();
+    write(&h.kiro_mcp(), FOREIGN_KIRO_MCP);
+    let env = h.env(&[]);
+    install(&kiro_opts(false, BIN), &env);
+    let v = read_json(&h.kiro_mcp());
+    assert_eq!(v["mcpServers"]["agentmail"], kiro_server(BIN), "{v}");
+    assert_eq!(v["mcpServers"]["gmail"]["url"], "http://127.0.0.1:3016/mcp");
+    // Foreign bytes are kept as written: only agentmail's entry is new.
+    let text = read(&h.kiro_mcp());
+    assert!(
+        text.starts_with("{\n    \"mcpServers\": {\n      \"gmail\": {"),
+        "{text}"
+    );
+    assert_eq!(read(&bak(&h.kiro_mcp())), FOREIGN_KIRO_MCP);
+}
+
+#[test]
+fn kiro_install_hooks_file() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    let changes = install(&kiro_opts(false, BIN), &env);
+    assert_eq!(paths(&changes), [h.kiro_hooks().as_path(), &h.kiro_mcp()]);
+    assert_eq!(read_json(&h.kiro_hooks()), kiro_expected_hooks(BIN, false));
+    assert!(marker(&h.kiro_hooks()).exists());
+    assert!(!bak(&h.kiro_hooks()).exists());
+}
+
+#[test]
+fn kiro_wake_installs_the_waiting_stop_hook() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    let wake = InstallOpts {
+        kiro_wake: true,
+        ..kiro_opts(false, BIN)
+    };
+    install(&wake, &env);
+    assert_eq!(read_json(&h.kiro_hooks()), kiro_expected_hooks(BIN, true));
+    // The MCP server registers kiro agents with `wake` on by default.
+    let mut server = kiro_server(BIN);
+    server["env"] = json!({"AGENTMAIL_KIRO_WAKE": "1"});
+    assert_eq!(read_json(&h.kiro_mcp())["mcpServers"]["agentmail"], server);
+    assert!(install::plan_install(&wake, &env).unwrap().is_empty());
+
+    // Installing again without it takes waking out, keeping the user's env.
+    let mut v = read_json(&h.kiro_mcp());
+    v["mcpServers"]["agentmail"]["env"]["RUST_LOG"] = json!("debug");
+    write(&h.kiro_mcp(), &serde_json::to_string_pretty(&v).unwrap());
+    install(&kiro_opts(false, BIN), &env);
+    assert_eq!(read_json(&h.kiro_hooks()), kiro_expected_hooks(BIN, false));
+    assert_eq!(
+        read_json(&h.kiro_mcp())["mcpServers"]["agentmail"]["env"],
+        json!({"RUST_LOG": "debug"})
+    );
+    // Without anything else in it, `env` goes with the variable.
+    install(&wake, &env);
+    let mut v = read_json(&h.kiro_mcp());
+    v["mcpServers"]["agentmail"]["env"]
+        .as_object_mut()
+        .unwrap()
+        .remove("RUST_LOG");
+    write(&h.kiro_mcp(), &serde_json::to_string_pretty(&v).unwrap());
+    install(&kiro_opts(false, BIN), &env);
+    assert_eq!(
+        read_json(&h.kiro_mcp())["mcpServers"]["agentmail"],
+        kiro_server(BIN)
+    );
+}
+
+#[test]
+fn kiro_hooks_file_keeps_foreign_hooks_and_fields() {
+    let h = Home::new();
+    let foreign = json!({
+        "version": "v1",
+        "hooks": [
+            {"name": "fmt", "trigger": "PostToolUse", "matcher": "fs_write",
+             "action": {"type": "command", "command": "cargo fmt"}},
+            {"name": "mine", "trigger": "Stop", "description": "kept",
+             "action": {"type": "command", "command": format!("{BIN} hook stop --harness kiro")},
+             "enabled": true, "timeout": 99},
+        ]
+    });
+    write(
+        &h.kiro_hooks(),
+        &serde_json::to_string_pretty(&foreign).unwrap(),
+    );
+    let env = h.env(&[]);
+    install(&kiro_opts(false, BIN), &env);
+    let v = read_json(&h.kiro_hooks());
+    let hooks = v["hooks"].as_array().unwrap();
+    assert_eq!(hooks[0], foreign["hooks"][0]);
+    // agentmail's stop hook is updated in place, keeping the user's keys.
+    assert_eq!(hooks[1]["description"], "kept", "{v}");
+    assert_eq!(hooks[1]["enabled"], true, "{v}");
+    assert_eq!(hooks[1]["timeout"], 10, "{v}");
+    assert_eq!(hooks[1]["name"], "agentmail-stop", "{v}");
+    assert_eq!(hooks.len(), 5, "{v}");
+    uninstall(&kiro_opts(false, BIN), &env);
+    let v = read_json(&h.kiro_hooks());
+    assert_eq!(
+        v["hooks"].as_array().unwrap(),
+        &[foreign["hooks"][0].clone()]
+    );
+}
+
+#[test]
+fn kiro_respects_kiro_home() {
+    let h = Home::new();
+    let kh = h.dir.path().join("kh");
+    let env = h.env(&[("KIRO_HOME", kh.to_str().unwrap())]);
+    install(&kiro_opts(false, BIN), &env);
+    assert_eq!(
+        read_json(&kh.join("settings/mcp.json"))["mcpServers"]["agentmail"],
+        kiro_server(BIN)
+    );
+    assert_eq!(
+        read_json(&kh.join("hooks/agentmail.json")),
+        kiro_expected_hooks(BIN, false)
+    );
+    assert!(!h.kiro_dir().exists());
+    uninstall(&kiro_opts(false, BIN), &env);
+    assert!(!kh.exists(), "agentmail created it and removes it again");
+}
+
+#[test]
+fn kiro_project_scope() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&kiro_opts(true, BIN), &env);
+    let mcp = h.proj().join(".kiro/settings/mcp.json");
+    let hooks = h.proj().join(".kiro/hooks/agentmail.json");
+    assert_eq!(read_json(&mcp)["mcpServers"]["agentmail"], kiro_server(BIN));
+    assert_eq!(read_json(&hooks), kiro_expected_hooks(BIN, false));
+    assert!(!h.kiro_dir().exists());
+    uninstall(&kiro_opts(true, BIN), &env);
+    assert!(!h.proj().join(".kiro").exists());
+}
+
+#[test]
+fn kiro_idempotent() {
+    let h = Home::new();
+    write(&h.kiro_mcp(), FOREIGN_KIRO_MCP);
+    let env = h.env(&[]);
+    install(&kiro_opts(false, BIN), &env);
+    assert!(
+        install::plan_install(&kiro_opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+    // A reinstall from another path replaces the entries, never adds.
+    install(&kiro_opts(false, "/usr/local/bin/agentmail"), &env);
+    assert_eq!(
+        read_json(&h.kiro_hooks()),
+        kiro_expected_hooks("/usr/local/bin/agentmail", false)
+    );
+}
+
+#[test]
+fn kiro_uninstall() {
+    let h = Home::new();
+    write(&h.kiro_mcp(), FOREIGN_KIRO_MCP);
+    let env = h.env(&[]);
+    install(&kiro_opts(false, BIN), &env);
+    let changes = uninstall(&kiro_opts(false, BIN), &env);
+    assert_eq!(changes.len(), 2);
+    assert!(!h.kiro_hooks().exists());
+    assert!(!marker(&h.kiro_hooks()).exists());
+    assert!(!h.kiro_dir().join("hooks").exists());
+    assert_eq!(
+        read_json(&h.kiro_mcp()),
+        serde_json::from_str::<Value>(FOREIGN_KIRO_MCP).unwrap()
+    );
+    assert!(
+        install::plan_uninstall(&kiro_opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn kiro_hooks_file_with_only_agentmails_hooks_left_valid() {
+    // A hooks file agentmail did not create keeps its other content; with
+    // none, it is left without a `hooks` list kiro would reject.
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(
+        &h.kiro_hooks(),
+        &serde_json::to_string_pretty(&kiro_expected_hooks(BIN, false)).unwrap(),
+    );
+    uninstall(&kiro_opts(false, BIN), &env);
+    assert_eq!(read_json(&h.kiro_hooks()), json!({}));
+}
+
+#[test]
+fn kiro_v3_warning_printed() {
+    let h = Home::new();
+    let out = cli(&h)
+        .env_remove("KIRO_HOME")
+        .args(["install", "--harness", "kiro"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.lines().any(
+            |l| l == "kiro-cli: agentmail supports the V3 engine only — run kiro-cli chat --v3"
+        ),
+        "{out}"
+    );
+    assert!(h.kiro_hooks().exists());
+    let out = cli(&h)
+        .env_remove("KIRO_HOME")
+        .args(["--json", "install", "--harness", "kiro", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("V3 engine only")),
+        "{v}"
+    );
+    cli(&h)
+        .env_remove("KIRO_HOME")
+        .args(["uninstall", "--harness", "kiro"])
+        .assert()
+        .success();
+    assert!(!h.kiro_dir().exists());
+}
+
+#[test]
+fn cli_kiro_wake_is_kiro_only() {
+    let h = Home::new();
+    let out = cli(&h)
+        .args(["install", "--harness", "claude-code", "--kiro-wake"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    assert!(String::from_utf8(out).unwrap().contains("--kiro-wake"));
+    assert!(!h.settings().exists());
+    let out = cli(&h)
+        .env_remove("KIRO_HOME")
+        .args(["install", "--harness", "kiro", "--kiro-wake"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    // Waking holds what the human types until Esc: the install says so.
+    assert!(out.contains("Esc"), "{out}");
+    assert!(read(&h.kiro_hooks()).contains("--wake"));
+}
+
+#[test]
+fn cli_kiro_set_default_changes_nothing() {
+    // kiro V3 loads hooks/agentmail.json for every agent (spike), so there
+    // is no agent of agentmail's to make the default.
+    let h = Home::new();
+    let out = cli(&h)
+        .env_remove("KIRO_HOME")
+        .args(["install", "--harness", "kiro", "--set-default"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("--set-default"), "{out}");
+    assert!(!h.kiro_dir().join("agents").exists());
+    assert!(!h.kiro_dir().join("settings/cli.json").exists());
 }

@@ -71,6 +71,27 @@ pub fn comm(pid: u32) -> Option<String> {
     }
 }
 
+/// The command-line arguments of `pid` (`/proc/<pid>/cmdline`), the
+/// program first. `None` when unreadable.
+pub fn args(pid: u32) -> Option<Vec<std::ffi::OsString>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+        Some(
+            raw.split(|b| *b == 0)
+                .map(|a| std::ffi::OsStr::from_bytes(a).to_os_string())
+                .collect(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Environment variable `name` of process `pid`, as the process was started
 /// (`/proc/<pid>/environ`). `None` when unset or unreadable.
 pub fn env_var(pid: u32, name: &str) -> Option<std::ffi::OsString> {

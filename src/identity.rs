@@ -16,6 +16,9 @@ pub const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";
 /// The kiro-cli root conversation id, set for kiro's shell tool commands
 /// and hooks (not its MCP servers).
 pub const ENV_KIRO_SESSION: &str = "KIRO_SESSION_ID";
+/// `1` turns waking on by default for kiro-cli agents; `install
+/// --kiro-wake` sets it on the MCP server.
+pub const ENV_KIRO_WAKE: &str = "AGENTMAIL_KIRO_WAKE";
 
 /// The session variables, in the order [`session_from_env`] reads them.
 const SESSION_VARS: [(&str, Harness); 2] = [
@@ -382,6 +385,14 @@ fn binding_with(
         .copied()
         .filter(&usable)
         .map(|p| (p, Harness::Other))
+}
+
+/// Whether an agent of `harness` registering without saying is woken for
+/// new mail. Yes, except under kiro-cli: its Stop hook waits only when
+/// installed with `--kiro-wake` (kiro holds what the human types while it
+/// waits), which sets [`ENV_KIRO_WAKE`]`=1` for the MCP server.
+pub fn default_wake(harness: Harness, env: impl Fn(&str) -> Option<OsString>) -> bool {
+    harness != Harness::Kiro || env(ENV_KIRO_WAKE).is_some_and(|v| v == "1")
 }
 
 #[cfg(test)]

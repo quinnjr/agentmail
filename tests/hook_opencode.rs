@@ -114,6 +114,7 @@ async fn run(
         session,
         surface_urgent,
         timeout: None,
+        wake: false,
     };
     hook::run_with(Harness::Opencode, event, &args, stdin, &|k| env.get(k)).await
 }
@@ -160,6 +161,7 @@ fn spawn_wait_with(
             session: Some(&session),
             surface_urgent: false,
             timeout,
+            wake: false,
         };
         let out = hook::run_with(
             Harness::Opencode,

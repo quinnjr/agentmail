@@ -90,10 +90,6 @@ impl<C: AsRequestContext> FromContextPart<C> for CallSession {
 /// The default wait of `ask`, `await_answer` and `wait_for_mail`.
 const DEFAULT_TIMEOUT_SECS: u64 = 240;
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RegisterParams {
     /// Short role name, e.g. `backend` (lowercase letters, digits, `-`).
@@ -112,9 +108,11 @@ pub struct RegisterParams {
     /// Always take a new address instead of reclaiming a gone one.
     #[serde(default)]
     pub fresh: bool,
-    /// Wake this agent for new mail (default true).
-    #[serde(default = "default_true")]
-    pub wake: bool,
+    /// Wake this agent for new mail (default true, except under kiro-cli,
+    /// where waking is opt-in: false unless agentmail was installed with
+    /// `--kiro-wake`).
+    #[serde(default)]
+    pub wake: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -535,7 +533,9 @@ impl AgentMailServer {
             cwd,
             proc_id,
             fresh: p.fresh,
-            wake: p.wake,
+            wake: p
+                .wake
+                .unwrap_or_else(|| crate::identity::default_wake(harness, |k| std::env::var_os(k))),
             session: s.0.clone(),
         };
         Ok(match self.request(&s, req).await {
@@ -938,7 +938,7 @@ mod tests {
                 working_on: None,
                 harness: None,
                 fresh: false,
-                wake: true,
+                wake: Some(true),
             })
         };
         let kiro = Some(SessionKey {

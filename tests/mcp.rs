@@ -93,8 +93,15 @@ impl Env {
 
     /// `agentmail mcp` as a child process, with an initialized client.
     async fn mcp(&self) -> RunningService<RoleClient, ClientConfig> {
+        self.mcp_with(&[]).await
+    }
+
+    /// [`Env::mcp`] with extra variables for the server.
+    async fn mcp_with(&self, vars: &[(&str, &str)]) -> RunningService<RoleClient, ClientConfig> {
         let transport = TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|c| {
-            c.arg("mcp")
+            c.env_remove("AGENTMAIL_KIRO_WAKE")
+                .envs(vars.iter().copied())
+                .arg("mcp")
                 .env("AGENTMAIL_DATA_DIR", self.data_dir())
                 .env("AGENTMAIL_SOCKET", self.socket())
                 .env_remove("AGENTMAIL_ADDRESS")
@@ -870,5 +877,28 @@ async fn client_from_opencode_shell_binds_itself() {
     assert_eq!(me["agent"]["proc_id"]["pid"], foreign, "{me}");
     assert_eq!(me["agent"]["harness"], "other", "{me}");
 
+    client.cancel().await.unwrap();
+}
+
+/// Harness Task 8: a kiro agent registers with `wake` off unless asked,
+/// or unless `install --kiro-wake` gave the server `AGENTMAIL_KIRO_WAKE=1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_register_wake_defaults_off_for_kiro() {
+    let env = Env::new();
+    let client = env.mcp().await;
+    ok(&call(&client, "register", json!({"name": "k", "harness": "kiro"})).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["wake"], false, "{me}");
+    let args = json!({"name": "k", "harness": "kiro", "wake": true});
+    ok(&call(&client, "register", args).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["wake"], true, "{me}");
+    client.cancel().await.unwrap();
+
+    let client = env.mcp_with(&[("AGENTMAIL_KIRO_WAKE", "1")]).await;
+    let args = json!({"name": "k2", "harness": "kiro", "fresh": true});
+    ok(&call(&client, "register", args).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["wake"], true, "{me}");
     client.cancel().await.unwrap();
 }

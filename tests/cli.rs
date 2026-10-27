@@ -1400,3 +1400,51 @@ fn register_in_session_with_outside_pid_drops_the_session() {
     assert!(!out.status.success(), "{}", text(&out.stdout));
     assert_eq!(json(&out)["error"]["code"], "NoIdentity");
 }
+
+/// Harness Task 8: under kiro-cli, waking is opt-in (the human cannot
+/// reach the agent while its Stop hook waits), so `register` leaves `wake`
+/// off unless asked, or unless `install --kiro-wake` set
+/// `AGENTMAIL_KIRO_WAKE=1`. Other harnesses keep it on.
+#[test]
+fn register_wake_defaults_off_for_kiro() {
+    let env = Env::new();
+    let wake = |c: &mut Command| ok_json(c)["agent"]["wake"].clone();
+    let reg = |c: Command, name: &str| {
+        let mut c = c;
+        c.env_remove("AGENTMAIL_KIRO_WAKE")
+            .args(["register", name, "--json", "--fresh"]);
+        c
+    };
+    assert_eq!(wake(&mut reg(env.under("kiro-cli"), "k1")), false);
+    assert_eq!(wake(reg(env.under("kiro-cli"), "k2").arg("--wake")), true);
+    assert_eq!(
+        wake(reg(env.under("kiro-cli"), "k3").env("AGENTMAIL_KIRO_WAKE", "1")),
+        true
+    );
+    assert_eq!(
+        wake(
+            reg(env.under("kiro-cli"), "k4")
+                .env("AGENTMAIL_KIRO_WAKE", "1")
+                .arg("--no-wake")
+        ),
+        false
+    );
+    // `--harness kiro` names the harness: the same default.
+    let sleep = StdCommand::new("sleep").arg("300").spawn().unwrap();
+    let mut c = reg(env.cmd(), "k5");
+    c.args(["--harness", "kiro", "--pid"])
+        .arg(sleep.id().to_string());
+    let v = wake(&mut c);
+    let mut sleep = sleep;
+    let _ = sleep.kill();
+    let _ = sleep.wait();
+    assert_eq!(v, false);
+    // Other harnesses keep waking on by default.
+    assert_eq!(wake(&mut reg(env.under("claude"), "c1")), true);
+    // Both flags at once is a usage error.
+    let out = reg(env.under("kiro-cli"), "k6")
+        .args(["--wake", "--no-wake"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}

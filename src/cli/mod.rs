@@ -96,9 +96,13 @@ pub enum Command {
         /// Always take a new address instead of reclaiming a gone one.
         #[arg(long)]
         fresh: bool,
-        /// Do not wake this agent for new mail.
-        #[arg(long)]
+        /// Do not wake this agent for new mail (the default under kiro-cli,
+        /// unless `install --kiro-wake` set AGENTMAIL_KIRO_WAKE=1).
+        #[arg(long, conflicts_with = "wake")]
         no_wake: bool,
+        /// Wake this agent for new mail (the default, except under kiro-cli).
+        #[arg(long)]
+        wake: bool,
         /// Bind to this process instead of the detected harness process. A
         /// harness process, or a process that is not an ancestor of this
         /// command, is bound exactly; an ancestor that is not a harness
@@ -300,13 +304,17 @@ pub enum Command {
         /// plugin; default 300).
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
+        /// kiro's `stop`: wait for mail while the agent is idle, then
+        /// continue its turn (installed by `install --kiro-wake`).
+        #[arg(long)]
+        wake: bool,
     },
     /// Wire agentmail into a harness: its hooks (opencode: its plugin) and
     /// MCP server. Edits the harness's config files, keeping everything else
     /// in them; each file's original is saved once as `<file>.agentmail.bak`.
     Install {
-        /// The harness to install into.
-        #[arg(long, value_parser = ["claude-code", "opencode"])]
+        /// The harness to install into (kiro: the V3 engine only).
+        #[arg(long, value_parser = ["claude-code", "opencode", "kiro"])]
         harness: String,
         /// Install into the current project instead of your user config.
         #[arg(long)]
@@ -314,14 +322,21 @@ pub enum Command {
         /// Show the changes as a diff without making them.
         #[arg(long)]
         dry_run: bool,
-        /// Make agentmail's agent the harness's default (kiro only).
+        /// Make agentmail's agent the harness's default (kiro only; kiro-cli
+        /// V3 loads agentmail's hooks for every agent, so this changes
+        /// nothing).
         #[arg(long)]
         set_default: bool,
+        /// kiro only: wake idle agents for new mail. The Stop hook then waits
+        /// after each turn, and kiro holds what you type until it ends or
+        /// you press Esc, so it is off by default.
+        #[arg(long)]
+        kiro_wake: bool,
     },
     /// Remove what `install` added to a harness's config files.
     Uninstall {
         /// The harness to remove agentmail from.
-        #[arg(long, value_parser = ["claude-code", "opencode"])]
+        #[arg(long, value_parser = ["claude-code", "opencode", "kiro"])]
         harness: String,
         /// Remove it from the current project instead of your user config.
         #[arg(long)]
@@ -788,17 +803,25 @@ fn restart_hint(
     Some(format!("Restart running {name} sessions to {what} it."))
 }
 
-/// `agentmail install` / `uninstall`: plan the changes, then show them
-/// (`--dry-run`) or make them. Needs no daemon.
-fn install(
-    harness: &str,
+/// The flags of `install` / `uninstall`.
+#[derive(Debug, Default, Clone, Copy)]
+struct InstallFlags {
     project: bool,
     dry_run: bool,
     set_default: bool,
-    uninstall: bool,
-    json: bool,
-) -> Result<ExitCode> {
+    kiro_wake: bool,
+}
+
+/// `agentmail install` / `uninstall`: plan the changes, then show them
+/// (`--dry-run`) or make them. Needs no daemon.
+fn install(harness: &str, flags: InstallFlags, uninstall: bool, json: bool) -> Result<ExitCode> {
     use crate::install::{self as inst, Env, InstallOpts};
+    let InstallFlags {
+        project,
+        dry_run,
+        set_default,
+        kiro_wake,
+    } = flags;
     let harness = harness_from(harness)?;
     let bin = std::env::current_exe().context("locating the agentmail binary")?;
     let o = InstallOpts {
@@ -806,6 +829,7 @@ fn install(
         project,
         dry_run,
         set_default,
+        kiro_wake,
         bin,
     };
     let env = Env::from_process()?;
@@ -1044,8 +1068,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         session,
         surface_urgent,
         timeout,
+        wake,
     } = cli.command
     {
+        if wake && (harness != "kiro" || event != HookEvent::Stop) {
+            use clap::CommandFactory;
+            let e = Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--wake applies only to `hook stop --harness kiro`; drop --wake",
+            );
+            return Ok(clap_exit(&e));
+        }
         // `--as human` is the human, like `AGENTMAIL_HUMAN=1`: a hook run
         // as the human has nothing to say (`--as` takes no other value),
         // which for opencode's plugin is `{}` / `{"gone":true}`.
@@ -1062,6 +1095,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             session: session.as_deref(),
             surface_urgent,
             timeout: timeout.map(Duration::from_secs),
+            wake,
         };
         return Ok(hook(event, &harness, &args).await);
     }
@@ -1071,7 +1105,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             project,
             dry_run,
             set_default,
+            kiro_wake,
         } => {
+            if kiro_wake && harness != "kiro" {
+                use clap::CommandFactory;
+                let e = Cli::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    format!(
+                        "--kiro-wake applies only to --harness kiro; drop --kiro-wake \
+                         ({harness} wakes idle agents without it)"
+                    ),
+                );
+                return Ok(clap_exit(&e));
+            }
             if set_default && harness != "kiro" {
                 use clap::CommandFactory;
                 let e = Cli::command().error(
@@ -1083,13 +1129,26 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 );
                 return Ok(clap_exit(&e));
             }
-            return install(&harness, project, dry_run, set_default, false, cli.json);
+            let flags = InstallFlags {
+                project,
+                dry_run,
+                set_default,
+                kiro_wake,
+            };
+            return install(&harness, flags, false, cli.json);
         }
         Command::Uninstall {
             harness,
             project,
             dry_run,
-        } => return install(&harness, project, dry_run, false, true, cli.json),
+        } => {
+            let flags = InstallFlags {
+                project,
+                dry_run,
+                ..InstallFlags::default()
+            };
+            return install(&harness, flags, true, cli.json);
+        }
         _ => {}
     }
     let paths = Paths::from_env()?;
@@ -1194,6 +1253,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             harness,
             fresh,
             no_wake,
+            wake,
             pid,
         } => {
             let bound = identity::register_proc(pid);
@@ -1246,6 +1306,11 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 (None, Some(k)) => k.harness,
                 (None, None) => detected,
             };
+            let wake = match (wake, no_wake) {
+                (true, _) => true,
+                (_, true) => false,
+                _ => identity::default_wake(harness, |k| std::env::var_os(k)),
+            };
             let req = Request::Register {
                 name,
                 role,
@@ -1254,7 +1319,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 cwd: std::env::current_dir().context("reading the working directory")?,
                 proc_id,
                 fresh,
-                wake: !no_wake,
+                wake,
                 session,
             };
             let d = s.call(req).await?;

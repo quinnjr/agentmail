@@ -46,11 +46,11 @@ model credentials that an isolated config does not have).
     (test `bind_skips_kiro_cli_chat`). An unknown MCP client run from a
     Claude Code shell binds its own parent instead, and so does one run
     from a kiro or opencode shell (see "MCP clients run from a harness
-    shell" below). What sits between `kiro-cli-chat` and `node` was
-    not observed live: in an isolated `HOME`/`KIRO_HOME` the real
-    `kiro-cli chat` stops at the browser login prompt before starting the
-    engine (no credentials in isolation). The binding does not depend on
-    that depth.
+    shell" below). Observed live in Task 8 (with the login copied into an
+    isolated data dir): the chain is `kiro-cli` -> `kiro-cli-chat` ->
+    the engine's `node` -> the MCP server (and `node` -> `sh -c` -> a
+    hook command), and the V3 MCP `register` bound `kiro-cli`'s pid with
+    harness `kiro`.
 - **Inherited session variables.** A harness started from another
   harness's shell inherits the outer variable (`claude` run from an opencode
   bash tool sees `OPENCODE_SESSION_ID`). The CLI only uses the variable of
@@ -168,12 +168,11 @@ model credentials that an isolated config does not have).
     environment variables the CLI reads, and twice as search keywords in
     its bundled help pages (hooks, session management). None of these
     shows it being set for the `kiro-cli-chat` or `node` children, but that
-    is a static reading. The process environments themselves were not
-    observed, because in an isolated `HOME`/`KIRO_HOME` the real
-    `kiro-cli chat` stops at the browser login before it starts either
-    process. The Task 10 kiro e2e (`scripts/e2e.sh kiro`) closes this: it
-    asserts that the V3 MCP `register` records harness `kiro`, bound to the
-    `kiro-cli` pid.
+    is a static reading. Task 8 then saw it hold live: the V3 MCP
+    `register` recorded harness `kiro`, bound to the `kiro-cli` pid, so
+    neither process carried a differing `KIRO_SESSION_ID` (see "kiro-cli
+    V3 hooks"). The Task 10 kiro e2e (`scripts/e2e.sh kiro`) keeps
+    asserting it.
 - **`register --pid` under opencode.** A `--pid` naming a non-harness
   ancestor (the shell, `$$`) is redirected to the opencode process above it,
   and so refused without a session like any other sessionless opencode
@@ -558,9 +557,8 @@ The code differs from the plan's sketch; build on the code:
   event, &HookArgs { session, surface_urgent, timeout }, stdin, env)`
   (the whole `hook` command line), where `env: &(dyn Fn(&str) ->
   Option<OsString> + Sync)` (the `Sync` lets a waiting hook run on a
-  spawned task). `run_with` dispatches on the harness: Claude Code and
-  opencode (Task 6) are implemented; kiro currently returns empty
-  output there.
+  spawned task). `run_with` dispatches on the harness: Claude Code,
+  opencode (Task 6) and kiro (Task 8; `HookArgs::wake` is its `--wake`).
 - `HookInput` also carries `agent_id` (Claude Code subagents), `prompt_id` and
   `hook_event_name`.
 - `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(&status)`,
@@ -975,3 +973,106 @@ them all.
 - The rest (backups, creation markers, keeping the file's layout, symlinks,
   modes) is the shared install machinery described under Claude Code's
   install (Task 5).
+
+## kiro-cli V3 hooks (Task 8)
+
+Checked live against kiro-cli 2.32.0 (KAS engine 0.66.43) with `chat --v3`,
+both `--no-interactive` and the interactive TUI in a detached tmux pane,
+in throwaway `HOME`, `XDG_*` and `KIRO_HOME` directories. kiro keeps its
+login in `$XDG_DATA_HOME/kiro-cli/data.sqlite3`, not in `KIRO_HOME`, so
+the spike copied only that file into the private data dir (with the
+engine binaries linked in), ran while its access token was still valid
+(so no refresh happened in the copy), and deleted it afterwards. The
+config schema and exit-code rules come from the engine bundle
+(`kas/<version>/node_modules/@kiro/agent/dist/server/acp-server.js`).
+
+- **(a) A standalone hooks file works, so no agent file is written.**
+  `$KIRO_HOME/hooks/*.json` (else `~/.kiro/hooks/`) is loaded for the
+  default agent, with no `--agent`. The format is
+  `{"version": "v1", "hooks": [{"name", "trigger", "matcher"?,
+  "action": {"type": "command", "command"}, "timeout"?, "enabled"?,
+  "description"?}]}`, with at least one hook. Triggers include
+  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and
+  `Stop` (also the V2 names `agentStop`, `promptSubmit`, ...). `timeout`
+  is in seconds, default 60; `0` means none. A workspace's
+  `.kiro/hooks/*.json` is loaded too (seen live in a git repo, with `-a`;
+  the engine runs hook commands only in a trusted workspace). The engine
+  watches `.kiro/hooks` and reloads. `--set-default` therefore has nothing
+  to do: install says so and changes no default agent.
+- **MCP.** `$KIRO_HOME/settings/mcp.json` (and a workspace's
+  `.kiro/settings/mcp.json`) `mcpServers.agentmail = {"command", "args"}`
+  is started by the V3 engine with the server's `env` added to kiro's own
+  environment; its tools appear as `@agentmail/<tool>` (loaded with
+  `tool_load`).
+- **Output, by exit code** (bundle, then checked live): stdout of a
+  `SessionStart` or `UserPromptSubmit` hook that exits 0 goes to the model
+  (UserPromptSubmit's is appended to the human's prompt text). Exit 2
+  from `PreToolUse` (or `UserPromptSubmit`) blocks: the tool call does not
+  run and the model gets stderr as its result (seen: the model read the
+  mail, then ran the tool again). Exit 1 from `Stop`, or exit 0 with
+  `{"decision": "block", "reason"}`, continues the turn with stderr (else
+  stdout) as a `<HOOK_INSTRUCTION>`. `PostToolUse` output is ignored. A
+  model may distrust text that looks injected, so the PreToolUse text
+  says plainly that agentmail held the call and that it can run again.
+- **(b) Stop continuations: one per human prompt.** A turn that a Stop
+  hook continued ends without running the Stop hooks again
+  (`onAgentStopHooksExecuted`): with a Stop hook that always exits 1, a
+  `--no-interactive` run continued once and then ended. So open
+  questions can never hold a model that cannot answer them, and kiro needs
+  nothing like Claude Code's `stop_hook_active`; but after a wake (or an
+  open-question continuation) the agent is not woken again until the
+  human's next prompt.
+- **(c) The human cannot reach the agent while a Stop hook blocks.** While
+  it runs, the TUI shows "Kiro is working · Type to steer". A message
+  typed and submitted then is queued ("1 message queued") and delivered
+  only after the hook exits. Esc cancels the turn and gives the prompt
+  back at once, but kiro does not stop the hook process: it runs on, and
+  its later exit 1 is ignored (no new turn). **Decision (plan rule): input
+  is held, so waking on kiro is opt-in.** `install --harness kiro` writes
+  the Stop hook without `--wake` (it only checks open questions, timeout
+  10); `install --kiro-wake` writes `hook stop --harness kiro --wake` with
+  `timeout: 0` and gives the MCP server `AGENTMAIL_KIRO_WAKE=1`.
+  `register` (MCP and CLI) defaults `wake` to false for a kiro agent
+  unless that variable is `1`; `wake: true` / `--wake` still turns it on.
+  A Stop hook left running after Esc ends at the human's next prompt or
+  tool call (they mark the session busy), so it never wakes a busy session
+  or competes with the next stop's wait; if mail comes first, its wake is
+  lost (kiro ignores it) but recorded, so that mail does not wake the
+  agent again, and the next prompt's reminder still shows it.
+- **Waking works.** With `--kiro-wake`, after a turn in the TUI the Stop
+  hook waited; mail from the human made it exit 1 and the agent read and
+  answered the mail in the continued turn, with no human input.
+- **Headless runs are never waited in.** `chat --no-interactive` ends only
+  after its Stop hooks, so a waiting one held a run open until killed.
+  The Stop hook does not wait when `kiro-cli` or `kiro-cli-chat` above it
+  was started with `--no-interactive`, or with `acp` (an editor drives the
+  engine; not checked live, so not risked).
+- **(d) Payloads and environment.** Recorded in
+  `tests/fixtures/hooks/kiro/` (paths anonymised): every payload has
+  `session_id` (`sess_<uuid>`, the same as `KIRO_SESSION_ID`),
+  `hook_event_name` and `cwd`; `UserPromptSubmit` adds `prompt`,
+  `PreToolUse` `tool_name` and `tool_input`, `PostToolUse` also
+  `tool_response`; `Stop` has nothing more (no `stop_hook_active`).
+  Every hook gets `KIRO_SESSION_ID` and runs in the session's directory,
+  as `sh -c <command>` under the engine's `node`, so the hook's ancestry
+  reaches `kiro-cli` (`node` -> `kiro-cli-chat` -> `kiro-cli`), where it
+  is cut (`hook_procs` in `src/hook/mod.rs`): the agent the MCP server bound there is found.
+- **What agentmail installs** (`hooks/agentmail.json`, a file of its own;
+  hooks recognised by their command, as for Claude Code):
+  `agentmail-session-start` (SessionStart) and `agentmail-prompt`
+  (UserPromptSubmit) print who the agent is and its reminder;
+  `agentmail-pre-tool` (PreToolUse, matcher `.*`: without a matcher kiro
+  runs it too but logs a warning) blocks one tool call per urgent message
+  with the mail on stderr; `agentmail-stop` (Stop) exits 1 with the open
+  questions, else, with `--wake` and the agent's `wake` on, waits as
+  Claude Code's wait hook does (`Daemon::wait`, no stop key) and exits 1
+  with the reminder when mail comes. Timeouts: 10 s, and none (`0`) for
+  the waiting Stop hook. A reinstall updates agentmail's hooks in place,
+  keeping keys the user added (`enabled`, `description`) and other hooks
+  in the file; uninstall removes them, the file itself when agentmail
+  created it, and a file left with no hooks loses its `hooks` and
+  `version` (kiro rejects an empty list). `install` prints
+  `kiro-cli: agentmail supports the V3 engine only — run kiro-cli chat --v3`.
+- **Subagents.** Their hooks carry the root conversation's
+  `KIRO_SESSION_ID` and run under the same `kiro-cli`, so they act as the
+  root agent (see "Session ids" above).
