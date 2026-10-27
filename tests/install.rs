@@ -1208,12 +1208,10 @@ fn opencode_jsonc_with_comments_refused_unchanged() {
     assert!(msg.contains("\"agentmail\": {"), "{msg}");
     assert!(msg.contains(&format!("\"{BIN}\"")), "{msg}");
     assert!(msg.contains("\"codemode\": false"), "{msg}");
-    // The rerun after pasting changes only the plugin, so the command
-    // prints no restart line then: the refusal says it is needed.
-    assert!(
-        msg.contains("`opencode service restart` to load the server"),
-        "{msg}"
-    );
+    // opencode reloads its config by itself: no service restart, which
+    // would interrupt every opencode session.
+    assert!(msg.contains("run the install again"), "{msg}");
+    assert!(!msg.contains("restart"), "{msg}");
     assert_eq!(read(&path), text);
     assert!(!h.oc_plugin().exists());
     assert!(!h.oc_config().exists());
@@ -1232,10 +1230,8 @@ fn opencode_jsonc_with_comments_refused_unchanged() {
     let err = install::plan_uninstall(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("by hand"), "{msg}");
-    assert!(
-        msg.contains("`opencode service restart` to unload the server"),
-        "{msg}"
-    );
+    assert!(msg.contains("run the uninstall again"), "{msg}");
+    assert!(!msg.contains("restart"), "{msg}");
     assert!(h.oc_plugin().exists());
     // Without the entry there is nothing to edit: the plugin goes.
     write(&path, text);
@@ -1647,13 +1643,11 @@ fn cli_opencode_install_and_uninstall() {
         out.contains("agentmail is installed for opencode."),
         "{out}"
     );
-    // Sessions run inside opencode's background service, which keeps the
-    // config it read at start: restarting a session loads nothing.
-    assert!(
-        out.contains("Run `opencode service restart` to load it"),
-        "{out}"
-    );
-    assert!(!out.contains("Restart running"), "{out}");
+    // opencode's background service watches its config and plugin files
+    // and reloads them by itself, so nothing needs restarting (and
+    // restarting the service would interrupt every opencode session).
+    assert!(!out.contains("restart"), "{out}");
+    assert!(!out.contains("Restart"), "{out}");
     let bin = std::fs::canonicalize(env!("CARGO_BIN_EXE_agentmail")).unwrap();
     let bin = bin.to_str().unwrap();
     assert_eq!(
@@ -1661,7 +1655,7 @@ fn cli_opencode_install_and_uninstall() {
         oc_server(bin)
     );
     assert_eq!(read(&h.oc_plugin()), oc_plugin_text(bin));
-    // Only the plugin file changes: opencode reloads it by itself.
+    // Only the plugin file changes: still no restart line.
     std::fs::remove_file(h.oc_plugin()).unwrap();
     let out = cli(&h)
         .env_remove("XDG_CONFIG_HOME")
@@ -1707,11 +1701,8 @@ fn cli_opencode_install_and_uninstall() {
         .clone();
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains("agentmail is removed from opencode."), "{out}");
-    assert!(
-        out.contains("Run `opencode service restart` to unload it"),
-        "{out}"
-    );
-    assert!(!out.contains("Restart running"), "{out}");
+    assert!(!out.contains("restart"), "{out}");
+    assert!(!out.contains("Restart"), "{out}");
     assert!(!h.oc_config().exists());
     assert!(!h.oc_plugin().exists());
     let out = cli(&h)
@@ -1723,6 +1714,14 @@ fn cli_opencode_install_and_uninstall() {
         .stdout
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
-    let restart = v["restart"].as_str().unwrap_or_default();
-    assert!(restart.contains("`opencode service restart`"), "{v}");
+    // A config change still needs no restart.
+    assert!(
+        v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == h.oc_config().display().to_string()),
+        "{v}"
+    );
+    assert_eq!(v["restart"], Value::Null, "{v}");
 }

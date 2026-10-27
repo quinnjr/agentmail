@@ -206,8 +206,7 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
             bail!(
                 "{} {jsonc}. Add this by hand, merging it into the \"mcp\" there in place of any \
                  \"agentmail\" entry in \"mcp\" → \"servers\".{v1} Then run the install again \
-                 to add the plugin, and `opencode service restart` to load the server (opencode's \
-                 background service reads its config only at start):\n{}",
+                 to add the plugin:\n{}",
                 path.display(),
                 snippet(bin)
             );
@@ -215,8 +214,7 @@ fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
         bail!(
             "{} {jsonc}. Remove the \"agentmail\" entry from \"mcp\" → \"servers\" (and any \
              \"agentmail\" directly under \"mcp\") by hand, then run the uninstall again to \
-             remove the plugin, and `opencode service restart` to unload the server (opencode's \
-             background service reads its config only at start).",
+             remove the plugin.",
             path.display()
         );
     }

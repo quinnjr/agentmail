@@ -770,32 +770,20 @@ fn harness_title(h: Harness) -> &'static str {
 }
 
 /// What the user must restart for the harness to pick up `changes`, if
-/// anything. opencode runs every session inside one background service that
-/// keeps the config it read at start, so a session restart loads nothing;
-/// the service needs restarting, and only for a config change (it watches
-/// and reloads its plugin files by itself).
+/// anything. opencode needs nothing: its background service watches its
+/// config and plugin files and reloads them by itself (a config change
+/// emits `config.updated`, reloads the plugins and connects new MCP
+/// servers), and restarting that service would interrupt every opencode
+/// session on the machine.
 fn restart_hint(
     harness: Harness,
     uninstall: bool,
     changes: &[crate::install::Change],
 ) -> Option<String> {
-    if changes.is_empty() {
+    if changes.is_empty() || harness == Harness::Opencode {
         return None;
     }
     let what = if uninstall { "unload" } else { "load" };
-    if harness == Harness::Opencode {
-        let config = changes.iter().any(|c| {
-            matches!(
-                c.path.file_name().and_then(|n| n.to_str()),
-                Some("opencode.json" | "opencode.jsonc")
-            )
-        });
-        return config.then(|| {
-            format!(
-                "Run `opencode service restart` to {what} it: opencode's background service reads its config only at start."
-            )
-        });
-    }
     let name = harness_title(harness);
     Some(format!("Restart running {name} sessions to {what} it."))
 }

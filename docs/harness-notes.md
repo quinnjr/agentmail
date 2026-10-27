@@ -844,14 +844,17 @@ against opencode 2.0.27 with private `HOME` and `XDG_*` directories and
 the background service moved to a private port (`opencode service set
 port`, which writes `service.json` in the private config dir); `opencode
 debug config` shows the config the service resolved, and the service log
-shows the plugin loading and the server connecting. The service reads its
-config at start, so after an install or uninstall that changes
-`opencode.json`/`opencode.jsonc` it needs `opencode service restart` (the
-command says so, instead of the "restart running sessions" line other
-harnesses get: every opencode session lives in that service, so restarting
-a session loads nothing). The plugin file itself is watched, so a change to
-it alone needs no restart and the command prints none. `--json` carries the
-same instruction as `restart` (null when nothing needs restarting).
+shows the plugin loading and the server connecting. The service watches
+its global config: editing `opencode.json` while it runs logs
+`event.type=config.updated`, the instance reloads its plugins, and a newly
+added local MCP server is started and connects, with no restart and no CLI
+call. A newly created `opencode.jsonc` (with no `opencode.json` present)
+is picked up the same way, and so is a plugin file added to a `plugins/`
+dir created after the service started. So install and uninstall print no
+restart line for opencode, and `--json` `restart` is null for it. They
+must never suggest `opencode service restart`: every opencode session on
+the machine lives in that one service, so restarting it would interrupt
+them all.
 
 - **Where.** The config dir is `$XDG_CONFIG_HOME/opencode` (a relative
   value is taken from the current directory, as opencode does), else
@@ -900,9 +903,8 @@ same instruction as `restart` (null when nothing needs restarting).
   removed; otherwise nothing at all is changed and the error shows the
   exact entry to paste (install; also telling to delete a V1
   `mcp.agentmail` when there is one) or says what to delete by hand
-  (uninstall), then to run the command again and `opencode service
-  restart` (the rerun changes only the plugin, so it prints no restart
-  line itself, but the service has not read the hand edit). With several
+  (uninstall), then to run the command again (to add or remove the
+  plugin; opencode picks up the hand edit by itself). With several
   files, any one refusing changes nothing in any.
 - **The plugin** is `plugin/agentmail.js` embedded in the binary with its
   one `"__AGENTMAIL_BIN__"` literal replaced by the binary's path as a
