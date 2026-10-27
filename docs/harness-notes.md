@@ -83,6 +83,19 @@ model credentials that an isolated config does not have).
   tool, below) is not bound to opencode and not shared. The refusal names
   the cause: the server was started by opencode, which shares it between
   its sessions.
+- **Harness at PID 1: session-only agents.** A harness ancestor at PID 1
+  (opencode as a container's entry point) cannot be bound to, and the CLI
+  then binds nothing rather than falling back to the grandparent, so
+  `agentmail register` (however deep its chain: opencode -> bash -> make ->
+  sh -> agentmail) and the MCP server (whose parent is the harness) agree:
+  the session's agent carries no process. Falling back would bind a
+  transient process in between, which would mark the agent Gone when it
+  exits and be replaced by a different one on the next register. Presence
+  is unchanged: an agent without a bound process is never Active, so mail
+  addressed to it by name is held until a bound registration claims it;
+  callers in that session act as it through its session (MCP `_meta`,
+  `OPENCODE_SESSION_ID`) or `AGENTMAIL_ADDRESS`. Pinned by
+  `identity_cli_session_register_under_pid_1_opencode_is_unbound`.
 - **opencode MCP server behind a wrapper.** When opencode starts the
   server through a wrapper (opencode -> `sh -c` -> agentmail mcp), the
   server's parent is the wrapper, but a session `register` over MCP binds

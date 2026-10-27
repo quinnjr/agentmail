@@ -190,8 +190,9 @@ fn caller_from(
 ///    harness, has no kiro or opencode above it, or sits above it): exactly
 ///    that process, with the harness its command name suggests.
 /// 3. Otherwise the nearest ancestor that is a known harness process.
-/// 4. Otherwise the grandparent, i.e. the parent of the shell running the
-///    CLI, as [`Harness::Other`].
+/// 4. Otherwise (no harness ancestor at all) the grandparent, i.e. the
+///    parent of the shell running the CLI, as [`Harness::Other`]. A harness
+///    ancestor at PID 1 binds nothing rather than falling back here.
 ///
 /// `None` when the process is gone or unreadable, or would be PID 1: every
 /// process descends from init, so binding to it would make the agent the
@@ -250,7 +251,7 @@ fn launched_from_harness_shell(
     harness: Harness,
     environ: impl Fn(u32, &str) -> Option<OsString>,
 ) -> bool {
-    let Some((name, _)) = SESSION_VARS.into_iter().find(|(_, h)| *h == harness) else {
+    let Some(name) = session_var(harness) else {
         return false;
     };
     let inherited = environ(harness_proc.pid, name);
@@ -326,8 +327,12 @@ fn binding_with(
         // Guard against the PID being reused between the two reads.
         return procinfo::is_alive(&p).then_some((p, harness));
     }
-    if let Some(found) = find_harness(me).filter(|(p, _)| usable(p)) {
-        return Some(found);
+    // A harness that cannot be bound (PID 1) binds nothing: falling back
+    // to the grandparent would bind an arbitrary, possibly short-lived
+    // process below it (a `make` or `sh` between the harness and the CLI),
+    // and the MCP server, whose parent is the harness, binds nothing too.
+    if let Some(found) = find_harness(me) {
+        return usable(&found.0).then_some(found);
     }
     procinfo::ancestors(me)
         .get(1)
@@ -962,17 +967,33 @@ mod tests {
 
     #[test]
     fn identity_register_proc_rejects_harness_at_pid_1() {
-        // A harness lookup that lands on init is ignored in favour of the
-        // grandparent.
+        // A harness lookup that lands on init binds nothing, rather than
+        // the grandparent, a process between init and the caller.
         let (child, grandchild) = spawn_grandchild();
         let init = procinfo::proc_id(1);
         let found = redirecting(grandchild, None, |_| init.map(|p| (p, Harness::ClaudeCode)));
         reap(child, grandchild);
-        let me = std::process::id();
-        assert_eq!(
-            found,
-            Some((procinfo::proc_id(me).unwrap(), Harness::Other))
-        );
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn identity_cli_session_register_under_pid_1_opencode_is_unbound() {
+        // `agentmail register` from an opencode session whose opencode is
+        // PID 1, run through intermediate processes (opencode -> ... -> sh
+        // -> agentmail): the session agent carries no process, as over MCP
+        // (whose parent, opencode at PID 1, cannot be bound), instead of
+        // being bound to a transient process in between. The harness is
+        // still opencode, so its process counts as shared.
+        let (child, grandchild) = spawn_grandchild();
+        let init = procinfo::proc_id(1);
+        let at_init = |_| init.map(|p| (p, Harness::Opencode));
+        let cli = register_proc_with(grandchild, None, at_init, |_| true);
+        let harness = binding_with(grandchild, None, at_init, |_| true, |_| true);
+        let mcp = register_proc_with(grandchild, Some(1), at_init, |_| true);
+        reap(child, grandchild);
+        assert_eq!(cli, None);
+        assert_eq!(mcp, None);
+        assert_eq!(harness.map(|(_, h)| h), Some(Harness::Opencode));
     }
 
     #[test]
@@ -990,8 +1011,7 @@ mod tests {
         reap(child, grandchild);
         assert_eq!(found, init.map(|p| (p, Harness::Opencode)));
         assert_eq!(via_shell, init.map(|p| (p, Harness::Opencode)));
-        assert_ne!(bound.map(|(p, _)| p.pid), Some(1));
-        assert_ne!(bound.map(|(_, h)| h), Some(Harness::Opencode));
+        assert_eq!(bound, None);
     }
 
     #[test]
