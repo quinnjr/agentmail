@@ -1057,7 +1057,8 @@ config schema and exit-code rules come from the engine bundle
   the `kiro-cli` process the CLI runs under, read from
   `/proc/<pid>/cwd`, so a command run in a subdirectory finds it; the
   CLI's own directory only without a `kiro-cli` above it; the
-  workspace's entry decides when it has one), else the user's (`$KIRO_HOME`, else `~/.kiro`), and takes
+  workspace's entry decides when it has one), else the user's
+  (`$KIRO_HOME`, else `~/.kiro`), and takes
   `env.AGENTMAIL_KIRO_WAKE = "1"` there as the install's choice.
   `wake: true` / `--wake` still turns it on.
   A Stop hook left running after Esc ends at the human's next prompt or
@@ -1087,7 +1088,8 @@ config schema and exit-code rules come from the engine bundle
   Every hook gets `KIRO_SESSION_ID` and runs in the session's directory,
   as `sh -c <command>` under the engine's `node`, so the hook's ancestry
   reaches `kiro-cli` (`node` -> `kiro-cli-chat` -> `kiro-cli`), where it
-  is cut (`hook_procs` in `src/hook/mod.rs`): the agent the MCP server bound there is found.
+  is cut (`hook_procs` in `src/hook/mod.rs`): the agent the MCP server
+  bound there is found.
 - **What agentmail installs** (`hooks/agentmail.json`, a file of its own;
   hooks recognised by their command, as for Claude Code):
   `agentmail-session-start` (SessionStart) and `agentmail-prompt`
@@ -1108,6 +1110,19 @@ config schema and exit-code rules come from the engine bundle
   already there from the install, which holds the file before
   agentmail; else the text as it was at uninstall). `install` prints
   `kiro-cli: agentmail supports the V3 engine only — run kiro-cli chat --v3`.
+  An uninstall leaves a hooks file without agentmail's hooks (an empty
+  list, or only the user's) as it is.
+- **Both scopes at once.** kiro loads a trusted workspace's
+  `.kiro/hooks/` alongside the user's `hooks/`, so agentmail installed
+  at both scopes runs every hook twice: two reminders at session start
+  and on each prompt, two `PreToolUse` hooks, and two Stop hooks. The
+  two Stop hooks share the `shown` file without a lock, so both can show
+  the same open questions; with `--kiro-wake` at one scope only, that
+  scope's waiting Stop hook runs beside the other's plain one, which
+  ends the stop at once with any open questions. `install` therefore
+  notes when the other scope's `hooks/agentmail.json` already holds
+  agentmail's hooks, and names the `uninstall` that removes them. Install
+  at one scope only.
 - **Subagents cannot be told apart.** Checked live (`--no-interactive`,
   the root told to use `invoke_sub_agent` for `echo sub-ok`): the
   subagent ran `PreToolUse` hooks for its own tool calls (`execute_bash`,

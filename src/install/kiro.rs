@@ -157,19 +157,41 @@ fn merge_hooks(hooks: &mut Vec<Value>, wanted: &[Value], bin: &Path) {
     );
 }
 
-/// Remove agentmail's hooks from a hooks file, for [`JsonFile::change`].
-/// A file left with no hooks loses its `hooks` list and its `version`;
-/// [`plan`] then removes the file ([`remove_hookless`]).
-fn strip_hooks_file(v: &mut Map<String, Value>, bin: &Path) {
-    if let Some(Value::Array(hooks)) = v.get_mut("hooks") {
-        hooks.retain(|h| !is_owned_hook(h, bin));
-        if hooks.is_empty() {
-            v.shift_remove("hooks");
-            if v.get("version").and_then(Value::as_str) == Some(VERSION) {
-                v.shift_remove("version");
-            }
+/// Remove agentmail's hooks from a hooks file, for [`JsonFile::change`],
+/// and say whether there were any. A file left with no hooks by removing
+/// them loses its `hooks` list and its `version`; [`plan`] then removes
+/// the file ([`remove_hookless`]). A file without agentmail's hooks (an
+/// empty list included) is left as it is.
+fn strip_hooks_file(v: &mut Map<String, Value>, bin: &Path) -> bool {
+    let Some(Value::Array(hooks)) = v.get_mut("hooks") else {
+        return false;
+    };
+    let before = hooks.len();
+    hooks.retain(|h| !is_owned_hook(h, bin));
+    if hooks.len() == before {
+        return false;
+    }
+    if hooks.is_empty() {
+        v.shift_remove("hooks");
+        if v.get("version").and_then(Value::as_str) == Some(VERSION) {
+            v.shift_remove("version");
         }
     }
+    true
+}
+
+/// Whether the hooks file at `path` holds any of agentmail's hooks. A
+/// file that is missing or cannot be read counts as none.
+fn has_owned_hooks(path: &Path, bin: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let text = super::json::strip_jsonc(&text).unwrap_or(text);
+    super::json::parse(&text).ok().is_some_and(|v| {
+        v.get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|hooks| hooks.iter().any(|h| is_owned_hook(h, bin)))
+    })
 }
 
 /// An uninstall's change to a hooks file left with no hooks, made a
@@ -227,8 +249,8 @@ fn set_wake_env(entry: &mut Map<String, Value>, wake: bool) {
 /// Whether `install --kiro-wake` is in effect where `env` runs: the
 /// agentmail MCP server entry of the workspace's `.kiro/settings/mcp.json`
 /// (in `env.cwd`: the caller passes kiro's workspace, the `kiro-cli`
-/// process's working directory), else of the user's (`$KIRO_HOME`, else `~/.kiro`), sets
-/// `AGENTMAIL_KIRO_WAKE` to `1`. kiro gives that variable only to the MCP
+/// process's working directory), else of the user's (`$KIRO_HOME`, else
+/// `~/.kiro`), sets `AGENTMAIL_KIRO_WAKE` to `1`. kiro gives that variable only to the MCP
 /// server, not to its shell tool's commands, so the CLI's `register` reads
 /// it here. A file that is missing or cannot be read counts as no entry.
 pub fn wake_installed(env: &Env) -> bool {
@@ -269,6 +291,7 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
         },
     )?;
     let mut new = file.value.clone();
+    let mut stripped = false;
     if install {
         if !new.contains_key("version") {
             new.insert("version".into(), json!(VERSION));
@@ -284,7 +307,7 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
         };
         merge_hooks(hooks, &wanted, &o.bin);
     } else {
-        strip_hooks_file(&mut new, &o.bin);
+        stripped = strip_hooks_file(&mut new, &o.bin);
     }
 
     let mcp_snippet = || {
@@ -320,9 +343,11 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
         strip_mcp(&mut new_mcp);
     }
 
-    let hookless = !install && file.value.contains_key("hooks") && !new.contains_key("hooks");
+    let hookless = stripped && !new.contains_key("hooks");
     let hooks_change = file
-        .change(new, !install, &|v| strip_hooks_file(v, &o.bin))
+        .change(new, !install, &|v| {
+            strip_hooks_file(v, &o.bin);
+        })
         .map(|c| match hookless {
             true => remove_hookless(c),
             false => c,
@@ -333,14 +358,30 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
         .collect())
 }
 
-/// What `install` tells the user about kiro: the V3-only warning, what
+/// What `install` tells the user about kiro: the V3-only warning, that
+/// agentmail's hooks are installed at the other scope too (kiro loads a
+/// workspace's hooks alongside the user's, so each would run twice), what
 /// waking costs (`--kiro-wake`), and that `--set-default` has nothing to
 /// do.
-pub(super) fn notes(o: &InstallOpts, install: bool) -> Vec<String> {
+pub(super) fn notes(o: &InstallOpts, env: &Env, install: bool) -> Vec<String> {
     if !install {
         return Vec::new();
     }
     let mut notes = vec![V3_WARNING.to_string()];
+    let (here, other) = (dir(o.project, env), dir(!o.project, env));
+    let other_hooks = other.join("hooks").join("agentmail.json");
+    if here != other && has_owned_hooks(&other_hooks, &o.bin) {
+        let (flag, scope) = match o.project {
+            true => ("", "user"),
+            false => (" --project", "project"),
+        };
+        notes.push(format!(
+            "note: agentmail's kiro hooks are also installed at {scope} scope ({}); \
+             kiro-cli loads both, so every agentmail hook runs twice. Keep one: \
+             agentmail uninstall --harness kiro{flag}",
+            other_hooks.display()
+        ));
+    }
     if o.kiro_wake {
         notes.push(
             "note: kiro-cli waking is on: after each turn the Stop hook waits for mail, \

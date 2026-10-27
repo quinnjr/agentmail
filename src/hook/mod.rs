@@ -503,8 +503,9 @@ impl Daemon {
     /// shown) is used as is, and the wait never ends as `Busy` for open
     /// questions (the stop they would block was the timed-out wait's, not
     /// blocked, or the turn was not one to continue; kiro's Stop hook
-    /// continues the stop itself for questions it has not shown). With `after_wake` and `known` `None`, `known` is the
-    /// mail the last wake was for (the `woken` file), whatever the open
+    /// continues the stop itself for questions it has not shown). With
+    /// `after_wake` and `known` `None`, `known` is the mail the last wake
+    /// was for (the `woken` file), whatever the open
     /// questions, and the wait never ends as `Busy` for them either: the
     /// turn that just ended was started by a wake (or failed), so mail
     /// that came during it is news, as after a woken turn's plain stop.

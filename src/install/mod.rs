@@ -141,7 +141,7 @@ pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
 pub fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
     match o.harness {
         Harness::Opencode => opencode::notes(o, env, install),
-        Harness::Kiro => Ok(kiro::notes(o, install)),
+        Harness::Kiro => Ok(kiro::notes(o, env, install)),
         _ => Ok(Vec::new()),
     }
 }

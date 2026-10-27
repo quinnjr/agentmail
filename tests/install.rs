@@ -2746,6 +2746,63 @@ fn kiro_hooks_file_left_with_no_hooks_is_removed() {
 }
 
 #[test]
+fn kiro_uninstall_leaves_hooks_files_without_agentmail_alone() {
+    // A hooks file with no agentmail hooks (empty, or only the user's) is
+    // not agentmail's to touch: no change, the file byte-identical.
+    let foreign = r#"{
+  "version": "v1",
+  "hooks": [{"name": "mine", "trigger": "Stop", "action": {"type": "command", "command": "echo hi"}}]
+}"#;
+    for text in [r#"{"version":"v1","hooks":[]}"#, foreign] {
+        let h = Home::new();
+        let env = h.env(&[]);
+        write(&h.kiro_hooks(), text);
+        assert!(
+            install::plan_uninstall(&kiro_opts(false, BIN), &env)
+                .unwrap()
+                .is_empty(),
+            "{text}"
+        );
+        uninstall(&kiro_opts(false, BIN), &env);
+        assert_eq!(read(&h.kiro_hooks()), text);
+        assert!(!bak(&h.kiro_hooks()).exists());
+    }
+}
+
+#[test]
+fn kiro_install_notes_the_other_scope() {
+    // Hooks installed at both scopes all run: kiro loads the workspace's
+    // hooks alongside the user's.
+    let both = |notes: &[String]| notes.iter().any(|n| n.contains("both"));
+    let h = Home::new();
+    let env = h.env(&[]);
+    let notes = install::notes(&kiro_opts(true, BIN), &env, true).unwrap();
+    assert!(!both(&notes), "{notes:?}");
+    install(&kiro_opts(false, BIN), &env);
+    let notes = install::notes(&kiro_opts(true, BIN), &env, true).unwrap();
+    assert!(both(&notes), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains(&h.kiro_hooks().display().to_string())),
+        "{notes:?}"
+    );
+    // The user's scope, with the project's installed.
+    install(&kiro_opts(true, BIN), &env);
+    let notes = install::notes(&kiro_opts(false, BIN), &env, true).unwrap();
+    assert!(both(&notes), "{notes:?}");
+    // Not on uninstall, nor once the other scope is gone.
+    assert!(
+        install::notes(&kiro_opts(false, BIN), &env, false)
+            .unwrap()
+            .is_empty()
+    );
+    uninstall(&kiro_opts(true, BIN), &env);
+    let notes = install::notes(&kiro_opts(false, BIN), &env, true).unwrap();
+    assert!(!both(&notes), "{notes:?}");
+}
+
+#[test]
 fn kiro_v3_warning_printed() {
     let h = Home::new();
     let out = cli(&h)
