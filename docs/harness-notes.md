@@ -480,11 +480,28 @@ Checked live against Claude Code 2.1.311 in a throwaway
   from; if Claude Code wrote it in between, nothing is written and the
   command asks to be run again.
 - Hooks are recognised as agentmail's by their command: a program whose
-  file name starts with `agentmail` run with `hook` as its first argument
-  (the binary path is shell-quoted when it needs to be). Reinstalling from
+  file name starts with `agentmail`, or the installing binary itself
+  (same path, or the same file once symlinks are resolved) whatever it is
+  called, run with `hook` as its first argument (the binary path is
+  shell-quoted when it needs to be). Install refuses to write a hook it
+  would not recognise. A renamed binary's entries are found only by that
+  same binary (or one named `agentmail…`). Reinstalling from
   another path replaces the old entries, including ones on events this
   version no longer uses, and uninstall removes every one of them, keeping
   other hooks that share a group with them.
+- Uninstall restores an equivalent file. A container (`hooks`, an event's
+  list, `mcpServers`) that agentmail's entries emptied is removed only
+  when the file had no such key before agentmail (a `"hooks": {}` that was
+  there stays), and a file emptied entirely is deleted, with its backup,
+  only when agentmail created it; a file that was `{}` is left as `{}`.
+  "Before agentmail" is the backup when there is one (with agentmail's
+  entries taken out, so a backup a reinstall made of a file agentmail
+  created still counts as created), else the file as it is.
+- A backup is written to a temporary file and hard-linked into place, so
+  a failed write never leaves a partial `<file>.agentmail.bak` (which
+  would stop the real original from ever being saved).
+- `--set-default` is kiro-only; with another harness it is a usage error
+  (exit 2).
 
 ### Hook identity
 
@@ -524,3 +541,30 @@ The code differs from the plan's sketch; build on the code:
   (checked every 0.5 s) or a busy mark, and keeps one waiter per agent with the turn file and lock
   above. It has no timeout of its own; the harness's hook `timeout` bounds
   it. kiro's Stop (Task 8) maps `Mail` to its exit code and the rest to 0.
+
+### Interfaces for later install tasks (Tasks 7 and 8)
+
+The plan's `json_merge_owned(...)` does not exist; `src/install/mod.rs`
+has these instead (Claude Code's `claude.rs` shows the pattern):
+
+- `JsonFile::read(path, entry)`: the file as a JSON object (missing or
+  blank: empty), refusing other text with a message that shows `entry`
+  (what to add by hand). It also records the file as it was before
+  agentmail (its backup, else its current value).
+- Edit a copy of `.value`, touching only agentmail's entries;
+  `object_at(root, key, path)` gets or creates a nested object and
+  refuses a non-object.
+- `JsonFile::change(new, uninstall, strip)` turns it into a `Change`
+  (`None` when nothing changes). `strip` removes agentmail's entries from
+  an object and nothing else; with it, containers agentmail emptied are
+  removed unless they were there before agentmail, and an uninstall
+  deletes the file only when agentmail created it.
+- Ownership: `is_agentmail_hook(cmd)` (program named `agentmail…` run
+  with `hook`) and `owns_hook(cmd, bin)` (that, or the program is `bin`
+  itself); MCP servers are owned by their key `agentmail`.
+- `json::render(orig, new)` writes `new` over the original text, keeping
+  every untouched byte (layout, key order, number spellings);
+  `json::pretty` for snippets. `bin_str(o)` is the absolute UTF-8 binary
+  path, `shell_quote` quotes it for a command line. `plan_install` /
+  `plan_uninstall` dispatch per harness, `apply` writes (with backups) and
+  `diff` renders `--dry-run`.

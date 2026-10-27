@@ -780,7 +780,7 @@ fn install(
         let list: Vec<Value> = changes
             .iter()
             .map(|c| {
-                let backup = (c.before.is_some() && !dry_run)
+                let backup = (c.before.is_some() && c.after.is_some() && !dry_run)
                     .then(|| inst::backup_path(&c.path).display().to_string());
                 json!({"path": c.path.display().to_string(), "action": action(c), "backup": backup})
             })
@@ -804,7 +804,7 @@ fn install(
             "update" => "updated",
             _ => "removed",
         };
-        let backup = if c.before.is_some() {
+        let backup = if c.before.is_some() && c.after.is_some() {
             format!(
                 " (original kept as {})",
                 inst::backup_path(&c.path).display()
@@ -965,7 +965,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             project,
             dry_run,
             set_default,
-        } => return install(&harness, project, dry_run, set_default, false, cli.json),
+        } => {
+            if set_default && harness != "kiro" {
+                use clap::CommandFactory;
+                let e = Cli::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    format!(
+                        "--set-default applies only to --harness kiro; {harness} has no \
+                         default agent to set, drop --set-default"
+                    ),
+                );
+                return Ok(clap_exit(&e));
+            }
+            return install(&harness, project, dry_run, set_default, false, cli.json);
+        }
         Command::Uninstall {
             harness,
             project,

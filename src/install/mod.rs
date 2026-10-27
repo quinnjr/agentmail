@@ -110,7 +110,9 @@ pub fn backup_path(path: &Path) -> PathBuf {
 /// file: saves the original as `<path>.agentmail.bak` unless a backup is
 /// already there, and replaces the file atomically (a temporary file in the
 /// same directory, renamed over it), keeping its permissions. A symlink is
-/// followed: the file it points to changes, the link stays.
+/// followed: the file it points to changes, the link stays. A file to
+/// delete (one agentmail created, emptied by an uninstall) goes with its
+/// backup, which can only hold agentmail's own entries.
 pub fn apply(changes: &[Change]) -> Result<()> {
     for c in changes {
         if read_opt(&c.path)? != c.before {
@@ -139,29 +141,22 @@ fn read_opt(path: &Path) -> Result<Option<String>> {
 
 fn apply_one(c: &Change) -> Result<()> {
     let perms = std::fs::metadata(&c.path).ok().map(|m| m.permissions());
-    if let Some(before) = &c.before {
-        let bak = backup_path(&c.path);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&bak)
-        {
-            Ok(mut f) => {
-                if let Some(p) = &perms {
-                    f.set_permissions(p.clone())?;
-                }
-                f.write_all(before.as_bytes())?;
-                f.sync_all()?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!("writing {}", bak.display())));
-            }
-        }
-    }
+    let bak = backup_path(&c.path);
     let Some(after) = &c.after else {
-        return Ok(std::fs::remove_file(&c.path)?);
+        // Only a file agentmail created is deleted ([`JsonFile::change`]):
+        // it and any backup of it hold nothing but agentmail's entries.
+        std::fs::remove_file(&c.path)?;
+        return match std::fs::remove_file(&bak) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(anyhow::Error::new(e).context(format!("removing {}", bak.display())))
+            }
+            _ => Ok(()),
+        };
     };
+    if let Some(before) = &c.before {
+        write_backup(&bak, perms.as_ref(), |f| f.write_all(before.as_bytes()))
+            .with_context(|| format!("writing {}", bak.display()))?;
+    }
     // Write through a symlink to its target, so the link stays a link.
     let target = if c.before.is_some() {
         std::fs::canonicalize(&c.path)?
@@ -192,11 +187,77 @@ fn apply_one(c: &Change) -> Result<()> {
     })
 }
 
+/// Save a backup at `bak` unless one is there already, never leaving a
+/// partial one behind: `fill` writes a temporary file next to it, which is
+/// then linked into place (which fails, harmlessly, when `bak` exists).
+/// Where hard links are not supported the file is created in place and
+/// removed again when filling it fails.
+fn write_backup(
+    bak: &Path,
+    perms: Option<&std::fs::Permissions>,
+    fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    if std::fs::symlink_metadata(bak).is_ok() {
+        return Ok(());
+    }
+    let dir = bak
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", bak.display()))?;
+    let name = bak
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", bak.display()))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let filled = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        if let Some(p) = perms {
+            f.set_permissions(p.clone())?;
+        }
+        fill(&mut f)?;
+        f.sync_all()
+    })();
+    let saved = filled.and_then(|()| match std::fs::hard_link(&tmp, bak) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => copy_new(&tmp, bak),
+        r => r,
+    });
+    let _ = std::fs::remove_file(&tmp);
+    match saved {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        r => Ok(r?),
+    }
+}
+
+/// Copy `from` to a new file `to` (refused when `to` exists), removing
+/// `to` again when the copy fails.
+fn copy_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    let copied = (|| {
+        f.set_permissions(std::fs::metadata(from)?.permissions())?;
+        std::io::copy(&mut std::fs::File::open(from)?, &mut f)?;
+        f.sync_all()
+    })();
+    if copied.is_err() {
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
 /// A JSON config file as read for planning.
+///
+/// Later install tasks build on it: [`JsonFile::read`] the file, edit a
+/// copy of [`JsonFile::value`] (only agentmail's entries), then
+/// [`JsonFile::change`] with a `strip` that removes agentmail's entries.
 struct JsonFile {
     path: PathBuf,
     before: Option<String>,
     value: Map<String, Value>,
+    /// The file before agentmail first changed it, as far as known: its
+    /// backup when there is one, else the file as it is now; `None` when
+    /// neither exists.
+    original: Option<Map<String, Value>>,
 }
 
 impl JsonFile {
@@ -218,20 +279,47 @@ impl JsonFile {
                 entry()
             ),
         };
+        // A backup that cannot be read as an object still shows the file
+        // existed before agentmail.
+        let original = match read_opt(&backup_path(&path))? {
+            Some(text) => Some(match json::parse(&text) {
+                Ok(Value::Object(m)) => m,
+                _ => Map::new(),
+            }),
+            None => before.is_some().then(|| value.clone()),
+        };
         Ok(JsonFile {
             path,
             before,
             value,
+            original,
         })
     }
 
-    /// The change to `new`, if any. An object left empty by an uninstall
-    /// held only agentmail's entries: the file is removed.
-    fn change(self, new: Map<String, Value>, uninstall: bool) -> Option<Change> {
+    /// The change to `new`, if any. `strip` removes agentmail's entries
+    /// from an object (and nothing else); with it the file as it was
+    /// before agentmail is worked out, so that containers agentmail's
+    /// entries emptied are removed only when they were not there before,
+    /// and a file emptied by an uninstall is deleted only when agentmail
+    /// created it (else it is left as `{}`).
+    fn change(
+        self,
+        mut new: Map<String, Value>,
+        uninstall: bool,
+        strip: &dyn Fn(&mut Map<String, Value>),
+    ) -> Option<Change> {
+        let original = self.original.as_ref().and_then(|raw| {
+            let mut o = raw.clone();
+            strip(&mut o);
+            prune_emptied(raw, &mut o, None);
+            // Only agentmail's entries: agentmail created the file.
+            (raw.is_empty() || !o.is_empty()).then_some(o)
+        });
+        prune_emptied(&self.value, &mut new, original.as_ref());
         if new == self.value {
             return None;
         }
-        let after = if uninstall && new.is_empty() {
+        let after = if uninstall && new.is_empty() && original.is_none() {
             None
         } else {
             Some(json::render(self.before.as_deref(), &Value::Object(new)))
@@ -242,6 +330,32 @@ impl JsonFile {
             after,
         })
     }
+}
+
+/// Remove from `after` the containers (objects and arrays, at any depth of
+/// objects) that are empty there but held something in `before`, unless
+/// `orig` has them: agentmail emptied them and they were not there before
+/// it.
+fn prune_emptied(
+    before: &Map<String, Value>,
+    after: &mut Map<String, Value>,
+    orig: Option<&Map<String, Value>>,
+) {
+    let is_empty = |v: &Value| match v {
+        Value::Object(m) => m.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        _ => false,
+    };
+    after.retain(|k, v| {
+        let Some(b) = before.get(k) else {
+            return true;
+        };
+        let o = orig.and_then(|o| o.get(k));
+        if let (Value::Object(b), Value::Object(a)) = (b, &mut *v) {
+            prune_emptied(b, a, o.and_then(Value::as_object));
+        }
+        !(is_empty(v) && !is_empty(b) && o.is_none())
+    });
 }
 
 /// `p` quoted for `sh` when it needs to be.
@@ -309,6 +423,26 @@ pub fn is_agentmail_hook(cmd: &str) -> bool {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with("agentmail"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a hook command is agentmail's when the binary is `bin`: as
+/// [`is_agentmail_hook`], or a program at `bin` itself (the same path, or
+/// the same file once resolved) run with `hook`, whatever its file name.
+pub fn owns_hook(cmd: &str, bin: &Path) -> bool {
+    if is_agentmail_hook(cmd) {
+        return true;
+    }
+    match shell_words(cmd, 2).as_slice() {
+        [prog, sub] if sub == "hook" => {
+            let prog = Path::new(prog);
+            prog == bin
+                || matches!(
+                    (std::fs::canonicalize(prog), std::fs::canonicalize(bin)),
+                    (Ok(a), Ok(b)) if a == b
+                )
         }
         _ => false,
     }
@@ -505,6 +639,35 @@ mod tests {
         ] {
             assert!(!is_agentmail_hook(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn owning_hooks_by_binary_path() {
+        let bin = Path::new("/x/am");
+        assert!(owns_hook("/x/am hook stop --harness claude-code", bin));
+        assert!(owns_hook("'/x/am' hook wait", bin));
+        assert!(owns_hook("/usr/bin/agentmail hook stop", bin));
+        assert!(!owns_hook("/x/am send", bin));
+        assert!(!owns_hook("/y/am hook stop", bin));
+    }
+
+    #[test]
+    fn failed_backup_leaves_nothing_behind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bak = dir.path().join("settings.json.agentmail.bak");
+        let err = write_backup(&bak, None, |f| {
+            f.write_all(b"{\"partial")?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A later backup is then written in full, and never replaced.
+        write_backup(&bak, None, |f| f.write_all(b"{}")).unwrap();
+        write_backup(&bak, None, |f| f.write_all(b"other")).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "{}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

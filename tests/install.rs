@@ -281,10 +281,98 @@ fn claude_install_keeps_other_indentation() {
     let text = read(&h.settings());
     assert!(text.starts_with("{\n    \"model\": \"opus\",\n    \"hooks\": {\n        \"SessionStart\": [\n            {\n"), "{text}");
     assert_eq!(read_json(&h.settings())["hooks"], expected_hooks(BIN));
-    // The `hooks` object left empty goes too (agentmail cannot tell it was
-    // there before).
+    // The `hooks` object was there before: it stays, empty.
     uninstall(&opts(false, BIN), &h.env(&[]));
-    assert_eq!(read(&h.settings()), "{\n    \"model\": \"opus\"\n}\n");
+    assert_eq!(read(&h.settings()), orig);
+}
+
+#[test]
+fn claude_uninstall_keeps_empty_containers_that_were_there() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    let settings = "{\n  \"hooks\": {\n    \"Stop\": []\n  }\n}\n";
+    let mcp = "{\n  \"mcpServers\": {}\n}\n";
+    write(&h.settings(), settings);
+    write(&h.user_mcp(), mcp);
+    install(&opts(false, BIN), &env);
+    assert_eq!(read_json(&h.settings())["hooks"], expected_hooks(BIN));
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(read(&h.settings()), settings);
+    assert_eq!(read(&h.user_mcp()), mcp);
+    assert!(
+        install::plan_uninstall(&opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn claude_uninstall_keeps_files_that_were_empty_objects() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(&h.settings(), "{}\n");
+    write(&h.user_mcp(), "{}");
+    install(&opts(false, BIN), &env);
+    let removed = uninstall(&opts(false, BIN), &env);
+    assert!(removed.iter().all(|c| c.after.is_some()));
+    assert_eq!(read_json(&h.settings()), json!({}));
+    assert_eq!(read_json(&h.user_mcp()), json!({}));
+    assert!(
+        install::plan_uninstall(&opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn claude_files_agentmail_created_go_even_after_reinstall() {
+    // A reinstall backs up the file agentmail itself created; uninstall
+    // still sees that agentmail created it.
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&opts(false, "/old/agentmail"), &env);
+    install(&opts(false, BIN), &env);
+    assert!(bak(&h.settings()).exists());
+    uninstall(&opts(false, BIN), &env);
+    assert!(!h.settings().exists());
+    assert!(!h.user_mcp().exists());
+    // The backups held only agentmail's entries: nothing is left behind.
+    assert!(!bak(&h.settings()).exists());
+    assert!(!bak(&h.user_mcp()).exists());
+}
+
+#[test]
+fn claude_binary_not_named_agentmail_is_still_recognised() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    write(&h.settings(), FOREIGN_SETTINGS);
+    let bin = "/x/am";
+    install(&opts(false, bin), &env);
+    assert_eq!(
+        read_json(&h.settings())["hooks"]["Stop"],
+        expected_hooks(bin)["Stop"]
+    );
+    let again = install::plan_install(&opts(false, bin), &env).unwrap();
+    assert!(again.is_empty(), "{:?}", paths(&again));
+    uninstall(&opts(false, bin), &env);
+    assert_eq!(read(&h.settings()), FOREIGN_SETTINGS);
+    assert!(!h.user_mcp().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_hooks_written_through_a_symlink_are_recognised() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    let real = h.dir.path().join("bin/am-real");
+    write(&real, "");
+    let link = h.dir.path().join("bin/am");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    install(&opts(false, link.to_str().unwrap()), &env);
+    // Uninstalling from the resolved path still finds the hooks.
+    uninstall(&opts(false, real.to_str().unwrap()), &env);
+    assert!(!h.settings().exists());
+    assert!(!h.user_mcp().exists());
 }
 
 #[test]
@@ -385,6 +473,8 @@ fn claude_uninstall_restores_equivalent() {
     assert!(removed.iter().all(|c| c.after.is_none()));
     assert!(!h.settings().exists());
     assert!(!h.user_mcp().exists());
+    assert!(!bak(&h.settings()).exists());
+    assert!(!bak(&h.user_mcp()).exists());
 }
 
 #[test]
@@ -602,6 +692,24 @@ fn cli_install_and_uninstall() {
         .args(["uninstall", "--harness", "claude-code"])
         .assert()
         .success();
+    assert!(!h.settings().exists());
+    assert!(!h.user_mcp().exists());
+    assert!(!bak(&h.settings()).exists());
+    assert!(!bak(&h.user_mcp()).exists());
+}
+
+#[test]
+fn cli_set_default_is_kiro_only() {
+    let h = Home::new();
+    let out = cli(&h)
+        .args(["install", "--harness", "claude-code", "--set-default"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("--set-default"), "{err}");
     assert!(!h.settings().exists());
     assert!(!h.user_mcp().exists());
 }
