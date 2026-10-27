@@ -17,6 +17,58 @@ pub fn parse(text: &str) -> serde_json::Result<Value> {
     serde_json::from_str(text)
 }
 
+/// `text` with its JSONC comments (`// ...` to the end of the line, and
+/// `/* ... */`) blanked out with spaces, line breaks kept, or `None` when
+/// it has none. Comment markers inside strings are not comments. An
+/// unterminated `/*` blanks the rest of the text.
+pub fn strip_comments(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut found = false;
+    let mut chars = text.chars().peekable();
+    let blank = |out: &mut String, c: char| out.push(if c == '\n' || c == '\r' { c } else { ' ' });
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                out.push(c);
+                while let Some(c) = chars.next() {
+                    out.push(c);
+                    match c {
+                        '\\' => out.extend(chars.next()),
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                found = true;
+                blank(&mut out, c);
+                while let Some(&c) = chars.peek() {
+                    if c == '\n' || c == '\r' {
+                        break;
+                    }
+                    blank(&mut out, c);
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                found = true;
+                blank(&mut out, c);
+                blank(&mut out, chars.next().expect("peeked"));
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    blank(&mut out, c);
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    found.then_some(out)
+}
+
 /// `new` written over `orig` (the text it was parsed from, or `None` for a
 /// new file), changing only what differs. Always ends with a newline when
 /// the original did, or when the file is new. New lines use the original's
@@ -564,5 +616,19 @@ mod tests {
             "{\n  \"a\": [\n    1\n  ]\n}\n"
         );
         assert_eq!(render(Some("  \n"), &json!({})), "{}\n");
+    }
+
+    #[test]
+    fn comments_are_blanked() {
+        assert_eq!(strip_comments("{\"a\": \"// no /* no */\"}"), None);
+        assert_eq!(strip_comments("{\"a\\\"//\": 1}"), None);
+        assert_eq!(
+            strip_comments("{ // c\n \"a\": /* x\n y */ 1 }").as_deref(),
+            Some("{     \n \"a\":     \n      1 }")
+        );
+        assert_eq!(strip_comments("/**/{}").as_deref(), Some("    {}"));
+        assert_eq!(strip_comments("{} /* open").as_deref(), Some("{}        "));
+        let v = parse(&strip_comments("{\r\n// c\r\n\"a\": 1}").unwrap()).unwrap();
+        assert_eq!(v, json!({"a": 1}));
     }
 }

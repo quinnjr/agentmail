@@ -301,12 +301,12 @@ pub enum Command {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
     },
-    /// Wire agentmail into a harness: its hooks and MCP server. Edits the
-    /// harness's config files, keeping everything else in them; each file's
-    /// original is saved once as `<file>.agentmail.bak`.
+    /// Wire agentmail into a harness: its hooks (opencode: its plugin) and
+    /// MCP server. Edits the harness's config files, keeping everything else
+    /// in them; each file's original is saved once as `<file>.agentmail.bak`.
     Install {
         /// The harness to install into.
-        #[arg(long, value_parser = ["claude-code"])]
+        #[arg(long, value_parser = ["claude-code", "opencode"])]
         harness: String,
         /// Install into the current project instead of your user config.
         #[arg(long)]
@@ -321,7 +321,7 @@ pub enum Command {
     /// Remove what `install` added to a harness's config files.
     Uninstall {
         /// The harness to remove agentmail from.
-        #[arg(long, value_parser = ["claude-code"])]
+        #[arg(long, value_parser = ["claude-code", "opencode"])]
         harness: String,
         /// Remove it from the current project instead of your user config.
         #[arg(long)]
@@ -860,6 +860,12 @@ fn install(
         ),
     };
     print_line(&summary)?;
+    if harness == Harness::Opencode && !changes.is_empty() {
+        // The background service keeps the config it read at start.
+        print_line(
+            "opencode's background service reads its config at start: run `opencode service restart`.",
+        )?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

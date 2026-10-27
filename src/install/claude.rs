@@ -15,7 +15,8 @@ use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
 
 use super::{
-    Change, Env, InstallOpts, JsonFile, bin_str, object_at, owns_hook, shell_quote, shell_words,
+    Change, Env, InstallOpts, JsonFile, bin_str, merge_keys, object_at, owns_hook, shell_quote,
+    shell_words,
 };
 
 /// Timeout for the quick hooks, in seconds.
@@ -103,22 +104,6 @@ const HOOK_KEYS: [&str; 5] = ["type", "command", "timeout", "async", "asyncRewak
 /// The keys of the MCP server entry that agentmail sets; others (such as
 /// `env`) are kept.
 const SERVER_KEYS: [&str; 3] = ["type", "command", "args"];
-
-/// Set the `keys` of `cur` to their values in `want`, removing those
-/// `want` lacks, and keep every other key.
-fn merge_keys(cur: &mut Map<String, Value>, want: &Map<String, Value>, keys: &[&str]) {
-    for k in keys {
-        match want.get(*k) {
-            Some(v) if cur.get(*k) != Some(v) => {
-                cur.insert(k.to_string(), v.clone());
-            }
-            Some(_) => {}
-            None => {
-                cur.shift_remove(*k);
-            }
-        }
-    }
-}
 
 /// Which of agentmail's hooks a command runs: the word after `hook`.
 fn hook_kind(h: &Value) -> Option<String> {

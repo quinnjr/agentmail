@@ -15,6 +15,7 @@
 
 mod claude;
 pub mod json;
+mod opencode;
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -94,6 +95,7 @@ impl Env {
 pub fn plan_install(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
     match o.harness {
         Harness::ClaudeCode => claude::plan(o, env, true),
+        Harness::Opencode => opencode::plan(o, env, true),
         h => bail!("agentmail cannot install into {} yet", h.as_str()),
     }
 }
@@ -102,6 +104,7 @@ pub fn plan_install(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
 pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
     match o.harness {
         Harness::ClaudeCode => claude::plan(o, env, false),
+        Harness::Opencode => opencode::plan(o, env, false),
         h => bail!("agentmail cannot uninstall from {} yet", h.as_str()),
     }
 }
@@ -637,6 +640,22 @@ fn object_at<'a>(
                 path.display()
             )
         })
+}
+
+/// Set the `keys` of `cur` to their values in `want`, removing those
+/// `want` lacks, and keep every other key.
+fn merge_keys(cur: &mut Map<String, Value>, want: &Map<String, Value>, keys: &[&str]) {
+    for k in keys {
+        match want.get(*k) {
+            Some(v) if cur.get(*k) != Some(v) => {
+                cur.insert(k.to_string(), v.clone());
+            }
+            Some(_) => {}
+            None => {
+                cur.shift_remove(*k);
+            }
+        }
+    }
 }
 
 /// A unified diff of one change, three lines of context, for `--dry-run`.

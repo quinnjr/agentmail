@@ -836,3 +836,60 @@ socket path limit), `opencode serve` plus `opencode run --server`:
   true`) and left no `hook wait` process behind.
 - Killing the server left no `hook wait` process behind either.
 
+
+### Install (Task 7)
+
+`agentmail install --harness opencode` writes the MCP server into
+`opencode.json` and the plugin into `plugins/agentmail.js`. Checked live
+against opencode 2.0.27 with private `HOME` and `XDG_*` directories and
+the background service moved to a private port (`opencode service set
+port`, which writes `service.json` in the private config dir); `opencode
+debug config` shows the config the service resolved, and the service log
+shows the plugin loading and the server connecting. The service reads its
+config at start, so after an install or uninstall it needs `opencode
+service restart` (the command says so); the plugin file itself is watched.
+
+- **Where.** The config dir is `$XDG_CONFIG_HOME/opencode` (a relative
+  value is taken from the current directory, as opencode does), else
+  `~/.config/opencode`. The file is the first of `opencode.json` and
+  `opencode.jsonc` that exists, else a new `opencode.json`. Plugins are
+  loaded from `plugin/` and `plugins/` next to it, `.js` and `.ts` files
+  only, so the `.agentmail.bak` and `.agentmail.created` files there are
+  never loaded. `--project`: `./opencode.json` (or `./opencode.jsonc`) and
+  `./.opencode/plugins/agentmail.js`.
+- **The entry**: `mcp.servers.agentmail = {"type": "local", "command":
+  [<bin>, "mcp"], "codemode": false}`. A reinstall sets only `type`,
+  `command` and `codemode`, keeping keys the user added (`environment`,
+  `disabled`, ...).
+- **V1 files (deviation from the plan).** opencode 2.0.27 still reads
+  the V1 shape (servers directly under `mcp`) and normalises it to
+  `mcp.servers`, but a V1 entry keeps only V1 fields: `codemode: false`
+  written there is silently dropped (seen in `opencode debug config`;
+  `enabled: false` becomes `disabled: true`). A file mixing both shapes
+  is read fine (V1 entries and `servers` merged), and opencode's own
+  `opencode mcp add` writes `servers` into a V1 file. So agentmail always
+  writes `mcp.servers.agentmail`, leaving the user's V1 entries exactly as
+  written, instead of the plan's "same shape", which would lose
+  `codemode: false`. A V1 entry named `agentmail` counts as agentmail's:
+  install moves it to `servers` (carrying `environment`, `cwd`,
+  `timeout`, `protocol`, and `enabled: false` as `disabled: true`) and
+  uninstall removes it.
+- **Comments.** A config with `//` or `/* */` comments (outside strings)
+  is never rewritten, since they would be lost. If it already is as the
+  command would leave it (the entry pasted by hand, or for uninstall no
+  agentmail entry), it is left alone and the plugin is still installed or
+  removed; otherwise nothing at all is changed and the error shows the
+  exact entry to paste (install) or says what to delete by hand
+  (uninstall), then to run the command again.
+- **The plugin** is `plugin/agentmail.js` embedded in the binary with its
+  one `"__AGENTMAIL_BIN__"` literal replaced by the binary's path as a
+  JSON string (quotes and backslashes escaped). A file at
+  `plugins/agentmail.js` counts as agentmail's when it starts with the
+  plugin's first line (`// agentmail for opencode`); any other file there
+  is refused by install and left alone by uninstall. Install rewrites an
+  older agentmail plugin (a new binary path or version); uninstall
+  deletes it, and the `plugins/` (and config) directories when agentmail
+  created them and they are empty.
+- The rest (backups, creation markers, keeping the file's layout, symlinks,
+  modes) is the shared install machinery described under Claude Code's
+  install (Task 5).
