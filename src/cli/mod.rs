@@ -97,7 +97,9 @@ pub enum Command {
         #[arg(long)]
         fresh: bool,
         /// Do not wake this agent for new mail (the default under kiro-cli,
-        /// unless `install --kiro-wake` set AGENTMAIL_KIRO_WAKE=1).
+        /// unless `install --kiro-wake` is in effect: AGENTMAIL_KIRO_WAKE=1,
+        /// or agentmail's entry in the kiro mcp.json that applies here
+        /// sets it).
         #[arg(long, conflicts_with = "wake")]
         no_wake: bool,
         /// Wake this agent for new mail (the default, except under kiro-cli).
@@ -1309,7 +1311,7 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             let wake = match (wake, no_wake) {
                 (true, _) => true,
                 (_, true) => false,
-                _ => identity::default_wake(harness, |k| std::env::var_os(k)),
+                _ => identity::default_wake_here(harness),
             };
             let req = Request::Register {
                 name,

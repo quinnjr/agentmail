@@ -1033,7 +1033,13 @@ config schema and exit-code rules come from the engine bundle
   10); `install --kiro-wake` writes `hook stop --harness kiro --wake` with
   `timeout: 0` and gives the MCP server `AGENTMAIL_KIRO_WAKE=1`.
   `register` (MCP and CLI) defaults `wake` to false for a kiro agent
-  unless that variable is `1`; `wake: true` / `--wake` still turns it on.
+  unless `--kiro-wake` is installed: the MCP server sees the variable;
+  kiro does not pass the server's `env` to its shell tool's commands, so
+  the CLI instead reads agentmail's server entry in the workspace's
+  `.kiro/settings/mcp.json` (the working directory's; it decides when it
+  has one), else the user's (`$KIRO_HOME`, else `~/.kiro`), and takes
+  `env.AGENTMAIL_KIRO_WAKE = "1"` there as the install's choice.
+  `wake: true` / `--wake` still turns it on.
   A Stop hook left running after Esc ends at the human's next prompt or
   tool call (they mark the session busy), so it never wakes a busy session
   or competes with the next stop's wait; if mail comes first, its wake is
@@ -1045,8 +1051,13 @@ config schema and exit-code rules come from the engine bundle
 - **Headless runs are never waited in.** `chat --no-interactive` ends only
   after its Stop hooks, so a waiting one held a run open until killed.
   The Stop hook does not wait when `kiro-cli` or `kiro-cli-chat` above it
-  was started with `--no-interactive`, or with `acp` (an editor drives the
-  engine; not checked live, so not risked).
+  was started with `--no-interactive` or `--output-format stream-json`
+  (`--output-format=stream-json`; `chat --help` says it implies
+  `--no-interactive`) anywhere in its arguments, or with the subcommand
+  `acp` (an editor drives the engine; not checked live, so not risked).
+  Only the subcommand position counts for `acp`: the first argument that
+  is not an option or the value of `--agent`, `--resume-id` or `--repo`,
+  so a prompt or an agent named `acp` in an interactive chat still waits.
 - **(d) Payloads and environment.** Recorded in
   `tests/fixtures/hooks/kiro/` (paths anonymised): every payload has
   `session_id` (`sess_<uuid>`, the same as `KIRO_SESSION_ID`),

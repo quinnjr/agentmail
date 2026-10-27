@@ -535,7 +535,7 @@ impl AgentMailServer {
             fresh: p.fresh,
             wake: p
                 .wake
-                .unwrap_or_else(|| crate::identity::default_wake(harness, |k| std::env::var_os(k))),
+                .unwrap_or_else(|| crate::identity::default_wake_here(harness)),
             session: s.0.clone(),
         };
         Ok(match self.request(&s, req).await {

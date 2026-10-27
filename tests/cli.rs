@@ -41,6 +41,12 @@ impl Env {
         self.dir.path().join("data")
     }
 
+    /// A private kiro config directory (`KIRO_HOME`), so the user's kiro
+    /// config never changes what `register` does.
+    fn kiro_home(&self) -> PathBuf {
+        self.dir.path().join("kiro")
+    }
+
     fn socket(&self) -> PathBuf {
         self.dir.path().join("agentmail.sock")
     }
@@ -49,6 +55,7 @@ impl Env {
     fn cmd(&self) -> Command {
         let mut c = Command::new(BIN);
         c.env("AGENTMAIL_DATA_DIR", self.data_dir())
+            .env("KIRO_HOME", self.kiro_home())
             .env("AGENTMAIL_SOCKET", self.socket())
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
@@ -91,6 +98,7 @@ impl Env {
         let mut c = Command::new(&fake);
         c.args(["-c", script, BIN])
             .env("AGENTMAIL_DATA_DIR", self.data_dir())
+            .env("KIRO_HOME", self.kiro_home())
             .env("AGENTMAIL_SOCKET", self.socket())
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
@@ -1403,8 +1411,8 @@ fn register_in_session_with_outside_pid_drops_the_session() {
 
 /// Harness Task 8: under kiro-cli, waking is opt-in (the human cannot
 /// reach the agent while its Stop hook waits), so `register` leaves `wake`
-/// off unless asked, or unless `install --kiro-wake` set
-/// `AGENTMAIL_KIRO_WAKE=1`. Other harnesses keep it on.
+/// off unless asked, or unless `AGENTMAIL_KIRO_WAKE=1` (what `install
+/// --kiro-wake` gives the MCP server). Other harnesses keep it on.
 #[test]
 fn register_wake_defaults_off_for_kiro() {
     let env = Env::new();
@@ -1447,4 +1455,36 @@ fn register_wake_defaults_off_for_kiro() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+/// kiro gives `AGENTMAIL_KIRO_WAKE` only to the MCP server, not to the
+/// commands its shell tool runs, so after `install --kiro-wake` the CLI's
+/// `register` reads the installed MCP entry: the user's (`KIRO_HOME`), or
+/// the workspace's `.kiro/settings/mcp.json`, which decides when it has
+/// one. Uninstalling (or installing without it) turns the default off.
+#[test]
+fn register_wake_follows_install_kiro_wake() {
+    let env = Env::new();
+    let wake = |name: &str| {
+        let mut c = env.under("kiro-cli");
+        c.env_remove("AGENTMAIL_KIRO_WAKE")
+            .args(["register", name, "--json", "--fresh"]);
+        ok_json(&mut c)["agent"]["wake"].clone()
+    };
+    let install = |args: &[&str]| {
+        let mut c = env.cmd();
+        c.args(["install", "--harness", "kiro"]).args(args);
+        c.assert().success();
+    };
+    install(&["--kiro-wake"]);
+    assert_eq!(wake("k1"), true);
+    install(&[]);
+    assert_eq!(wake("k2"), false);
+
+    // The workspace's entry decides over the user's.
+    install(&["--project", "--kiro-wake"]);
+    assert_eq!(wake("k3"), true);
+    install(&["--kiro-wake"]);
+    install(&["--project"]);
+    assert_eq!(wake("k4"), false);
 }

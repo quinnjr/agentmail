@@ -146,6 +146,12 @@ pub fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
     }
 }
 
+/// Whether `install --kiro-wake` is in effect for kiro agents where `env`
+/// runs (see [`kiro::wake_installed`]).
+pub fn kiro_wake_installed(env: &Env) -> bool {
+    kiro::wake_installed(env)
+}
+
 /// Where the original of `path` is kept: `<path>.agentmail.bak`.
 pub fn backup_path(path: &Path) -> PathBuf {
     with_suffix(path, ".agentmail.bak")

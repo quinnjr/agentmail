@@ -11,7 +11,9 @@
 //! mail on `PreToolUse` (kiro ignores `PostToolUse` output), and the
 //! open-question check on `Stop`. With `--kiro-wake` the Stop hook also
 //! waits for mail (`--wake`, no timeout) and the MCP server gets
-//! `AGENTMAIL_KIRO_WAKE=1`, so kiro agents register with `wake` on.
+//! `AGENTMAIL_KIRO_WAKE=1`, so kiro agents register with `wake` on: the
+//! MCP server reads the variable, and the CLI, whose environment kiro
+//! does not give it, reads the installed entry ([`wake_installed`]).
 
 use std::path::{Path, PathBuf};
 
@@ -35,9 +37,9 @@ const VERSION: &str = "v1";
 pub const V3_WARNING: &str =
     "kiro-cli: agentmail supports the V3 engine only — run kiro-cli chat --v3";
 
-/// kiro's config directory for `o`.
-fn dir(o: &InstallOpts, env: &Env) -> PathBuf {
-    if o.project {
+/// kiro's config directory: the workspace's (`project`) or the user's.
+fn dir(project: bool, env: &Env) -> PathBuf {
+    if project {
         return env.cwd.join(".kiro");
     }
     env.dir_var("KIRO_HOME")
@@ -46,11 +48,13 @@ fn dir(o: &InstallOpts, env: &Env) -> PathBuf {
 
 /// The files: (hooks file, file with `mcpServers`).
 fn files(o: &InstallOpts, env: &Env) -> (PathBuf, PathBuf) {
-    let d = dir(o, env);
-    (
-        d.join("hooks").join("agentmail.json"),
-        d.join("settings").join("mcp.json"),
-    )
+    let d = dir(o.project, env);
+    (d.join("hooks").join("agentmail.json"), mcp_file(&d))
+}
+
+/// The file with `mcpServers` in kiro config directory `d`.
+fn mcp_file(d: &Path) -> PathBuf {
+    d.join("settings").join("mcp.json")
 }
 
 /// agentmail's hooks, in the order they are written.
@@ -198,6 +202,24 @@ fn set_wake_env(entry: &mut Map<String, Value>, wake: bool) {
     {
         entry.shift_remove("env");
     }
+}
+
+/// Whether `install --kiro-wake` is in effect where `env` runs: the
+/// agentmail MCP server entry of the workspace's `.kiro/settings/mcp.json`
+/// (in `env.cwd`), else of the user's (`$KIRO_HOME`, else `~/.kiro`), sets
+/// `AGENTMAIL_KIRO_WAKE` to `1`. kiro gives that variable only to the MCP
+/// server, not to its shell tool's commands, so the CLI's `register` reads
+/// it here. A file that is missing or cannot be read counts as no entry.
+pub fn wake_installed(env: &Env) -> bool {
+    let entry = |project| -> Option<Value> {
+        let text = std::fs::read_to_string(mcp_file(&dir(project, env))).ok()?;
+        let text = super::json::strip_jsonc(&text).unwrap_or(text);
+        let mut v = super::json::parse(&text).ok()?;
+        Some(v.get_mut("mcpServers")?.get_mut("agentmail")?.take())
+    };
+    entry(true)
+        .or_else(|| entry(false))
+        .is_some_and(|s| s.get("env").and_then(|e| e.get(ENV_KIRO_WAKE)) == Some(&json!("1")))
 }
 
 /// Remove agentmail's MCP server, for [`JsonFile::change`].

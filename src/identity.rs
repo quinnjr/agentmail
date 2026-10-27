@@ -17,7 +17,8 @@ pub const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";
 /// and hooks (not its MCP servers).
 pub const ENV_KIRO_SESSION: &str = "KIRO_SESSION_ID";
 /// `1` turns waking on by default for kiro-cli agents; `install
-/// --kiro-wake` sets it on the MCP server.
+/// --kiro-wake` sets it on the MCP server (kiro does not pass it on to
+/// its shell tool's commands, so the CLI reads the installed config).
 pub const ENV_KIRO_WAKE: &str = "AGENTMAIL_KIRO_WAKE";
 
 /// The session variables, in the order [`session_from_env`] reads them.
@@ -390,15 +391,52 @@ fn binding_with(
 /// Whether an agent of `harness` registering without saying is woken for
 /// new mail. Yes, except under kiro-cli: its Stop hook waits only when
 /// installed with `--kiro-wake` (kiro holds what the human types while it
-/// waits), which sets [`ENV_KIRO_WAKE`]`=1` for the MCP server.
-pub fn default_wake(harness: Harness, env: impl Fn(&str) -> Option<OsString>) -> bool {
-    harness != Harness::Kiro || env(ENV_KIRO_WAKE).is_some_and(|v| v == "1")
+/// waits), which sets [`ENV_KIRO_WAKE`]`=1` for the MCP server. So for
+/// kiro, yes when that variable is `1` or when `kiro_wake_installed` (the
+/// installed config says so, for the CLI, which kiro does not give the
+/// variable); it is asked only then.
+pub fn default_wake(
+    harness: Harness,
+    env: impl Fn(&str) -> Option<OsString>,
+    kiro_wake_installed: impl FnOnce() -> bool,
+) -> bool {
+    harness != Harness::Kiro
+        || env(ENV_KIRO_WAKE).is_some_and(|v| v == "1")
+        || kiro_wake_installed()
+}
+
+/// [`default_wake`] for this process: its environment, and the kiro
+/// config installed for its working directory and home.
+pub fn default_wake_here(harness: Harness) -> bool {
+    default_wake(
+        harness,
+        |k| std::env::var_os(k),
+        || {
+            crate::install::Env::from_process()
+                .is_ok_and(|e| crate::install::kiro_wake_installed(&e))
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn default_wake_is_opt_in_for_kiro_only() {
+        let unset = |_: &str| None;
+        let one = |k: &str| (k == ENV_KIRO_WAKE).then(|| OsString::from("1"));
+        let zero = |k: &str| (k == ENV_KIRO_WAKE).then(|| OsString::from("0"));
+        let never = || -> bool { panic!("the installed config was read") };
+        assert!(default_wake(Harness::ClaudeCode, unset, never));
+        assert!(default_wake(Harness::Opencode, unset, never));
+        assert!(default_wake(Harness::Other, unset, never));
+        assert!(default_wake(Harness::Kiro, one, never));
+        assert!(!default_wake(Harness::Kiro, unset, || false));
+        assert!(!default_wake(Harness::Kiro, zero, || false));
+        assert!(default_wake(Harness::Kiro, unset, || true));
+    }
 
     #[test]
     fn session_var_names_each_session_harness() {

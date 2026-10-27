@@ -36,17 +36,47 @@ const EXIT_BLOCK_TOOL: u8 = 2;
 /// kiro's exit code for a `Stop` hook that continues the turn.
 const EXIT_CONTINUE: u8 = 1;
 
-/// The arguments that make a kiro run one nobody types into: `chat
-/// --no-interactive` (it ends only after its Stop hooks, so a waiting one
-/// would hold it open until mail came, as seen live) and `acp`, where an
-/// editor drives the engine (not checked live; a wait there could hold its
-/// turn open indefinitely, so it is not risked).
-const HEADLESS_ARGS: [&str; 2] = ["--no-interactive", "acp"];
+/// kiro-cli's options before a subcommand that take a value as the next
+/// argument (`kiro-cli --help-all`, 2.32.0), so that value is not taken
+/// for the subcommand.
+const VALUE_OPTIONS: [&str; 3] = ["--agent", "--resume-id", "--repo"];
+
+/// Whether a `kiro-cli` or `kiro-cli-chat` process started with `args`
+/// (after the program) runs with nobody typing into it:
+/// - `--no-interactive` anywhere: `chat --no-interactive` ends only after
+///   its Stop hooks, so a waiting one would hold it open until mail came
+///   (seen live);
+/// - `--output-format stream-json` (or `=stream-json`) anywhere, which
+///   `kiro-cli chat --help` says implies `--no-interactive`;
+/// - the subcommand `acp`, where an editor drives the engine (not checked
+///   live; a wait there could hold its turn open indefinitely, so it is not
+///   risked). Only the subcommand counts: the first argument that is not
+///   an option or an option's value, so a prompt or an agent named `acp`
+///   in an interactive chat does not.
+fn headless_args(args: &[&str]) -> bool {
+    let anywhere = args.iter().enumerate().any(|(i, a)| {
+        *a == "--no-interactive"
+            || *a == "--output-format=stream-json"
+            || (*a == "--output-format" && args.get(i + 1) == Some(&"stream-json"))
+    });
+    let mut rest = args.iter();
+    let subcommand = loop {
+        match rest.next() {
+            Some(a) if VALUE_OPTIONS.contains(a) => {
+                rest.next();
+            }
+            Some(a) if a.starts_with('-') => {}
+            other => break other,
+        }
+    };
+    anywhere || subcommand == Some(&"acp")
+}
 
 /// Whether the hook runs in a kiro run nobody types into: one of the
-/// processes it runs under, up to `kiro-cli`, was started with one of
-/// [`HEADLESS_ARGS`]. Only `kiro-cli` and `kiro-cli-chat` are looked at,
-/// so a hook command or shell with such an argument changes nothing.
+/// processes it runs under, up to `kiro-cli`, is `kiro-cli` or
+/// `kiro-cli-chat` started with [`headless_args`]. Other processes are not
+/// looked at, so a hook command or shell with such an argument changes
+/// nothing.
 fn headless(d: &Daemon) -> bool {
     d.procs.iter().any(|p| {
         let Some(args) = procinfo::args(p.pid) else {
@@ -58,10 +88,9 @@ fn headless(d: &Daemon) -> bool {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n == "kiro-cli" || n == "kiro-cli-chat")
         });
-        is_kiro
-            && args[1..]
-                .iter()
-                .any(|a| a.to_str().is_some_and(|a| HEADLESS_ARGS.contains(&a)))
+        // An argument that is not UTF-8 is none of the words looked for.
+        let args: Vec<&str> = args[1..].iter().map(|a| a.to_str().unwrap_or("")).collect();
+        is_kiro && headless_args(&args)
     })
 }
 
@@ -138,5 +167,44 @@ async fn stop(d: &mut Daemon, wake: bool) -> HookOutput {
             None => HookOutput::default(),
         },
         WaitOutcome::Gone | WaitOutcome::Busy | WaitOutcome::Skip => HookOutput::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::headless_args;
+
+    #[test]
+    fn headless_args_finds_runs_nobody_types_into() {
+        for args in [
+            &["chat", "--v3", "--no-interactive", "hi"][..],
+            &["--no-interactive", "chat"],
+            &["chat", "--v3", "--output-format", "stream-json", "hi"],
+            &["chat", "--output-format=stream-json"],
+            &["acp"],
+            &["acp", "--agent-engine", "v3"],
+            &["-v", "--v3", "acp"],
+            &["--agent", "dev", "acp"],
+        ] {
+            assert!(headless_args(args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn headless_args_leaves_interactive_chats() {
+        for args in [
+            &[][..],
+            &["chat", "--v3"],
+            &["--v3"],
+            // A prompt or an agent named `acp` is not the subcommand.
+            &["chat", "--v3", "acp"],
+            &["chat", "--agent", "acp"],
+            &["--agent", "acp"],
+            &["--agent", "acp", "chat"],
+            &["chat", "--output-format", "text"],
+            &["chat", "--output-format=text", "stream-json"],
+        ] {
+            assert!(!headless_args(args), "{args:?}");
+        }
     }
 }

@@ -99,7 +99,9 @@ impl Env {
     /// [`Env::mcp`] with extra variables for the server.
     async fn mcp_with(&self, vars: &[(&str, &str)]) -> RunningService<RoleClient, ClientConfig> {
         let transport = TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|c| {
+            // A private kiro config, so the user's never sets the default.
             c.env_remove("AGENTMAIL_KIRO_WAKE")
+                .env("KIRO_HOME", self.dir.path().join("kiro"))
                 .envs(vars.iter().copied())
                 .arg("mcp")
                 .env("AGENTMAIL_DATA_DIR", self.data_dir())

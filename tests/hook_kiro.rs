@@ -500,7 +500,9 @@ fn fake_kiro(dir: &Path, paths: &Paths, extra: &[&str]) -> (std::process::Child,
     if !fake.exists() {
         std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
     }
-    let pid_file = dir.join(format!("kiro-{}.pid", extra.len()));
+    static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid_file = dir.join(format!("kiro-{n}.pid"));
     let go = dir.join("go");
     let script = format!(
         "echo $$ > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done; \
@@ -561,21 +563,32 @@ async fn register_proc(d: &TestDaemon, name: &str, pid: u32) -> String {
 async fn stop_never_waits_in_a_headless_run() {
     // `kiro-cli chat --no-interactive` ends the run only after the Stop
     // hook: waiting there would hold every headless run open until mail
-    // came (seen live). Its interactive chat is waited in as usual.
+    // came (seen live). `--output-format stream-json` implies
+    // `--no-interactive`. Its interactive chat is waited in as usual.
     let d = TestDaemon::start().await;
     let dir = TempDir::new().unwrap();
-    let (headless, pid) = fake_kiro(dir.path(), &d.paths, &["chat", "--v3", "--no-interactive"]);
-    register_proc(&d, "headless", pid).await;
-    std::fs::write(dir.path().join("go"), "").unwrap();
-    let out = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || headless.wait_with_output().unwrap()),
-    )
-    .await
-    .expect("the headless stop waited")
-    .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    for (i, args) in [
+        &["chat", "--v3", "--no-interactive"][..],
+        &["chat", "--v3", "--output-format", "stream-json", "hi"],
+        &["chat", "--v3", "--output-format=stream-json"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _ = std::fs::remove_file(dir.path().join("go"));
+        let (headless, pid) = fake_kiro(dir.path(), &d.paths, args);
+        register_proc(&d, &format!("headless{i}"), pid).await;
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || headless.wait_with_output().unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the headless stop waited: {args:?}"))
+        .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    }
 
     std::fs::remove_file(dir.path().join("go")).unwrap();
     let (mut chat, pid) = fake_kiro(dir.path(), &d.paths, &["chat", "--v3"]);
