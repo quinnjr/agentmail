@@ -1273,3 +1273,37 @@ Deviations from the plan, and why:
   beyond its `ExecStart`, showing the edits and how to move them to a
   drop-in; replacing a unit of the user's notes any settings it had that
   agentmail's unit lacks.
+- **When install restarts the service.** `try-restart` runs only when the
+  service is already running (`is-active`) on something other than
+  agentmail's unit as install leaves it: the unit file changed, or, with
+  it unchanged, `systemctl --user show agentmail` (asked before the
+  reload) reports `LoadState=not-found`, `NeedDaemonReload=yes`, a
+  `FragmentPath` other than the unit's (compared with symlinks resolved),
+  a loaded `ExecStart` whose `path=` is not this binary, or a main process
+  that started before the unit file was last written
+  (`--timestamp=unix -p ExecMainStartTimestamp`, systemd 248 and later).
+  Deciding from the file change alone left a re-run after a failed
+  install (unit written, then `daemon-reload`, `enable` or `try-restart`
+  failed) reporting success with the service still on the old unit; the
+  start-time check is what catches a failure after the reload, where
+  every loaded property already matches. Whatever systemd cannot tell
+  counts for nothing, so an older systemd falls back to the file change.
+- **The binary the unit runs.** `ExecStart` is the path the binary was
+  invoked as (from the working directory or `PATH`) when that names this
+  same file, so a symlink to a versioned install stays a symlink;
+  otherwise (a path with `..`, or one that is not this binary) the
+  resolved `current_exe`. `%` is doubled and the path quoted only when it
+  must be.
+- **Uninstall after the unit was removed by hand.** With the unit file
+  gone, uninstall cleans up only what is agentmail's: the running service
+  when systemd has no unit file for it any more or still loads it from
+  agentmail's removed unit, and the `default.target.wants` link when it
+  points to agentmail's unit (`disable` cannot, with the file gone, so
+  the link is removed directly, then `daemon-reload`). Both compare paths
+  with symlinks resolved in the unit's directory, as the unit search path
+  check does, so a config directory reached through a symlink (HOME a
+  link to another disk) is still recognised. A service loaded from
+  elsewhere, and a link to it, are the user's and left alone with a note.
+  Removing the unit by hand also means removing
+  `agentmail.service.agentmail.created`, agentmail's marker, which a later
+  install or uninstall trusts.

@@ -812,10 +812,11 @@ fn removal_steps(path: &Path) -> String {
 /// `bin`, with `daemon stop` told the service's location by `stop` (see
 /// [`stop_env`]), so that it stops the daemon there, the one the service
 /// replaces. With
-/// `restart` (install, changing the unit while the service runs, on the
-/// unit replaced or on one removed by hand), the service is restarted so
-/// that it runs the new unit: enabling a running service does not (a
-/// stopped one `enable --now` starts on the new unit). With `stop_daemon`, install then stops any daemon run
+/// `restart` (install, the service running on anything but the unit as
+/// install leaves it: the unit replaced, one removed by hand, or one a
+/// failed install left it on; see [`runs_stale`]), the service is
+/// restarted so that it runs the new unit: enabling a running service does
+/// not (a stopped one `enable --now` starts on the new unit). With `stop_daemon`, install then stops any daemon run
 /// on demand: last, so that the service's daemon, already waiting for the
 /// lock, takes over as it exits, leaving no time for a client to start
 /// another on demand. (Install passes `stop_daemon` only when such a daemon
@@ -866,25 +867,120 @@ pub fn wants_link(env: &Env) -> PathBuf {
         .join(format!("{NAME}.service"))
 }
 
-/// Where systemd loads the service from: `None` when it has no unit file
-/// for it (`LoadState=not-found`), else its `FragmentPath` (empty when it
-/// has none). An error when systemd cannot be asked.
-fn fragment(env: &Env) -> Result<Option<PathBuf>> {
+/// `systemctl --user show` of the service with `args` (say, `-p` and the
+/// properties wanted). An error when systemd cannot be asked.
+fn show(env: &Env, args: &[&str]) -> Result<String> {
     let out = Command::new(systemctl(env))
-        .args(["--user", "show", "-p", "LoadState,FragmentPath", NAME])
+        .args(["--user", "show"])
+        .args(args)
+        .arg(NAME)
         .output()
         .context("asking systemd about the service")?;
     if !out.status.success() {
         bail!("systemctl --user show {NAME} failed ({})", out.status);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let prop = |k: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
-            .unwrap_or("")
-            .to_string()
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The value of the property `k` in `systemctl show` output `text` (empty
+/// when it is not there).
+fn prop<'a>(text: &'a str, k: &str) -> &'a str {
+    text.lines()
+        .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+        .unwrap_or("")
+}
+
+/// Whether `a` and `b` name the same file, as they are or once symlinks
+/// are resolved: in the whole path, or (the file itself may be gone, as a
+/// unit removed by hand is) in its directory.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(x), Ok(y)) = (std::fs::canonicalize(a), std::fs::canonicalize(b))
+        && x == y
+    {
+        return true;
+    }
+    let in_dir = |p: &Path| {
+        Some(
+            std::fs::canonicalize(p.parent()?)
+                .ok()?
+                .join(p.file_name()?),
+        )
     };
-    Ok((prop("LoadState") != "not-found").then(|| PathBuf::from(prop("FragmentPath"))))
+    matches!((in_dir(a), in_dir(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Where systemd loads the service from: `None` when it has no unit file
+/// for it (`LoadState=not-found`), else its `FragmentPath` (empty when it
+/// has none). An error when systemd cannot be asked.
+fn fragment(env: &Env) -> Result<Option<PathBuf>> {
+    let text = show(env, &["-p", "LoadState,FragmentPath"])?;
+    Ok((prop(&text, "LoadState") != "not-found")
+        .then(|| PathBuf::from(prop(&text, "FragmentPath"))))
+}
+
+/// Install, with the service running and its unit file already as
+/// agentmail would write it for `bin`: whether the running service is
+/// still on something else, so that it must be restarted all the same
+/// (say, a previous install wrote the unit over the README's, then its
+/// `daemon-reload`, `enable` or `try-restart` failed). It is when systemd
+/// has no unit file for it loaded (`LoadState=not-found`), has not
+/// reloaded the file since it changed (`NeedDaemonReload=yes`), loads it
+/// from another file (`FragmentPath`, compared with symlinks resolved), or
+/// runs another binary (the loaded `ExecStart`'s `path=`), or when its
+/// main process started before the unit file was last written
+/// (`ExecMainStartTimestamp`, which catches a reload that ran but a restart
+/// that did not). Asked before the unit is reloaded; whatever systemd
+/// cannot tell counts for nothing, as when it cannot be asked at all.
+pub fn runs_stale(env: &Env, bin: &Path) -> bool {
+    let unit = unit_path(env);
+    let Ok(text) = show(
+        env,
+        &["-p", "LoadState,FragmentPath,NeedDaemonReload,ExecStart"],
+    ) else {
+        return false;
+    };
+    let load = prop(&text, "LoadState");
+    if load == "not-found" || prop(&text, "NeedDaemonReload") == "yes" {
+        return true;
+    }
+    if load == "loaded" && !same_file(Path::new(prop(&text, "FragmentPath")), &unit) {
+        return true;
+    }
+    let exec = prop(&text, "ExecStart");
+    if let Some(path) = exec
+        .split_once("path=")
+        .and_then(|(_, rest)| rest.split(" ;").next())
+        .filter(|p| !p.is_empty())
+        && Path::new(path) != bin
+    {
+        return true;
+    }
+    started_before_written(env, &unit)
+}
+
+/// Whether the service's main process started before the unit file at
+/// `unit` was last written (to the second; `systemctl show
+/// --timestamp=unix`, systemd 248 and later). False when either is not
+/// known.
+fn started_before_written(env: &Env, unit: &Path) -> bool {
+    let Ok(text) = show(env, &["--timestamp=unix", "-p", "ExecMainStartTimestamp"]) else {
+        return false;
+    };
+    let Some(started) = prop(&text, "ExecMainStartTimestamp")
+        .strip_prefix('@')
+        .and_then(|t| t.split('.').next())
+        .and_then(|t| t.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    std::fs::metadata(unit)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|written| started < written.as_secs())
 }
 
 /// Uninstall, with no unit file: what systemd still has of agentmail's
@@ -894,7 +990,9 @@ fn fragment(env: &Env) -> Result<Option<PathBuf>> {
 /// loads it from [`unit_path`] (not yet reloaded); one loaded from
 /// elsewhere (say, `~/.local/share/systemd/user` or a package's) is the
 /// user's. Likewise the `default.target.wants` link is agentmail's only
-/// when it points to [`unit_path`] (it may dangle there).
+/// when it points to [`unit_path`] (it may dangle there). Both compare
+/// with symlinks resolved, in the unit's directory too (see
+/// [`same_file`]), as the unit search path check does.
 pub fn orphan(env: &Env) -> (Option<Orphan>, Option<String>) {
     let unit = unit_path(env);
     let mut left = Vec::new();
@@ -902,7 +1000,7 @@ pub fn orphan(env: &Env) -> (Option<Orphan>, Option<String>) {
     let link = match std::fs::read_link(&wants) {
         Ok(target) => {
             let target = wants.parent().map_or(target.clone(), |d| d.join(&target));
-            if target == unit {
+            if same_file(&target, &unit) {
                 Some(wants)
             } else {
                 left.push(format!(
@@ -918,7 +1016,7 @@ pub fn orphan(env: &Env) -> (Option<Orphan>, Option<String>) {
     let active = is_active(env)
         && match fragment(env) {
             Ok(None) => true,
-            Ok(Some(f)) if f == unit => true,
+            Ok(Some(f)) if same_file(&f, &unit) => true,
             Ok(Some(f)) => {
                 left.push(format!(
                     "the running service {NAME} is loaded from {}, not from agentmail's unit",

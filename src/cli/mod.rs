@@ -1008,12 +1008,16 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     } else {
         (None, None)
     };
-    // A service running before install (on a unit that was there, or one
-    // removed by hand) is restarted to run ours: enabling a running service
-    // does not. One that is not running is started on ours by `enable
-    // --now`, and restarting it then would only drop the clients of the
-    // daemon it just started. Asked before anything starts it.
-    let restart = !uninstall && !changes.is_empty() && service::is_active(&env);
+    // A service running before install on anything but agentmail's unit
+    // as it now stands (a unit that was there, one removed by hand, or,
+    // after an install that failed before restarting it, the unit before
+    // that one) is restarted to run ours: enabling a running service does
+    // not. One that is not running is started on ours by `enable --now`,
+    // and restarting it then would only drop the clients of the daemon it
+    // just started. Asked before anything reloads or starts it.
+    let restart = !uninstall
+        && service::is_active(&env)
+        && (!changes.is_empty() || service::runs_stale(&env, &bin));
     // Only a daemon started on demand is stopped: a supervised one (the
     // service's own, say, on a re-run) would only drop its clients while
     // it is restarted. Asked before the service starts, and again once it

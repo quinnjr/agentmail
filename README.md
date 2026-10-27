@@ -129,90 +129,36 @@ agentmail install --service            # --dry-run shows what it would do
 loginctl enable-linger "$USER"         # optional: keep it running while logged out
 ```
 
-It writes the unit below to `~/.config/systemd/user/agentmail.service` (or
-under `$XDG_CONFIG_HOME`, when it is absolute), with `ExecStart` running the binary you invoked by
-the path you invoked it as (a symlink stays a symlink, so a unit pointing at
-`~/.local/bin/agentmail` follows it to a newer version; a path that is not
-this binary, or one with `..` in it, gives way to the binary's resolved
-path). Only agentmail's own unit is replaced as is: the one it created
-(whatever its `ExecStart`), or the one it wrote in place of a unit of yours
-kept as the backup (its `ExecStart` a path as agentmail writes it). Any
-other unit already there, also one you wrote by hand from this README, is
-saved as `agentmail.service.agentmail.bak` first, and install refuses to
-replace it when that backup already keeps a different one, so that neither
-is lost; when that unit set more than the unit below (say, an
-`Environment=` line), install notes what the service no longer gets. A unit
-agentmail created that you have since edited (beyond its `ExecStart`)
-install refuses to replace, changing nothing, and shows your edits: keep
-such settings in a drop-in instead (see below), which install and uninstall
-never touch. It then runs the commands below, `daemon-reload` and
-`enable --now`, and, when the service was already running (on the unit it
-replaced, or on one removed by hand), `systemctl --user try-restart
-agentmail`, since enabling a running service does not restart it on the new
-unit (a service that was not running, `enable --now` starts on the new
-unit). Last, when a daemon
-started on demand runs where the service's daemon runs (its lock record does
-not say it is supervised), it runs `agentmail daemon stop` there: the
-service's location is what its environment makes it, the systemd user
-manager's (`systemctl --user show-environment`) with the unit's and its
-drop-ins' `Environment=` and `EnvironmentFile=` over it (`systemctl --user
-show -p Environment agentmail`), and the command is shown with
-`AGENTMAIL_DATA_DIR` and `AGENTMAIL_SOCKET` unset or set as that takes
-(when the manager or unit cannot be asked, the default location, those two
-unset). The service's daemon, already waiting for the
-lock, takes over as the on-demand one exits, so no client can start another
-on demand in between. It looks again once the service is started, so a
-daemon a client started on demand while systemd was starting the service
-(which the service's would otherwise wait behind) is stopped too; that look
-also reads the service's location again, now that systemd has loaded the
-unit and its drop-ins. A lock file without a record yet (a daemon records
-itself a moment after taking the lock), or with one caught mid-rewrite, is
-read again for up to a second first, so the service's own daemon that has
-just taken over is not mistaken for one on demand. With no daemon running, or the service's own
-(supervised) one, it skips that step, so a re-run leaves the service's daemon
-alone; should the step fail, the service is running all the same, and the
-error says to stop the on-demand daemon yourself. It refuses, changing
-nothing, when the systemd user manager's unit search path (`systemctl --user
-show -p UnitPath`) does not hold the directory it would write to (the
-manager's own `XDG_CONFIG_HOME` or `HOME` differs from your shell's), since
-the manager would never see the unit; run it again with `XDG_CONFIG_HOME`
-and `HOME` set as the manager has them. (`systemctl --user set-environment`
-does not help here: it changes only the environment the manager gives the
-services it starts, not where it looks for units.) It first asks
-`systemctl --user is-system-running`: a manager that answers `running`,
-`degraded` (some other unit failed), `starting` or `initializing` can run the
-service; any other answer, or none, changes nothing and prints these steps to
-do by hand (`--dry-run` asks too, and notes that a real run would change
-nothing). `agentmail uninstall --service` disables and stops the service,
-removes the unit and reloads systemd. It removes only the unit below
-(whatever its `ExecStart`) or one agentmail created: one you wrote by hand
-from this README, or one agentmail created that you then edited, is saved as
-the backup first, unless that backup already keeps a different unit, and
-any other unit is left in place with the commands to remove it by hand. Removing it by hand, also remove
-`agentmail.service.agentmail.created` next to it (agentmail's marker, which
-a later install or uninstall trusts), and either move a unit kept as
-`agentmail.service.agentmail.bak` back or remove it too. Uninstall does not put a unit kept in the
-backup back (it says so); to restore it, run
-`mv agentmail.service.agentmail.bak agentmail.service && systemctl --user daemon-reload`
-in that directory. When the unit file is already gone (removed by hand) but
-systemd still runs the service or has its `default.target.wants` link,
-uninstall stops it, removes the link and reloads systemd: the service only
-when systemd has no unit file for it any more (or still loads it from
-agentmail's removed unit), and the link only when it points to agentmail's
-unit. A service named `agentmail` loaded from elsewhere (say,
-`~/.local/share/systemd/user` or a package's), and a link to it, are yours,
-and left alone with a note saying so. The service's daemon does not see
-the `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` of the shell you run the
-install in: install notes those it finds set that the service does not get
-the same value of, with the drop-in lines that give the service the same
-(see below). It also notes when the service's environment otherwise puts
-the data directory or socket elsewhere than your shell does (say, the
-manager's `XDG_RUNTIME_DIR`, or an `AGENTMAIL_DATA_DIR` a drop-in sets and
-your shell does not), naming the variables that differ.
-Uninstall leaves the service's drop-ins in place (and says so), so a later
-install uses them again. When a command fails after
-the unit is written (or, on uninstall, before or after it is removed), the
-error says what is left and how to finish or undo it.
+What it does:
+
+- Writes the unit below to `~/.config/systemd/user/agentmail.service` (under
+  `$XDG_CONFIG_HOME` when that is set to an absolute path), running the
+  `agentmail` you invoked.
+- Runs `systemctl --user daemon-reload` and `enable --now agentmail`,
+  restarts the service if it was already running on an older unit, and
+  stops a daemon an agent started on demand, so the service's daemon takes
+  over.
+- Never loses a unit of yours: one already there (say, written by hand from
+  this README) is saved as `agentmail.service.agentmail.bak` first, and a
+  unit agentmail wrote that you have since edited is not replaced at all.
+- Notes when your shell sets `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET`
+  differently from the service, with the lines to give the service the same
+  (see the drop-in below).
+
+Put your own settings for the service in a drop-in
+(`systemctl --user edit agentmail`), not in `agentmail.service`: install and
+uninstall never touch drop-ins.
+
+`agentmail uninstall --service` disables and stops the service and removes
+the unit (cleaning up after one you already removed by hand). It leaves
+drop-ins and a saved `.agentmail.bak` unit in place, and says how to restore
+the latter.
+
+Both refuse, changing nothing and printing the steps to do by hand, when the
+systemd user manager is not available, or when it would not see the unit
+(its own `XDG_CONFIG_HOME` or `HOME` differs from your shell's). If a step
+fails part-way, the error says what is left and how to finish; running the
+same command again finishes it. Add `--dry-run` to see what either would do.
 
 To set it up by hand instead, add a user unit at
 `~/.config/systemd/user/agentmail.service`:

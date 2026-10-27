@@ -3013,6 +3013,19 @@ exit 0
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Another test's child, forked while the script was open for
+            // writing here, holds it open until it execs: running the
+            // script fails with ETXTBSY until then.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::process::Command::new(&fake)
+                .args(["--user", "is-active"])
+                .env("FAKE_ACTIVE", "")
+                .output()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::ExecutableFileBusy)
+            {
+                assert!(std::time::Instant::now() < deadline, "fake systemctl busy");
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         ServiceHome { h }
     }
@@ -3068,6 +3081,19 @@ exit 0
             .env_remove("FAKE_START_ON_ENABLE")
             .env_remove("FAKE_RO");
         c
+    }
+
+    /// What `systemctl --user show` says of the service running on
+    /// agentmail's unit as installed for this binary, reloaded since.
+    fn loaded(&self) -> String {
+        format!(
+            "LoadState=loaded\nFragmentPath={}\nNeedDaemonReload=no\nExecStart={{ path={} ; \
+             argv[]={} daemon run --wait-for-lock ; ignore_errors=no ; start_time=[n/a] ; \
+             stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\n",
+            self.unit().display(),
+            bin_path(),
+            bin_path()
+        )
     }
 
     /// The CLI with a private daemon location, as `AGENTMAIL_DATA_DIR` and
@@ -3193,6 +3219,7 @@ fn service_calls_systemctl_in_order() {
     let out = s
         .cli()
         .env("FAKE_ACTIVE", "active")
+        .env("FAKE_SHOW", s.loaded())
         .args(["install", "--service"])
         .assert()
         .success()
@@ -3352,6 +3379,7 @@ fn service_dry_run_changes_and_runs_nothing() {
         let out = s
             .cli()
             .env("FAKE_ACTIVE", "active")
+            .env("FAKE_SHOW", s.loaded())
             .args(["install", "--service", "--dry-run"])
             .assert()
             .success()
@@ -3362,6 +3390,7 @@ fn service_dry_run_changes_and_runs_nothing() {
     };
     let out = dry(false);
     assert!(out.contains("nothing to change"), "{out}");
+    assert!(!out.contains("try-restart"), "{out}");
     assert!(!out.contains("daemon stop"), "{out}");
     assert!(
         out.contains("systemctl --user enable --now agentmail"),
@@ -4200,6 +4229,164 @@ fn service_restarts_a_replaced_unit() {
             "--user enable --now agentmail [down]",
         ]
     );
+}
+
+#[test]
+fn service_rerun_after_a_failed_install_restarts_the_service() {
+    // Install replaces the README's unit while the service runs on it, and
+    // fails before the service is restarted onto agentmail's unit: running
+    // it again, as the error says, finishes it with the restart, though
+    // the unit file is already as it should be.
+    let tail = |s: &ServiceHome, n: usize| s.log()[n..].to_vec();
+    // With `daemon-reload` failed, systemd has not reloaded the unit since
+    // it changed; with a later step failed, it has, but the process
+    // started before the unit was written.
+    let show = |s: &ServiceHome, fail: &str| {
+        if fail == "daemon-reload" {
+            s.loaded()
+                .replace("NeedDaemonReload=no", "NeedDaemonReload=yes")
+        } else {
+            format!("{}ExecMainStartTimestamp=@1\n", s.loaded())
+        }
+    };
+    for fail in ["daemon-reload", "enable", "try-restart"] {
+        let s = ServiceHome::new();
+        write(&s.unit(), &readme_unit());
+        let err = s
+            .cli()
+            .env("FAKE_ACTIVE", "active")
+            .env("FAKE_FAIL", fail)
+            .args(["install", "--service"])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("again to finish"), "{fail}: {err}");
+        assert_eq!(
+            read(&s.unit()),
+            install::service::unit(Path::new(&bin_path())).unwrap()
+        );
+        let n = s.log().len();
+        s.cli()
+            .env("FAKE_ACTIVE", "active")
+            .env("FAKE_SHOW", show(&s, fail))
+            .args(["install", "--service"])
+            .assert()
+            .success();
+        assert_eq!(
+            tail(&s, n),
+            [
+                "--user is-system-running [down]",
+                "--user daemon-reload [down]",
+                "--user enable --now agentmail [down]",
+                "--user try-restart agentmail [down]",
+            ],
+            "{fail}"
+        );
+    }
+
+    // The running service is on something else than the unit as it stands
+    // here: restarted too.
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    let restarts = |show: String| {
+        let n = s.log().len();
+        s.cli()
+            .env("FAKE_ACTIVE", "active")
+            .env("FAKE_SHOW", show)
+            .args(["install", "--service"])
+            .assert()
+            .success();
+        s.log()[n..].iter().any(|l| l.contains("try-restart"))
+    };
+    let other = s.h.dir.path().join("pkg/agentmail.service");
+    assert!(restarts(s.loaded().replace(
+        &format!("FragmentPath={}", s.unit().display()),
+        &format!("FragmentPath={}", other.display())
+    )));
+    assert!(restarts(s.loaded().replace(
+        &format!("path={}", bin_path()),
+        "path=/old/agentmail"
+    )));
+    assert!(restarts("LoadState=not-found\nFragmentPath=\n".to_string()));
+    // On agentmail's unit, loaded, and started since it was written: left
+    // running, its clients undisturbed.
+    assert!(!restarts(s.loaded()));
+    assert!(!restarts(format!(
+        "{}ExecMainStartTimestamp=@99999999999\n",
+        s.loaded()
+    )));
+    // Through a symlinked config directory, it is the same unit.
+    #[cfg(unix)]
+    {
+        let alias = s.h.dir.path().join("alias-cfg");
+        std::os::unix::fs::symlink(s.config(), &alias).unwrap();
+        assert!(!restarts(s.loaded().replace(
+            &format!("FragmentPath={}", s.unit().display()),
+            &format!(
+                "FragmentPath={}",
+                alias.join("systemd/user/agentmail.service").display()
+            )
+        )));
+    }
+    // A service that is not running is not restarted, whatever systemd
+    // says of it.
+    let n = s.log().len();
+    s.cli()
+        .env("FAKE_SHOW", "LoadState=not-found\nFragmentPath=\n")
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert!(!s.log()[n..].iter().any(|l| l.contains("try-restart")));
+}
+
+#[cfg(unix)]
+#[test]
+fn service_uninstall_cleans_up_through_a_symlinked_config_directory() {
+    // The config directory reaches systemd through a symlink (HOME, say,
+    // a link to another disk): the enable link and the FragmentPath name
+    // agentmail's removed unit by the other path, and are agentmail's all
+    // the same.
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    let alias = s.h.dir.path().join("alias-cfg");
+    std::os::unix::fs::symlink(s.config(), &alias).unwrap();
+    let aliased = alias.join("systemd/user/agentmail.service");
+    let link = s
+        .unit()
+        .parent()
+        .unwrap()
+        .join("default.target.wants/agentmail.service");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&aliased, &link).unwrap();
+    std::fs::remove_file(s.unit()).unwrap();
+    let n = s.log().len();
+    let out = s
+        .cli()
+        .env("FAKE_ACTIVE", "active")
+        .env(
+            "FAKE_SHOW",
+            format!("LoadState=loaded\nFragmentPath={}\n", aliased.display()),
+        )
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("left alone"), "{out}");
+    assert_eq!(
+        s.log()[n..],
+        [
+            "--user is-system-running [down]",
+            "--user stop agentmail [down]",
+            "--user daemon-reload [down]",
+        ]
+    );
+    assert!(std::fs::symlink_metadata(&link).is_err());
 }
 
 #[test]
