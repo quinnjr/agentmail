@@ -16,10 +16,12 @@
 //!   when the timeout (default [`DEFAULT_WAIT`]) passed first, so the
 //!   plugin waits again, passing `known` back (below);
 //!   `{"busy":true}` when the session is not idle (open questions continue
-//!   the turn, or a later wait took over); `{"skip":true}` when the agent
+//!   the turn, though never on a wait passed `known`, or a later wait took
+//!   over); `{"skip":true}` when the agent
 //!   does not want waking (`wake` off) or the waiter lock is unusable; and
 //!   `{"gone":true}` when the agent signed off or is gone, the session has
-//!   no agent, the daemon is down or went away, or opencode exited. Only
+//!   no agent, the daemon is down or went away, opencode exited, or the
+//!   hook runs as the human. Only
 //!   `{"mail":false}` asks the plugin to wait again at once; it stops on
 //!   the others until the session is idle again.
 //!

@@ -963,8 +963,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     } = cli.command
     {
         // `--as human` is the human, like `AGENTMAIL_HUMAN=1`: a hook run
-        // as the human has nothing to say (`--as` takes no other value).
+        // as the human has nothing to say (`--as` takes no other value),
+        // which for opencode's plugin is `{}` / `{"gone":true}`.
         if cli.as_who.is_some() {
+            if matches!(harness_from(&harness), Ok(Harness::Opencode)) {
+                let out = crate::hook::opencode::unavailable(event);
+                if !out.stdout.is_empty() {
+                    let _ = print_text(&out.stdout);
+                }
+            }
             return Ok(ExitCode::SUCCESS);
         }
         let args = crate::hook::HookArgs {

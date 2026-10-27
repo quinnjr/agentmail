@@ -467,7 +467,8 @@ impl Daemon {
     /// [`Daemon::wait`], with the unread mail that does not count as news
     /// in `known`. `None` lets the first look decide (as `wait` does);
     /// `Some` (a timed-out wait's set, passed back by opencode's plugin)
-    /// is used as is. The wait keeps `known` up to date (mail read
+    /// is used as is, and the wait never ends as `Busy` for open questions
+    /// (the stop they would block was the timed-out wait's, not blocked). The wait keeps `known` up to date (mail read
     /// meanwhile drops out), so a caller that stops it (a timeout) can
     /// hand it to the wait that follows: mail that came in between is then
     /// news, not counted as already there.
@@ -496,7 +497,11 @@ impl Daemon {
             Some(r) => r.block,
             None => !status.open_questions.is_empty(),
         };
-        if wake_for_unread && blocked {
+        // A wait passed a timed-out wait's `known` (a re-wait) follows a
+        // stop that was already found not blocked: questions opened since
+        // are mail like any other, so they do not end it as `Busy`.
+        let rewait = known.is_some();
+        if wake_for_unread && blocked && !rewait {
             // The Stop hook blocks this stop, so the session goes on with
             // a continuation and is not idle: a wake now would be injected
             // into that turn. The continuation's own stop

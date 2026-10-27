@@ -433,8 +433,11 @@ How `agentmail hook wait` behaves under it:
   binary) exits 0 and prints nothing (the usage error only when stderr is
   a terminal, for a person running it by hand), so it never blocks a stop
   and never shows up in a harness. A hook run with `--as human` is the
-  human, like `AGENTMAIL_HUMAN=1`: it exits 0 and prints nothing (`--as`
-  accepts no other value; any other is a usage error, silent as above).
+  human, like `AGENTMAIL_HUMAN=1`: it exits 0 with nothing to say, which
+  is no output, except for opencode's plugin, which gets the same answer
+  as for a session without an agent (`{}` for `status` and `signoff`,
+  `{"gone":true}` for `wait`) (`--as` accepts no other value; any other is
+  a usage error, silent as above).
   It counts as a `hook` command line when its first positional argument
   (after global options such as `--json` or `--as human`, before any
   `--`) is `hook`.
@@ -666,10 +669,14 @@ bundle (the `fromPromise` adapter that wraps a `{ id, setup }` module).
   directories: both instances got both sessions' `execution.*` events). The
   plugin therefore acts on a session only when `ctx.session.get` places it
   in its own `ctx.location.directory`; otherwise two instances would each
-  queue the same question or run two waiters. Answers are cached: its own
-  sessions until deleted, another instance's in a list of the 256 most
-  recently seen (state for those is dropped, so a long-running `opencode
-  serve` does not grow without bound). A failed lookup is not cached; the
+  queue the same question or run two waiters. Answers are cached, both in
+  lists bounded so a long-running `opencode serve` that never deletes
+  sessions does not grow without bound: another instance's sessions, the
+  256 most recently seen (state for those is dropped); its own sessions,
+  with their state, until deleted or until more than 256 are known, when
+  the least recently seen that need nothing more (idle, no waiter or
+  turn-end handler running, nothing left to deliver, no turn of the
+  plugin's pending) are forgotten and looked up again when next seen. A failed lookup is not cached; the
   session's next event asks again. A deleted session cannot be looked up
   any more: an instance that never saw it signs it off too, which is
   harmless twice.
@@ -695,7 +702,10 @@ How the plugin (`plugin/agentmail.js`) behaves, built on that:
   else, with unread mail, the reminder is appended to the tool result. When
   the steer fails (the session ended meanwhile), the urgent text is
   appended to the tool result instead, with the reminder, since agentmail
-  will not report that mail as urgent again.
+  will not report that mail as urgent again. A failed tool call (status
+  `error`) has no result to append to: its urgent text is kept by the
+  plugin and pushed after the next tool call, or, if the turn ends first,
+  queued at its end (`resume: true`, with any open questions).
 - At the end of a successful turn, open questions are queued as the next
   turn (`queue`, `resume: true`), unless that turn was itself one the
   plugin started (a wake or the questions): like Claude Code's
@@ -724,13 +734,29 @@ How the plugin (`plugin/agentmail.js`) behaves, built on that:
   (open questions continue the turn, or another wait took over),
   `{"skip":true}` (`wake` off, or the lock unusable) or `{"gone":true}`
   (signed off, gone, no agent, daemon down, opencode exited). On mail the
-  plugin queues the reminder with `resume: true`, which starts a turn; on
-  anything but the timeout the waiter stops until the session is idle
-  again. `execution.started` kills the waiter's process, so a wake never
+  plugin queues the reminder with `resume: true`, which starts a turn.
+  When that fails (or the answer has no text) the waiter does not stop:
+  agentmail has recorded the mail as woken, so a later plain wait would
+  not wake for it. It waits on for new mail only (`stop_hook_active:
+  true`), with a short timeout (5 s, doubling per failure up to 300 s),
+  and after each timeout queues the reminder of a fresh status again
+  while the mail is still unread; new mail meanwhile is another try. A
+  re-wait after a timeout never answers `{"busy":true}` for open
+  questions (`Daemon::wait_from` with `known`: the stop was already found
+  not blocked), so a question delivered between two waits is mail like
+  any other. A first wait can still answer it, for a question that came
+  after the turn end's status: if the session is still idle, the plugin
+  re-runs the turn's end once (status, then the questions queued; if they
+  cannot be, or there are none, it waits again, for new mail only when
+  they could not be queued), and a second busy answer ends the waiter. On
+  `{"skip":true}`, `{"gone":true}` or a failure the waiter stops until
+  the session is idle again. `execution.started` kills the waiter's process, so a wake never
   lands in a busy turn (`Bun.spawn`, since Bun's `$` cannot be killed).
   A mail answer the wait printed just before the kill (or while the turn
   was starting) has already been recorded by agentmail as woken, so the
-  plugin does not drop it: it marks the session, and if the busy turn ends
+  plugin does not drop it, even when the process then ended by the signal
+  (its stdout is parsed whatever the exit status, and a mail answer is
+  kept): it marks the session, and if the busy turn ends
   without a tool call having appended the reminder, the reminder is queued
   then (`resume: true`), once.
   There are no busy-mark files for opencode: the plugin sees the session's

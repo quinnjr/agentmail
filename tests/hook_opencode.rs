@@ -495,6 +495,26 @@ async fn wait_after_timeout_counts_mail_that_came_between() {
 }
 
 #[tokio::test]
+async fn rewait_after_timeout_wakes_for_a_question_that_came_between() {
+    // A plain end of turn whose wait timed out: the plugin waits again with
+    // the timed-out wait's `known`. A question delivered in between is
+    // news; the re-wait does not answer `busy` for it (no turn on opencode
+    // continues from a wait, and the plugin's waiter would end for good).
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    let env = Env::of(&d.paths);
+    let short = Some(Duration::from_secs(1));
+    let v = joined(spawn_wait(&env, "ses_a", false, short)).await;
+    assert_eq!(v, json!({ "mail": false, "known": [] }));
+
+    ask(&d, &a, "POST /orders body?").await;
+
+    let payload = json!({ "stop_hook_active": false, "known": v["known"] });
+    let v = joined(spawn_wait_with(&env, "ses_a", payload, short)).await;
+    assert_eq!(v["mail"], true, "{v}");
+}
+
+#[tokio::test]
 async fn wait_respects_no_wake() {
     let d = TestDaemon::start().await;
     register(&d, "backend", "ses_a", false).await;
@@ -628,6 +648,33 @@ fn cli_daemon_down_prints_empty_status_and_gone() {
         stdout_json(&cli(&paths, &wait, "")),
         json!({ "gone": true })
     );
+    // The human, by `--as human` as by `AGENTMAIL_HUMAN=1`: the same.
+    for human in [&["--as", "human"][..], &[][..]] {
+        let env_human = human.is_empty();
+        for (args, want) in [
+            (&status[..], json!({})),
+            (&wait[..], json!({ "gone": true })),
+        ] {
+            let mut cmd = assert_cmd::Command::new(BIN);
+            cmd.args(human)
+                .args(args)
+                .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
+                .env("AGENTMAIL_SOCKET", &paths.socket)
+                .env_remove("AGENTMAIL_ADDRESS")
+                .env_remove("OPENCODE_SESSION_ID")
+                .timeout(Duration::from_secs(20));
+            if env_human {
+                cmd.env("AGENTMAIL_HUMAN", "1");
+            } else {
+                cmd.env_remove("AGENTMAIL_HUMAN");
+            }
+            assert_eq!(
+                stdout_json(&cmd.output().unwrap()),
+                want,
+                "{human:?} {args:?}"
+            );
+        }
+    }
     // The plugin's sign-off of a deleted session, with an
     // `OPENCODE_SESSION_ID` set as well: still nothing started.
     let off = ["hook", "signoff", "--harness", "opencode", "--session", "s"];

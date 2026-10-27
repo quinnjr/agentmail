@@ -40,13 +40,20 @@ if (cmd === "hook status") {
     let answer = lines[0];
     let v = null;
     try { v = JSON.parse(answer); } catch {}
-    if (v && v._delay_ms) {
-      // Answer late, and (with _ignore_term) after a kill: the answer was
-      // already on its way when the plugin killed it.
-      if (v._ignore_term) process.on("SIGTERM", () => {});
+    if (v && v._print_on_term) {
+      // Answer only when killed, then die by the signal anyway, as the real
+      // agentmail does when the kill lands after it recorded and printed a
+      // wake: the answer was on its way when the plugin killed it.
+      delete v._print_on_term;
+      process.on("SIGTERM", () => {
+        fs.writeSync(1, JSON.stringify(v) + "\\n");
+        process.kill(process.pid, "SIGKILL");
+      });
+      setTimeout(() => {}, 30000);
+    } else if (v && v._delay_ms) {
+      // Answer late.
       const ms = v._delay_ms;
       delete v._delay_ms;
-      delete v._ignore_term;
       setTimeout(() => process.stdout.write(JSON.stringify(v) + "\\n"), ms);
     } else {
       process.stdout.write(answer + "\\n");
@@ -321,13 +328,16 @@ test("waiter_wakes_on_mail_and_rearms", async () => {
 test("waiter_waits_again_after_a_timeout_and_stops_otherwise", async () => {
   const { ctx } = await start();
   setStatus("ses_a", registered());
-  queueWaits("ses_a", { mail: false }, { busy: true });
+  queueWaits("ses_a", { mail: false }, { busy: true }, { busy: true });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
-  await until(() => waits("ses_a").length === 2);
+  await until(() => waits("ses_a").length === 3, 5000);
   const started = Date.now();
+  // A busy answer while the session is idle, with no questions to queue,
+  // waits again once, as the turn's end would; a second busy ends the
+  // waiter: no fourth wait, and no wake.
+  expect(JSON.parse(waits("ses_a")[2].stdin)).toEqual({ stop_hook_active: false });
   await Bun.sleep(1500);
-  // Busy ends the waiter: no third wait, and no wake.
-  expect(waits("ses_a")).toHaveLength(2);
+  expect(waits("ses_a")).toHaveLength(3);
   expect(ctx.synthetic).toEqual([]);
   // Gone, skip and failures end it too.
   for (const answer of [{ gone: true }, { skip: true }, "not json"]) {
@@ -585,7 +595,7 @@ test("wake_dropped_while_busy_is_delivered_at_turn_end", async () => {
   const { ctx } = await start();
   setStatus("ses_a", registered());
   // The wait's mail answer is on its way when the next turn starts.
-  queueWaits("ses_a", { mail: true, text: "📬 1 unread", _delay_ms: 300, _ignore_term: true });
+  queueWaits("ses_a", { mail: true, text: "📬 1 unread", _print_on_term: true });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 1);
   await Bun.sleep(50);
@@ -609,7 +619,7 @@ test("wake_dropped_while_busy_is_delivered_at_turn_end", async () => {
 test("wake_dropped_while_busy_is_not_repeated_after_a_tool_reminder", async () => {
   const { ctx } = await start();
   setStatus("ses_a", registered());
-  queueWaits("ses_a", { mail: true, text: "📬 1 unread", _delay_ms: 300, _ignore_term: true });
+  queueWaits("ses_a", { mail: true, text: "📬 1 unread", _print_on_term: true });
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 1);
   await Bun.sleep(50);
@@ -624,3 +634,143 @@ test("wake_dropped_while_busy_is_not_repeated_after_a_tool_reminder", async () =
   await until(() => waits("ses_a").length === 2);
   expect(ctx.synthetic).toEqual([]);
 });
+
+test("busy_while_idle_queues_questions_that_opened_since", async () => {
+  // A question arrives after the turn end's status, before the wait looks:
+  // agentmail answers busy (the questions would continue the turn). The
+  // session is still idle, so the plugin queues them itself.
+  const { ctx } = await start();
+  setStatus("ses_a", registered());
+  queueWaits("ses_a", { busy: true, _delay_ms: 300 });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  setStatus("ses_a", registered({ unread: 1, open_questions: [{ id: "q1" }], text: { questions: "❓ q" } }));
+  await until(() => ctx.synthetic.length === 1);
+  expect(ctx.synthetic[0]).toEqual({ sessionID: "ses_a", text: "❓ q", delivery: "queue", resume: true });
+  // The turn they start is the plugin's: its end does not queue them again.
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 2);
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+  expect(ctx.synthetic).toHaveLength(1);
+});
+
+test("busy_while_idle_with_unqueueable_questions_waits_for_new_mail", async () => {
+  let fail = true;
+  const { ctx } = await start({
+    synthetic: () => {
+      if (fail) throw new Error("no");
+    },
+  });
+  setStatus("ses_a", registered());
+  queueWaits("ses_a", { busy: true, _delay_ms: 300 });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => waits("ses_a").length === 1);
+  setStatus("ses_a", registered({ unread: 1, text: { questions: "❓ q" } }));
+  await until(() => waits("ses_a").length === 2, 5000);
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+  expect(ctx.synthetic).toEqual([]);
+  fail = false;
+});
+
+test("wake_that_cannot_be_queued_keeps_waiting_and_retries", async () => {
+  let failures = 1;
+  const { ctx } = await start({
+    synthetic: () => {
+      if (failures > 0) {
+        failures--;
+        throw new Error("busy elsewhere");
+      }
+    },
+  });
+  setStatus("ses_a", registered());
+  queueWaits("ses_a", { mail: true, text: "📬 1 unread" }, { mail: false, known: ["m1"] });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  // Not queued: a new wait starts at once, for new mail only, and short.
+  await until(() => waits("ses_a").length === 2, 5000);
+  const second = waits("ses_a")[1];
+  expect(JSON.parse(second.stdin)).toEqual({ stop_hook_active: true });
+  expect(second.args.at(-1)).toBe("5");
+  // That wait times out: the reminder is tried again, from a fresh status.
+  setStatus("ses_a", registered({ unread: 1, text: { reminder: "📬 1 unread (again)" } }));
+  await until(() => ctx.synthetic.length === 1, 5000);
+  expect(ctx.synthetic[0]).toEqual({ sessionID: "ses_a", text: "📬 1 unread (again)", delivery: "queue", resume: true });
+  // Delivered: the waiter ends.
+  await Bun.sleep(1200);
+  expect(waits("ses_a")).toHaveLength(2);
+});
+
+test("wake_without_text_keeps_waiting_and_retries", async () => {
+  const { ctx } = await start();
+  setStatus("ses_a", registered({ unread: 1, text: { reminder: "📬 1 unread" } }));
+  queueWaits("ses_a", { mail: true }, { mail: false });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.synthetic.length === 1, 5000);
+  expect(ctx.synthetic[0].text).toBe("📬 1 unread");
+  expect(JSON.parse(waits("ses_a")[1].stdin)).toEqual({ stop_hook_active: true });
+});
+
+test("urgent_for_a_failed_tool_is_kept_when_steering_fails", async () => {
+  let fail = true;
+  const { ctx } = await start({
+    synthetic: () => {
+      if (fail) throw new Error("no");
+    },
+  });
+  // A failed tool call (nothing to append to), and the steer fails: the
+  // urgent text agentmail marked surfaced is kept...
+  setStatus("ses_a", registered({ unread: 1, urgent: [{ id: "m1" }], text: { urgent: "🚨 prod" } }));
+  const failed = { tool: "shell", sessionID: "ses_a", status: "error", error: new Error("x") };
+  await ctx.hooks["execute.after"](failed);
+  expect(ctx.synthetic).toEqual([]);
+  // ...and pushed after the next tool call, though no longer reported.
+  fail = false;
+  setStatus("ses_a", registered({ unread: 1 }));
+  const next = toolEvent("ses_a");
+  await ctx.hooks["execute.after"](next);
+  expect(ctx.synthetic).toEqual([{ sessionID: "ses_a", text: "🚨 prod", delivery: "steer", resume: false }]);
+  // Once.
+  await ctx.hooks["execute.after"](toolEvent("ses_a"));
+  expect(ctx.synthetic).toHaveLength(1);
+
+  // Without a next tool call it is queued at the turn's end.
+  fail = true;
+  setStatus("ses_a", registered({ unread: 1, urgent: [{ id: "m2" }], text: { urgent: "🚨 db" } }));
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await ctx.hooks["execute.after"]({ ...failed });
+  fail = false;
+  setStatus("ses_a", registered({ unread: 2 }));
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.synthetic.length === 2);
+  expect(ctx.synthetic[1]).toEqual({ sessionID: "ses_a", text: "🚨 db", delivery: "queue", resume: true });
+});
+
+test("own_sessions_are_bounded", async () => {
+  const { ctx } = await start();
+  // Sessions without an agent: idle, no waiter, nothing to deliver.
+  for (let i = 0; i < 300; i++) ctx.emit("session.execution.succeeded", { sessionID: `ses_${i}` });
+  await until(() => ctx.gets.length === 300 && calls().length === 300, 10000);
+  await Bun.sleep(100);
+  // The oldest were forgotten (looked up again), the newest kept.
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_0" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_299" });
+  await until(() => ctx.gets.length === 301);
+  await until(() => calls().length === 302);
+  expect(ctx.gets.slice(300)).toEqual(["ses_0"]);
+}, 20000);
+
+test("sessions_with_a_waiter_are_not_forgotten", async () => {
+  const { ctx } = await start();
+  setStatus("ses_w", registered());
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_w" });
+  await until(() => existsSync(join(fake, "waiting.ses_w.pid")));
+  const pid = Number(readFileSync(join(fake, "waiting.ses_w.pid"), "utf8"));
+  for (let i = 0; i < 300; i++) ctx.emit("session.execution.succeeded", { sessionID: `ses_${i}` });
+  await until(() => ctx.gets.length === 301 && calls().length === 302, 10000);
+  await Bun.sleep(100);
+  expect(alive(pid)).toBe(true);
+  // Still known: a new turn stops its waiter without a lookup.
+  ctx.emit("session.execution.started", { sessionID: "ses_w" });
+  await until(() => !alive(pid));
+  expect(ctx.gets.filter((id) => id === "ses_w")).toHaveLength(1);
+}, 20000);
