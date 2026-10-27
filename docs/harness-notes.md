@@ -1326,16 +1326,27 @@ not re-run:
 | `kiro` | passed | 1–5 |
 | `mixed` (Claude Code A, opencode B) | passed | 1–4 |
 
+- **Deviation from the plan: Claude Code's config.** The plan drives Claude
+  Code as `claude -p --settings … --mcp-config …`. The script instead runs
+  `agentmail install --harness claude-code` into the throwaway
+  `CLAUDE_CONFIG_DIR` and runs `claude -p` with neither flag, so Claude
+  Code reads the installed user-scope config (`settings.json` and
+  `.claude.json` there) and the e2e run also covers `install`.
+
 - **Logins.** Claude Code's `.credentials.json` and kiro-cli's
   `data.sqlite3` were copied into the throwaway home with their refresh
   tokens removed (kiro: the `kirocli:odic:token` row of `auth_kv`), so a
   run can only use the access token and never rotate the real login; both
   copies are deleted when the script exits. Both harnesses ran on the
-  access token alone. The script refuses a login with less than 15
-  minutes left. (The kiro re-run had about 9 minutes left on the login,
-  and the user's own login must not be refreshed from here, so it ran
-  from a scratch copy of the script with that margin lowered to 4
-  minutes; it finished in under 2.) The expiry is parsed with any number
+  access token alone. Since the copy cannot be refreshed, the script
+  refuses a login that expires before the longest possible run ends: 6 ×
+  `AGENTMAIL_E2E_TIMEOUT` + 300 seconds by default (six waits plus
+  setup), or `AGENTMAIL_E2E_MIN_LOGIN_SECS`. (The kiro re-run had about 9
+  minutes left on the login, and the user's own login must not be
+  refreshed from here; it ran from a scratch copy of the script, then
+  fixed at 15 minutes, with the margin lowered to 4 minutes, and
+  finished in under 2. That knob is now the environment variable, so
+  such a run needs no edited copy.) The expiry is parsed with any number
   of fraction digits (none, 3, 6, 9). opencode's free models need no
   login.
 - **kiro's data dir.** Only what kiro-cli never writes is linked from
@@ -1391,6 +1402,20 @@ not re-run:
   `serve` on a free port with a random `OPENCODE_PASSWORD` (both `serve`
   and `run --server` read it; without it `run --server` fails with
   "requires a password").
+- **Secrets and stray processes.** The API key and opencode's server
+  password are exported only inside the subshell that execs the harness
+  (after every other exported variable is unset), never passed as
+  `env -i NAME=value` arguments, so they are not in any process's
+  command line. Each harness is started under `setsid` (which, as the
+  subshell is not a group leader, execs without forking, so the pid the
+  script records, and step 5 checks, is still the harness's), and on a
+  timeout and on exit the script TERMs each harness's process group,
+  waits up to 5 seconds and KILLs what is left, before stopping the
+  daemon and removing the throwaway home. That catches kiro's
+  `kiro-cli-chat` and engine `node`, opencode's MCP servers and the
+  plugin's `agentmail hook wait`. After this change `opencode` mode was
+  run again (2026-10-27, `AGENTMAIL_E2E_TIMEOUT=400`) and passed steps
+  1–4 and 6, with no agentmail-e2e process left afterwards.
 - **The unix socket path limit** (about 100 bytes) ruled out a socket in
   the scratch directory; the script puts it in its own `mktemp -d
   /tmp/am-e2e.XXXXXX`.

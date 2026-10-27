@@ -51,15 +51,28 @@
 #   AGENTMAIL_E2E_KIRO_DATA kiro-cli's data dir holding its login
 #                           (default: ${XDG_DATA_HOME:-~/.local/share}/kiro-cli)
 #   AGENTMAIL_E2E_TIMEOUT   seconds allowed per wait and agent run (default: 600)
+#   AGENTMAIL_E2E_MIN_LOGIN_SECS
+#                           how long a copied login must still be valid
+#                           (default: 6 x AGENTMAIL_E2E_TIMEOUT + 300, the
+#                           longest a run can take: six waits plus setup).
+#                           Lower it, or the timeout, to run on a login
+#                           that expires sooner.
 #   AGENTMAIL_E2E_KEEP=1    keep the temporary directory (logs, transcripts)
 #
 # Logins are copied, never linked, and with their refresh token removed, so
-# the copy cannot rotate (and so invalidate) the real login; the script
-# refuses a login that expires within 15 minutes. Copies are deleted on exit,
-# even with AGENTMAIL_E2E_KEEP=1. Of kiro-cli's data dir only the runtimes it
-# never writes (bun, node, tui.js, the versioned engine under kas/) are
-# linked in; its feed files are copied and the rest left out. Nothing outside
-# the temporary directory is written, apart from cargo's target directory.
+# the copy cannot rotate (and so invalidate) the real login. Without that
+# token the copy cannot outlive its access token, so the script refuses a
+# login that expires within AGENTMAIL_E2E_MIN_LOGIN_SECS. Copies are deleted
+# on exit, even with AGENTMAIL_E2E_KEEP=1. Of kiro-cli's data dir only the
+# runtimes it never writes (bun, node, tui.js, the versioned engine under
+# kas/) are linked in; its feed files are copied and the rest left out.
+# Secrets (the API key, opencode's server password) reach the harnesses
+# through their environment, never a command line. Each harness runs in a
+# process group of its own (setsid), which is killed (TERM, then KILL) on a
+# timeout and on exit, before the temporary directory is removed, so none
+# of its descendants (MCP servers, hooks, kiro's engine) outlives the run.
+# Nothing outside the temporary directory is written, apart from cargo's
+# target directory.
 
 set -uo pipefail
 
@@ -85,12 +98,20 @@ fail() {
 }
 note() { echo "e2e $MODE: [$STEP] $*" >&2; }
 
-for tool in jq git cargo; do
+for tool in jq git cargo setsid; do
     command -v "$tool" >/dev/null || fail "$tool is required"
 done
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TIMEOUT=${AGENTMAIL_E2E_TIMEOUT:-600}
+[[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || fail "AGENTMAIL_E2E_TIMEOUT=$TIMEOUT is not a positive number of seconds"
+# A run waits at most six times for TIMEOUT (A registers, B registers, the
+# answered question, B finishes, A finishes, A is woken), plus setup.
+MIN_LOGIN_SECS=${AGENTMAIL_E2E_MIN_LOGIN_SECS:-$((6 * TIMEOUT + 300))}
+[[ $MIN_LOGIN_SECS =~ ^[0-9]+$ ]] ||
+    fail "AGENTMAIL_E2E_MIN_LOGIN_SECS=$MIN_LOGIN_SECS is not a number of seconds"
+MIN_LOGIN_MS=$((MIN_LOGIN_SECS * 1000))
+MIN_LOGIN_TEXT="$((MIN_LOGIN_SECS / 60)) minutes ($MIN_LOGIN_SECS s, AGENTMAIL_E2E_MIN_LOGIN_SECS)"
 
 needs() { [ "$HA" = "$1" ] || [ "$HB" = "$1" ]; }
 
@@ -125,12 +146,33 @@ BIN=$ROOT/target/release/agentmail
 STEP=setup
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/agentmail-e2e.XXXXXX") || fail "mktemp failed"
 SECRETS=()
+# Each harness is started under setsid, so its pid is also the id of a
+# process group holding it and every descendant that stays in the group.
 PIDS=()
+
+# kill_groups <pid...>: TERMs each process group, gives them 5 seconds to
+# exit, then KILLs whatever is left.
+kill_groups() {
+    local p i alive
+    for p in "$@"; do
+        kill -TERM -- "-$p" 2>/dev/null
+    done
+    for i in $(seq 50); do
+        alive=
+        for p in "$@"; do
+            kill -0 -- "-$p" 2>/dev/null && alive=1
+        done
+        [ -n "$alive" ] || return 0
+        sleep 0.1
+    done
+    for p in "$@"; do
+        kill -KILL -- "-$p" 2>/dev/null
+    done
+}
+
 cleanup() {
     local p
-    for p in "${PIDS[@]}"; do
-        kill "$p" 2>/dev/null
-    done
+    [ ${#PIDS[@]} -gt 0 ] && kill_groups "${PIDS[@]}"
     "$BIN" daemon stop >/dev/null 2>&1
     for p in "${SECRETS[@]}"; do
         rm -f "$p"
@@ -160,7 +202,6 @@ ln -s "$BIN" "$TMP/bin/agentmail"
 # but PATH, the locale and an API key, so no outer session, login or
 # agentmail identity leaks in.
 HENV=(
-    env -i
     "PATH=$TMP/bin:$PATH"
     "HOME=$H"
     "USER=${USER:-e2e}"
@@ -176,35 +217,58 @@ HENV=(
     "AGENTMAIL_DATA_DIR=$AGENTMAIL_DATA_DIR"
     "AGENTMAIL_SOCKET=$AGENTMAIL_SOCKET"
 )
-[ -n "${ANTHROPIC_API_KEY:-}" ] && HENV+=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+# Secrets are kept in unexported shell variables and exported only inside
+# henv's subshell, so they never appear on a command line (`env -i
+# KEY=...` would put them in /proc/<pid>/cmdline for any local user).
+E2E_API_KEY=${ANTHROPIC_API_KEY:-}
+export -n ANTHROPIC_API_KEY 2>/dev/null
+
+# henv [--opencode-password] <command...>: replaces the current shell (call
+# it in a subshell) with the command, in the clean environment above plus
+# the API key, and opencode's server password when asked for.
+henv() {
+    local pw= v
+    if [ "${1:-}" = --opencode-password ]; then
+        pw=1
+        shift
+    fi
+    for v in $(compgen -e); do
+        unset "$v" 2>/dev/null
+    done
+    for v in "${HENV[@]}"; do
+        export "${v?}"
+    done
+    [ -n "$E2E_API_KEY" ] && export ANTHROPIC_API_KEY="$E2E_API_KEY"
+    [ -n "$pw" ] && export OPENCODE_PASSWORD="$OPENCODE_PASSWORD"
+    exec "$@"
+}
 
 # The human's CLI, against the private daemon.
 human() { "$BIN" --as human "$@"; }
 
 now_ms() { date +%s%3N; }
-MIN_LOGIN_MS=$((15 * 60 * 1000))
 
 setup_claude() {
     ln -s "$CLAUDE_BIN" "$TMP/bin/claude"
     mkdir -p "$H/.claude"
-    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    if [ -z "$E2E_API_KEY" ]; then
         local src=${AGENTMAIL_E2E_CLAUDE_CREDENTIALS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json}
         [ -r "$src" ] || fail "no Claude Code login at $src (set AGENTMAIL_E2E_CLAUDE_CREDENTIALS or ANTHROPIC_API_KEY)"
         local exp
         exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$src") || fail "cannot read $src"
         [ "$exp" -gt $(($(now_ms) + MIN_LOGIN_MS)) ] ||
-            fail "the Claude Code login in $src expires within 15 minutes; refresh it (run claude once) and retry"
+            fail "the Claude Code login in $src expires within $MIN_LOGIN_TEXT; refresh it (run claude once) and retry"
         local dst=$H/.claude/.credentials.json
         SECRETS+=("$dst")
         (umask 077 && jq 'del(.claudeAiOauth.refreshToken)' "$src" >"$dst") ||
             fail "cannot copy the Claude Code login"
     fi
-    "${HENV[@]}" "$BIN" install --harness claude-code >"$TMP/logs/install-claude.log" 2>&1 ||
+    (henv "$BIN" install --harness claude-code) >"$TMP/logs/install-claude.log" 2>&1 ||
         fail "install --harness claude-code: $(cat "$TMP/logs/install-claude.log")"
 }
 
 setup_opencode() {
-    "${HENV[@]}" "$BIN" install --harness opencode >"$TMP/logs/install-opencode.log" 2>&1 ||
+    (henv "$BIN" install --harness opencode) >"$TMP/logs/install-opencode.log" 2>&1 ||
         fail "install --harness opencode: $(cat "$TMP/logs/install-opencode.log")"
 }
 
@@ -233,7 +297,7 @@ setup_kiro() {
         esac
     done
     SECRETS+=("$dst/data.sqlite3" "$dst/data.sqlite3-wal" "$dst/data.sqlite3-shm" "$dst/data.sqlite3-journal")
-    (umask 077 && python3 -I - "$src/data.sqlite3" "$dst/data.sqlite3" "$MIN_LOGIN_MS" <<'EOF'
+    (umask 077 && python3 -I - "$src/data.sqlite3" "$dst/data.sqlite3" "$MIN_LOGIN_MS" "$MIN_LOGIN_TEXT" <<'EOF'
 import datetime, json, re, sqlite3, sys
 
 def parse_utc(s):
@@ -248,7 +312,7 @@ def parse_utc(s):
     tz = "+00:00" if m[3] in (None, "Z") else m[3]
     return datetime.datetime.fromisoformat(f"{m[1]}.{frac}{tz}")
 
-src, dst, min_ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src, dst, min_ms, min_text = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
 d = sqlite3.connect(dst)
 s.backup(d)
@@ -261,14 +325,14 @@ tok = json.loads(row[0])
 exp = parse_utc(tok["expires_at"])
 left = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds() * 1000
 if left < min_ms:
-    sys.exit("the kiro-cli login expires within 15 minutes; refresh it (run kiro-cli once) and retry")
+    sys.exit(f"the kiro-cli login expires within {min_text}; refresh it (run kiro-cli once) and retry")
 tok.pop("refresh_token", None)
 d.execute("update auth_kv set value = ? where key = ?", (json.dumps(tok), key))
 d.commit()
 d.close()
 EOF
     ) || fail "cannot copy the kiro-cli login"
-    "${HENV[@]}" "$BIN" install --harness kiro >"$TMP/logs/install-kiro.log" 2>&1 ||
+    (henv "$BIN" install --harness kiro) >"$TMP/logs/install-kiro.log" 2>&1 ||
         fail "install --harness kiro: $(cat "$TMP/logs/install-kiro.log")"
 }
 
@@ -290,7 +354,7 @@ start_opencode_server() {
     local port
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])' 2>/dev/null ||
         echo $((20000 + RANDOM % 20000)))
-    (cd "$REPO" && exec "${HENV[@]}" "OPENCODE_PASSWORD=$OPENCODE_PASSWORD" \
+    (cd "$REPO" && henv --opencode-password setsid \
         "$OPENCODE_BIN" serve --hostname 127.0.0.1 --port "$port" \
         >"$TMP/logs/opencode-serve.log" 2>&1) &
     PIDS+=($!)
@@ -309,7 +373,7 @@ start_agent() {
     local who=$1 harness=$2 prompt=$3 out=$TMP/logs/$1.out
     case $harness in
     claude-code)
-        (cd "$REPO" && exec "${HENV[@]}" claude -p --model "${AGENTMAIL_E2E_CLAUDE_MODEL:-haiku}" \
+        (cd "$REPO" && henv setsid claude -p --model "${AGENTMAIL_E2E_CLAUDE_MODEL:-haiku}" \
             --output-format json --allowedTools "mcp__agentmail,Bash" -- "$prompt" \
             >"$out" 2>"$out.err") &
         ;;
@@ -317,16 +381,16 @@ start_agent() {
         # A, and B when A is opencode too, run on A's server (so both
         # sessions share its MCP server); B beside Claude Code A runs alone.
         if [ -n "$OPENCODE_URL" ]; then
-            (cd "$REPO" && exec "${HENV[@]}" "OPENCODE_PASSWORD=$OPENCODE_PASSWORD" \
+            (cd "$REPO" && henv --opencode-password setsid \
                 "$OPENCODE_BIN" run --server "$OPENCODE_URL" \
                 --format json --auto -m "$OPENCODE_MODEL" -- "$prompt" >"$out" 2>"$out.err") &
         else
-            (cd "$REPO" && exec "${HENV[@]}" "$OPENCODE_BIN" run --standalone \
+            (cd "$REPO" && henv setsid "$OPENCODE_BIN" run --standalone \
                 --format json --auto -m "$OPENCODE_MODEL" -- "$prompt" >"$out" 2>"$out.err") &
         fi
         ;;
     kiro)
-        (cd "$REPO" && exec "${HENV[@]}" "$KIRO_BIN" chat --v3 --no-interactive --trust-all-tools \
+        (cd "$REPO" && henv setsid "$KIRO_BIN" chat --v3 --no-interactive --trust-all-tools \
             "$prompt" >"$out" 2>"$out.err") &
         ;;
     esac
@@ -351,7 +415,7 @@ finish() {
     local pid=$1 who=$2 end=$(($(date +%s) + TIMEOUT))
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$(date +%s)" -ge "$end" ]; then
-            kill "$pid" 2>/dev/null
+            kill_groups "$pid"
             fail "agent $who ran over ${TIMEOUT}s (output in $TMP/logs/$who.out)"
         fi
         sleep 1

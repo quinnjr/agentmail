@@ -90,9 +90,18 @@ explicitly answers it.
 ## Installing into a harness
 
 ```sh
-agentmail install --harness claude-code|opencode|kiro [--project] [--dry-run]
-agentmail uninstall --harness claude-code|opencode|kiro [--project] [--dry-run]
+agentmail install --harness claude-code|opencode|kiro [--project] [--dry-run] [--json]
+                  [--kiro-wake] [--set-default]
+agentmail uninstall --harness claude-code|opencode|kiro [--project] [--dry-run] [--json]
+agentmail install|uninstall --service [--dry-run] [--json]
 ```
+
+`--kiro-wake` and `--set-default` are for kiro only (see the notes below);
+`--service` installs (or removes) the daemon's systemd user unit instead of
+a harness and takes none of `--harness`, `--project`, `--kiro-wake` or
+`--set-default` (see
+[Running the daemon under systemd](#running-the-daemon-under-systemd)).
+`--json` prints the result as JSON.
 
 `install` edits the harness's own config files directly (it never runs the
 harness's CLI). It touches only agentmail's entries, keeping every other
@@ -584,9 +593,16 @@ It needs real model access, so `cargo test` does not run it:
   for opencode).
 
 Logins are copied into the throwaway home without their refresh token, so
-a run can never rotate your real login, and deleted afterwards; a login
-that expires within 15 minutes is refused. `AGENTMAIL_E2E_KEEP=1` keeps the
-throwaway directory (logs and transcripts) for inspection.
+a run can never rotate your real login, and deleted afterwards. A copy
+cannot outlive its access token, so a login that expires before the
+longest possible run ends is refused: by default 6 ×
+`AGENTMAIL_E2E_TIMEOUT` (600 s per wait) + 300 seconds, or
+`AGENTMAIL_E2E_MIN_LOGIN_SECS` to run on a login that expires sooner. The
+API key and opencode's server password reach the harnesses through their
+environment, never a command line. Each harness runs in its own process
+group, killed with everything it started on a timeout and on exit.
+`AGENTMAIL_E2E_KEEP=1` keeps the throwaway directory (logs and
+transcripts) for inspection.
 
 ## Development
 
