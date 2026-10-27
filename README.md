@@ -560,10 +560,13 @@ real agents headlessly: `backend` registers and answers questions,
 question/answer thread exists between them, that urgent mail sent to
 `backend` mid-run reaches it, for kiro that the agent is bound to the
 `kiro-cli` process, and for opencode that an idle `backend` is woken by new
-mail (it replies, or opencode's session log shows the turn the wake
-started). Claude Code and kiro do not wake idle agents in a headless run, so
-their waking is checked only by hand (see `docs/harness-notes.md`). `mixed` runs `backend` under Claude Code and `frontend`
-under opencode. It exits non-zero and names the failed step on any failure.
+mail (it replies, or opencode's session log shows a turn the wake started
+that saw the mail). Claude Code and kiro do not wake idle agents in a
+headless run, so their waking is checked only by hand (see
+`docs/harness-notes.md`). In `opencode` mode both agents run on one
+`opencode serve`, so their sessions share one MCP server. `mixed` runs
+`backend` under Claude Code and `frontend` under opencode. It exits
+non-zero and names the failed step on any failure.
 
 It needs real model access, so `cargo test` does not run it:
 
@@ -574,7 +577,9 @@ It needs real model access, so `cargo test` does not run it:
 - opencode: on `PATH` or `AGENTMAIL_E2E_OPENCODE`; uses a free opencode
   model by default (`AGENTMAIL_E2E_OPENCODE_MODEL`).
 - kiro-cli: on `PATH` or `AGENTMAIL_E2E_KIRO`, logged in
-  (`AGENTMAIL_E2E_KIRO_DATA` for a non-default data directory).
+  (`AGENTMAIL_E2E_KIRO_DATA` for a non-default data directory). Only the
+  runtimes kiro-cli never writes are linked from that directory; the login
+  and feed files are copied, the rest left out.
 - `jq`, `git`, `cargo`, and `python3` for kiro and opencode (and `curl`
   for opencode).
 

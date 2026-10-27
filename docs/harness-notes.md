@@ -1313,7 +1313,11 @@ Deviations from the plan, and why:
 `scripts/e2e.sh <claude-code|opencode|kiro|mixed>` (see the README). Run on
 2026-10-27 against Claude Code 2.1.312 (`--model haiku`), opencode 2.0.27
 (`opencode/big-pickle`, a free model) and kiro-cli 2.32.0 (`chat --v3`,
-default model), each in a throwaway home, with the release build:
+default model), each in a throwaway home, with the release build. After
+review, `opencode`, `kiro` and `mixed` were run again with the script as
+committed (B on A's server in `opencode` mode, the narrower kiro data dir,
+the stricter step 6 check); `claude-code`, whose path did not change, was
+not re-run:
 
 | mode | result | steps checked |
 |---|---|---|
@@ -1328,7 +1332,23 @@ default model), each in a throwaway home, with the release build:
   run can only use the access token and never rotate the real login; both
   copies are deleted when the script exits. Both harnesses ran on the
   access token alone. The script refuses a login with less than 15
-  minutes left. opencode's free models need no login.
+  minutes left. (The kiro re-run had about 9 minutes left on the login,
+  and the user's own login must not be refreshed from here, so it ran
+  from a scratch copy of the script with that margin lowered to 4
+  minutes; it finished in under 2.) The expiry is parsed with any number
+  of fraction digits (none, 3, 6, 9). opencode's free models need no
+  login.
+- **kiro's data dir.** Only what kiro-cli never writes is linked from
+  the real `~/.local/share/kiro-cli`: `bun`, `node`, `tui.js`, their
+  `.sha256` files and each versioned engine directory under `kas/` (the
+  `kas/` directory itself is private, since kiro keeps lock files there).
+  The feed files are copied; knowledge bases, `run/`, `run-receipts/` and
+  locks are left out. During the re-run kiro-cli created `run/`,
+  `run-receipts/`, `.refresh.lock` and `telemetry-export-drops.lock` in
+  the copy, and a listing of the real directory (paths, sizes, mtimes,
+  `run/` aside) before and after showed nothing changed by the run (only
+  `data.sqlite3`, rewritten every two minutes by the user's own running
+  `kiro-cli`, before the run as well).
 - **Urgent mail (step 4)** was sent the moment the question had its
   answer, while A was still in its turn (it then runs `sleep 20` and
   `echo finished`). In every run the model's own final message quoted the
@@ -1339,18 +1359,28 @@ default model), each in a throwaway home, with the release build:
   and the pid of the `kiro-cli` process the script started, confirming
   that `kiro-cli-chat` and the engine's `node` in between do not displace
   the binding (no differing `KIRO_SESSION_ID` reaches the MCP server).
-- **opencode waking (step 6).** A ran under `opencode serve` (a server
-  that outlives the turn; `run --standalone` stops its server at the end
-  of the turn, so nothing could wake there) with `run --server`; B ran in
-  its own session on the same server (`opencode` mode, so both sessions
-  share one MCP server, as in Review Focus 3) or `--standalone`
-  (`mixed`). After A's turn the human's mail started a new turn by itself:
-  opencode's session log (its `session_message` table) shows the plugin's
-  synthetic reminder and the model's answer. The free model answered in
-  text rather than replying over agentmail, so the script accepts either
-  a reply in the thread or that recorded turn. An earlier run showed the
-  same: a wake right after the turn for mail A had left unread, then one
-  for the new mail.
+- **Two opencode sessions on one MCP server.** In `opencode` mode A ran
+  under `opencode serve` with `run --server`, and B ran with `run
+  --server` against the same server, in a session of its own, so both
+  sessions shared that server's one agentmail MCP server (Review Focus
+  3). The re-run's opencode database holds both sessions; each registered
+  its own address (`backend-…`, `frontend-…`), the question was asked and
+  answered between them, and each session got only its own mail (B's
+  session a wake for the answer, A's the urgent mail and its wakes). In
+  `mixed` B runs `run --standalone`, as no opencode server is running.
+- **opencode waking (step 6).** A's server outlives the turn (`run
+  --standalone` stops its server at the end of the turn, so nothing could
+  wake there). After A's turn the human's mail started a new turn by
+  itself: opencode's session log (its `session_message` table) shows the
+  plugin's synthetic reminder and the model's answer. The reminder names
+  only an unread count, so the script ties the turn to the wake mail by
+  requiring the answer that follows it (tool calls and their results
+  included) to mention the mail's subject token. That matters: in the
+  re-run a wake for mail A had left unread came first (its `inbox` call
+  did not list the new mail), then the wake for the new mail, whose
+  `inbox` result showed the subject. The free model answered in text
+  rather than replying over agentmail, so the script accepts either a
+  reply in the thread or that recorded turn.
 - **Not checked headlessly:** waking under Claude Code (its wait hook
   stays silent outside the terminal UI, `claude -p` included) and under
   kiro (a `--no-interactive` run is never waited in). Both were checked by

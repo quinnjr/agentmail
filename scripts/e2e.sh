@@ -22,12 +22,15 @@
 #      `kiro-cli` process the script started.
 #   6. opencode A only (the one harness that wakes in a headless setup): A's
 #      turn ends, the human mails it, and a new turn starts with no prompt:
-#      A replies, or opencode's session log shows the plugin's wake answered
-#      (A runs on `opencode serve`, which outlives the turn). Claude Code runs its wait hook only in the interactive UI and kiro
-#      never waits in a `--no-interactive` run, so their waking is not
-#      checked here (see docs/harness-notes.md).
+#      A replies, or opencode's session log shows a turn the plugin's wake
+#      started that saw the new mail (A runs on `opencode serve`, which
+#      outlives the turn). Claude Code runs its wait hook only in the
+#      interactive UI and kiro never waits in a `--no-interactive` run, so
+#      their waking is not checked here (see docs/harness-notes.md).
 #
-# `mixed` runs A under Claude Code and B under opencode.
+# In `opencode` mode B runs in its own session on A's `opencode serve`, so
+# both sessions share one agentmail MCP server. `mixed` runs A under Claude
+# Code and B under opencode (`run --standalone`).
 #
 # Needs real model access, so `cargo test` never runs it. Inputs:
 #
@@ -53,8 +56,10 @@
 # Logins are copied, never linked, and with their refresh token removed, so
 # the copy cannot rotate (and so invalidate) the real login; the script
 # refuses a login that expires within 15 minutes. Copies are deleted on exit,
-# even with AGENTMAIL_E2E_KEEP=1. Nothing outside the temporary directory is
-# written, apart from cargo's target directory.
+# even with AGENTMAIL_E2E_KEEP=1. Of kiro-cli's data dir only the runtimes it
+# never writes (bun, node, tui.js, the versioned engine under kas/) are
+# linked in; its feed files are copied and the rest left out. Nothing outside
+# the temporary directory is written, apart from cargo's target directory.
 
 set -uo pipefail
 
@@ -208,17 +213,41 @@ setup_kiro() {
     [ -r "$src/data.sqlite3" ] || fail "no kiro-cli login in $src (set AGENTMAIL_E2E_KIRO_DATA)"
     local dst=$H/.local/share/kiro-cli
     mkdir -p "$dst"
-    # The engine and its runtimes are linked in; only the login is copied.
+    # Only what kiro-cli never writes is linked in: its runtimes and the
+    # versioned engine directories under kas/ (the kas/ directory itself,
+    # where it keeps lock files, is private). The small feed files are
+    # copied; everything else (knowledge bases, run state, logs) is left
+    # out, so nothing kiro-cli writes reaches the real data dir.
     local f
     for f in "$src"/*; do
         case $(basename "$f") in
-        data.sqlite3* | *.lock | run | run-receipts) ;;
-        *) ln -s "$f" "$dst/" ;;
+        bun | node | tui.js | *.sha256) ln -s "$f" "$dst/" ;;
+        feed*.json | feed-cache.*) cp -p "$f" "$dst/" || fail "cannot copy $f" ;;
+        kas)
+            mkdir -p "$dst/kas"
+            local k
+            for k in "$f"/*; do
+                [ -d "$k" ] && ln -s "$k" "$dst/kas/"
+            done
+            ;;
         esac
     done
     SECRETS+=("$dst/data.sqlite3" "$dst/data.sqlite3-wal" "$dst/data.sqlite3-shm" "$dst/data.sqlite3-journal")
     (umask 077 && python3 -I - "$src/data.sqlite3" "$dst/data.sqlite3" "$MIN_LOGIN_MS" <<'EOF'
-import datetime, json, sqlite3, sys
+import datetime, json, re, sqlite3, sys
+
+def parse_utc(s):
+    # RFC 3339 as kiro-cli writes it, with any number of fraction digits
+    # (none, 3, 9, ...): fromisoformat wants 0, 3 or 6 before Python 3.11.
+    m = re.fullmatch(
+        r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)?", s.strip()
+    )
+    if m is None:
+        raise ValueError(f"bad timestamp {s!r}")
+    frac = (m[2] or "")[:6].ljust(6, "0")
+    tz = "+00:00" if m[3] in (None, "Z") else m[3]
+    return datetime.datetime.fromisoformat(f"{m[1]}.{frac}{tz}")
+
 src, dst, min_ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
 s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
 d = sqlite3.connect(dst)
@@ -229,7 +258,7 @@ row = d.execute("select value from auth_kv where key = ?", (key,)).fetchone()
 if row is None:
     sys.exit("kiro-cli is not logged in")
 tok = json.loads(row[0])
-exp = datetime.datetime.fromisoformat(tok["expires_at"].replace("Z", "+00:00")[:26] + "+00:00")
+exp = parse_utc(tok["expires_at"])
 left = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds() * 1000
 if left < min_ms:
     sys.exit("the kiro-cli login expires within 15 minutes; refresh it (run kiro-cli once) and retry")
@@ -285,7 +314,9 @@ start_agent() {
             >"$out" 2>"$out.err") &
         ;;
     opencode)
-        if [ "$who" = A ]; then
+        # A, and B when A is opencode too, run on A's server (so both
+        # sessions share its MCP server); B beside Claude Code A runs alone.
+        if [ -n "$OPENCODE_URL" ]; then
             (cd "$REPO" && exec "${HENV[@]}" "OPENCODE_PASSWORD=$OPENCODE_PASSWORD" \
                 "$OPENCODE_BIN" run --server "$OPENCODE_URL" \
                 --format json --auto -m "$OPENCODE_MODEL" -- "$prompt" >"$out" 2>"$out.err") &
@@ -364,7 +395,8 @@ mentions() {
     case $harness in
     claude-code) grep -rqs -- "$token" "$H/.claude/projects" ;;
     opencode) grep -rqs -- "$token" "$H/.local/share/opencode" ;;
-    kiro) grep -rqs -- "$token" "$H/.kiro" "$H/.local/share/kiro-cli/data.sqlite3" ;;
+    # The whole private copy: the conversation may still be in the -wal.
+    kiro) grep -rqs -- "$token" "$H/.kiro" "$H/.local/share/kiro-cli" ;;
     esac
 }
 
@@ -373,21 +405,31 @@ replied_in() {
         jq -e --arg a "$ADDR_A" '[.. | objects | select(.from? == $a)] | length > 0' >/dev/null
 }
 
-# opencode_woke <session id> <since, ms>: opencode's own record (its
-# database in the throwaway home) shows a turn the plugin started in that
-# session after the given time: a synthetic message (the plugin's wake)
-# answered by the model.
+# opencode_woke <session id> <since, ms> <token>: opencode's own record
+# (its database in the throwaway home) shows a turn the plugin started in
+# that session after the given time, for the wake mail: a synthetic message
+# (the plugin's wake, which names only an unread count) answered by the
+# model in a turn that mentions the token (the mail's subject, as its inbox
+# or read showed it, or the model's own words). A wake for older mail does
+# not count unless that turn took in the new mail.
 opencode_woke() {
-    python3 -I - "$H/.local/share/opencode/opencode.db" "$1" "$2" <<'PY' 2>/dev/null
+    python3 -I - "$H/.local/share/opencode/opencode.db" "$1" "$2" "$3" <<'PY' 2>/dev/null
 import sqlite3, sys
-db, session, since = sys.argv[1], sys.argv[2], int(sys.argv[3])
+db, session, since, token = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
 rows = c.execute(
-    "select type from session_message where session_id = ? and time_created > ? order by seq",
+    "select type, data from session_message where session_id = ? and time_created > ? order by seq",
     (session, since),
 ).fetchall()
-types = [t for (t,) in rows]
-sys.exit(0 if "synthetic" in types and "assistant" in types[types.index("synthetic"):] else 1)
+woken = False  # inside a turn a synthetic message started
+for kind, data in rows:
+    if kind == "synthetic":
+        woken = True
+    elif kind == "user":
+        woken = False
+    elif kind == "assistant" and woken and token in data:
+        sys.exit(0)
+sys.exit(1)
 PY
 }
 
@@ -396,8 +438,8 @@ WOKE_BY=
 woken() {
     if replied_in "$WAKE_THREAD"; then
         WOKE_BY="replied in thread $WAKE_THREAD"
-    elif opencode_woke "$SESSION_A" "$WAKE_SENT"; then
-        WOKE_BY="opencode ran a turn for the wake (the model did not reply)"
+    elif opencode_woke "$SESSION_A" "$WAKE_SENT" "$WAKE_TOKEN"; then
+        WOKE_BY="opencode ran a turn for the wake mail (the model did not reply)"
     else
         return 1
     fi
