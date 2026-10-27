@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod hook;
 pub mod identity;
 pub mod ids;
+pub mod install;
 pub mod mcp;
 pub mod model;
 pub mod paths;

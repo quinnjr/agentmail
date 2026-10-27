@@ -455,6 +455,37 @@ How `agentmail hook wait` behaves under it:
   lock whose file was removed does not block a new wait: a lock counts
   only while the file at the path is the one locked.
 
+### Install (Task 5)
+
+`agentmail install --harness claude-code` writes the hook set above into
+`settings.json` and the MCP server into the user's `.claude.json`.
+Checked live against Claude Code 2.1.311 in a throwaway
+`CLAUDE_CONFIG_DIR` and `HOME`, with `claude mcp list` / `claude mcp get`
+(no model run needed):
+
+- **User-scope MCP servers live in `$CLAUDE_CONFIG_DIR/.claude.json`**
+  when `CLAUDE_CONFIG_DIR` is set, else in `~/.claude.json`: with both a
+  `$CLAUDE_CONFIG_DIR/.claude.json` and a `~/.claude.json`, only the
+  first one's server was listed, and without the variable only the
+  second's. After `agentmail install` the server showed as `agentmail:
+  <bin> mcp - Connected`, scope "User config".
+- **Project-scope servers (`.mcp.json`) wait for approval**: `claude mcp
+  list` shows them as "Pending approval (run `claude` to approve)" until
+  the user approves them in an interactive session. `install --project`
+  says so.
+- Claude Code rewrites `.claude.json` itself, often, with a two-space
+  indent. Install therefore changes only agentmail's entries and keeps
+  every other byte of the file (layout, key order, number spellings), and
+  checks just before writing that the file still has the text it planned
+  from; if Claude Code wrote it in between, nothing is written and the
+  command asks to be run again.
+- Hooks are recognised as agentmail's by their command: a program whose
+  file name starts with `agentmail` run with `hook` as its first argument
+  (the binary path is shell-quoted when it needs to be). Reinstalling from
+  another path replaces the old entries, including ones on events this
+  version no longer uses, and uninstall removes every one of them, keeping
+  other hooks that share a group with them.
+
 ### Hook identity
 
 Hooks resolve their agent by `--session <id>` (opencode's plugin) or else

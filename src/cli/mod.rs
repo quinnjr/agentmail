@@ -293,6 +293,35 @@ pub enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Wire agentmail into a harness: its hooks and MCP server. Edits the
+    /// harness's config files, keeping everything else in them; each file's
+    /// original is saved once as `<file>.agentmail.bak`.
+    Install {
+        /// The harness to install into.
+        #[arg(long, value_parser = ["claude-code"])]
+        harness: String,
+        /// Install into the current project instead of your user config.
+        #[arg(long)]
+        project: bool,
+        /// Show the changes as a diff without making them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Make agentmail's agent the harness's default (kiro only).
+        #[arg(long)]
+        set_default: bool,
+    },
+    /// Remove what `install` added to a harness's config files.
+    Uninstall {
+        /// The harness to remove agentmail from.
+        #[arg(long, value_parser = ["claude-code"])]
+        harness: String,
+        /// Remove it from the current project instead of your user config.
+        #[arg(long)]
+        project: bool,
+        /// Show the changes as a diff without making them.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Manage the background daemon (default: status).
     Daemon {
         #[command(subcommand)]
@@ -703,6 +732,110 @@ async fn hook(event: HookEvent, harness: &str, session: Option<&str>) -> ExitCod
     ExitCode::from(out.exit)
 }
 
+/// The name people know a harness by.
+fn harness_title(h: Harness) -> &'static str {
+    match h {
+        Harness::ClaudeCode => "Claude Code",
+        Harness::Opencode => "opencode",
+        Harness::Kiro => "kiro-cli",
+        Harness::Other => "this harness",
+    }
+}
+
+/// `agentmail install` / `uninstall`: plan the changes, then show them
+/// (`--dry-run`) or make them. Needs no daemon.
+fn install(
+    harness: &str,
+    project: bool,
+    dry_run: bool,
+    set_default: bool,
+    uninstall: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    use crate::install::{self as inst, Env, InstallOpts};
+    let harness = harness_from(harness)?;
+    let bin = std::env::current_exe().context("locating the agentmail binary")?;
+    let o = InstallOpts {
+        harness,
+        project,
+        dry_run,
+        set_default,
+        bin,
+    };
+    let env = Env::from_process()?;
+    let changes = if uninstall {
+        inst::plan_uninstall(&o, &env)?
+    } else {
+        inst::plan_install(&o, &env)?
+    };
+    if !dry_run {
+        inst::apply(&changes)?;
+    }
+    let action = |c: &inst::Change| match (&c.before, &c.after) {
+        (None, _) => "create",
+        (Some(_), Some(_)) => "update",
+        (Some(_), None) => "delete",
+    };
+    if json {
+        let list: Vec<Value> = changes
+            .iter()
+            .map(|c| {
+                let backup = (c.before.is_some() && !dry_run)
+                    .then(|| inst::backup_path(&c.path).display().to_string());
+                json!({"path": c.path.display().to_string(), "action": action(c), "backup": backup})
+            })
+            .collect();
+        print_json(&json!({"dry_run": dry_run, "changes": list}))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let name = harness_title(harness);
+    if dry_run {
+        for c in &changes {
+            print_text(&inst::diff(c))?;
+        }
+        if changes.is_empty() {
+            print_line("nothing to change")?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    for c in &changes {
+        let verb = match action(c) {
+            "create" => "created",
+            "update" => "updated",
+            _ => "removed",
+        };
+        let backup = if c.before.is_some() {
+            format!(
+                " (original kept as {})",
+                inst::backup_path(&c.path).display()
+            )
+        } else {
+            String::new()
+        };
+        print_line(&format!("{verb} {}{backup}", c.path.display()))?;
+    }
+    let summary = match (uninstall, changes.is_empty()) {
+        (false, true) => format!("agentmail is already installed for {name}."),
+        (false, false) => {
+            let mut s = format!(
+                "agentmail is installed for {name}. Restart running {name} sessions to load it."
+            );
+            if project && harness == Harness::ClaudeCode {
+                s.push_str(
+                    "\nClaude Code asks you to approve the project's MCP servers (.mcp.json) when it next starts.",
+                );
+            }
+            s
+        }
+        (true, true) => format!("agentmail is not installed for {name}; nothing to remove."),
+        (true, false) => format!(
+            "agentmail is removed from {name}. Restart running {name} sessions to unload it."
+        ),
+    };
+    print_line(&summary)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Print an error as `error: <message>` on stderr, with the candidate table
 /// for an ambiguous recipient. With `--json`, also print it as
 /// `{"error":{code,message,candidates}}` on stdout.
@@ -825,6 +958,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         return Ok(hook(event, &harness, session.as_deref()).await);
+    }
+    match cli.command {
+        Command::Install {
+            harness,
+            project,
+            dry_run,
+            set_default,
+        } => return install(&harness, project, dry_run, set_default, false, cli.json),
+        Command::Uninstall {
+            harness,
+            project,
+            dry_run,
+        } => return install(&harness, project, dry_run, false, true, cli.json),
+        _ => {}
     }
     let paths = Paths::from_env()?;
     if let Command::Daemon { action } = cli.command {
@@ -1232,7 +1379,11 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 ))
             })?;
         }
-        Command::Daemon { .. } | Command::Mcp | Command::Hook { .. } => {
+        Command::Daemon { .. }
+        | Command::Mcp
+        | Command::Hook { .. }
+        | Command::Install { .. }
+        | Command::Uninstall { .. } => {
             unreachable!("handled in run")
         }
     }
