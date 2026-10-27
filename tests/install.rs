@@ -3314,7 +3314,8 @@ fn service_dry_run_changes_and_runs_nothing() {
         "{out}"
     );
     assert!(!s.unit().exists());
-    assert!(s.log().is_empty());
+    // Only the read-only check that systemd is usable runs.
+    assert_eq!(s.log(), ["--user is-system-running [down]"]);
     assert!(!out.contains("note:"), "{out}");
     // No daemon runs: there is none to stop.
     assert!(!out.contains("daemon stop"), "{out}");
@@ -3384,6 +3385,49 @@ fn service_notes_a_manager_with_other_default_locations() {
             format!(
                 "XDG_RUNTIME_DIR={}\nXDG_CONFIG_HOME={}\n",
                 run.display(),
+                s.config().display()
+            ),
+        )
+        .args(["--json", "install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["notes"], json!([]), "{v}");
+    // A quoted value of some other variable (a multi-line one, say) does
+    // not hide the difference.
+    let out = s
+        .cli()
+        .env(
+            "FAKE_ENV",
+            format!(
+                "MOTD=$'a\\nb'\nXDG_RUNTIME_DIR=/run/user/4242\nXDG_CONFIG_HOME={}\n",
+                s.config().display()
+            ),
+        )
+        .args(["--json", "install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        v["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("socket /run/user/4242/agentmail.sock"),
+        "{v}"
+    );
+    // One of a variable the location depends on cannot be read: no note.
+    let out = s
+        .cli()
+        .env(
+            "FAKE_ENV",
+            format!(
+                "XDG_RUNTIME_DIR=$'/run/user/42\\n42'\nXDG_CONFIG_HOME={}\n",
                 s.config().display()
             ),
         )
@@ -3577,6 +3621,9 @@ fn service_uninstall_cleans_up_after_a_unit_removed_by_hand() {
     assert!(out.contains("systemctl --user stop agentmail"), "{out}");
     assert!(out.contains(&format!("rm {}", link.display())), "{out}");
     assert!(std::fs::symlink_metadata(&link).is_ok());
+    // Only the read-only check that systemd is usable runs.
+    assert_eq!(s.log()[n..], ["--user is-system-running [down]"]);
+    let n = s.log().len();
     let out = s
         .cli()
         .env("FAKE_ACTIVE", "active")
@@ -3975,6 +4022,46 @@ fn service_no_systemd_errors() {
 }
 
 #[test]
+fn service_dry_run_notes_no_systemd() {
+    // A dry run where a real run would refuse says so.
+    let s = ServiceHome::new();
+    for args in [
+        &["install", "--service", "--dry-run"][..],
+        &["--json", "install", "--service", "--dry-run"][..],
+    ] {
+        let out = s
+            .cli()
+            .env("FAKE_STATE", "offline")
+            .env("FAKE_RC", "1")
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("the systemd user manager is not available"),
+            "{out}"
+        );
+        assert!(out.contains("offline"), "{out}");
+        assert!(out.contains("a real run would change nothing"), "{out}");
+    }
+    assert!(!s.unit().exists());
+    // A usable one: no note.
+    let out = s
+        .cli()
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("not available"), "{out}");
+}
+
+#[test]
 fn service_degraded_systemd_is_usable() {
     // `is-system-running` exits non-zero when some unit failed, but the
     // manager is up and can run agentmail's.
@@ -4039,7 +4126,11 @@ fn service_restarts_a_replaced_unit() {
         &s.unit(),
         "[Service]\nExecStart=/old/agentmail daemon run\n",
     );
-    s.cli().args(["install", "--service"]).assert().success();
+    s.cli()
+        .env("FAKE_ACTIVE", "active")
+        .args(["install", "--service"])
+        .assert()
+        .success();
     assert_eq!(
         s.log(),
         [
@@ -4047,6 +4138,22 @@ fn service_restarts_a_replaced_unit() {
             "--user daemon-reload [down]",
             "--user enable --now agentmail [down]",
             "--user try-restart agentmail [down]",
+        ]
+    );
+    // A service that is not running is started on the new unit by
+    // enable --now: restarting it would only drop its new daemon's clients.
+    let s = ServiceHome::new();
+    write(
+        &s.unit(),
+        "[Service]\nExecStart=/old/agentmail daemon run\n",
+    );
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(
+        s.log(),
+        [
+            "--user is-system-running [down]",
+            "--user daemon-reload [down]",
+            "--user enable --now agentmail [down]",
         ]
     );
 }
@@ -4077,14 +4184,139 @@ fn service_uninstall_leaves_a_unit_agentmail_did_not_write() {
 
 #[test]
 fn service_uninstall_removes_the_readme_unit() {
-    // The README's hand-made unit is agentmail's, whatever binary it runs.
+    // The README's unit, written by hand (whatever binary it runs), is
+    // removed, but kept as the backup first, with how to put it back.
+    for text in [
+        readme_unit(),
+        install::service::unit(Path::new("/x/agentmail")).unwrap(),
+    ] {
+        let s = ServiceHome::new();
+        write(&s.unit(), &text);
+        let out = s
+            .cli()
+            .args(["uninstall", "--service"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!s.unit().exists());
+        assert_eq!(read(&bak(&s.unit())), text);
+        assert!(
+            out.contains(&format!("(backup kept as {})", bak(&s.unit()).display())),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "note: uninstall does not put the unit kept as {} back",
+                bak(&s.unit()).display()
+            )),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn service_install_keeps_a_readme_unit_written_by_hand() {
+    // The README's unit, written by hand (its ExecStart `%h/...`, no
+    // marker): install keeps it as the backup, and uninstall says how to
+    // put it back.
     let s = ServiceHome::new();
+    let readme = readme_unit();
+    assert!(readme.contains("ExecStart=%h/"), "{readme}");
+    write(&s.unit(), &readme);
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(read(&bak(&s.unit())), readme);
+    assert!(!marker(&s.unit()).exists());
+    assert!(
+        out.contains(&format!(
+            "updated {} (original kept as {})",
+            s.unit().display(),
+            bak(&s.unit()).display()
+        )),
+        "{out}"
+    );
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!s.unit().exists());
+    assert_eq!(read(&bak(&s.unit())), readme);
+    assert!(
+        out.contains(&format!(
+            "note: uninstall does not put the unit kept as {} back",
+            bak(&s.unit()).display()
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn service_never_drops_a_readme_unit_over_an_earlier_kept_unit() {
+    // An earlier unit X is kept as the backup, and the README's unit was
+    // written by hand in place of agentmail's: neither install nor
+    // uninstall discards either.
+    let s = ServiceHome::new();
+    let x = "[Service]\nExecStart=/x/agentmail daemon run\n";
+    let readme = readme_unit();
+    write(&bak(&s.unit()), x);
+    write(&s.unit(), &readme);
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("different earlier unit"), "{err}");
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("not the unit agentmail installs"), "{err}");
+    assert_eq!(read(&s.unit()), readme);
+    assert_eq!(read(&bak(&s.unit())), x);
+    assert!(s.log().is_empty());
+
+    // agentmail's own unit written over X (by an older binary, say) is
+    // replaced and removed as agentmail's, X kept.
+    let s = ServiceHome::new();
+    write(&s.unit(), x);
+    s.cli().args(["install", "--service"]).assert().success();
     write(
         &s.unit(),
-        &install::service::unit(Path::new("/x/agentmail")).unwrap(),
+        &install::service::unit(Path::new("/old/agentmail")).unwrap(),
+    );
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(read(&bak(&s.unit())), x);
+    write(
+        &s.unit(),
+        &install::service::unit(Path::new("/old/agentmail")).unwrap(),
     );
     s.cli().args(["uninstall", "--service"]).assert().success();
     assert!(!s.unit().exists());
+    assert_eq!(read(&bak(&s.unit())), x);
 }
 
 #[test]

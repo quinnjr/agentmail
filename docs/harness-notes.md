@@ -1194,9 +1194,11 @@ Deviations from the plan, and why:
 - **Step order.** The plan has install run `agentmail daemon stop`, then
   `systemctl --user daemon-reload` and `enable --now agentmail`. Install
   instead runs `daemon-reload` and `enable --now` first, then
-  `try-restart agentmail` when it replaced an existing unit or the
-  service was already running (its unit removed by hand; enabling a
-  running service does not restart it on the new unit), and runs
+  `try-restart agentmail` only when the service was already running
+  before (on the unit replaced, or on one removed by hand; enabling a
+  running service does not restart it on the new unit, while a stopped
+  one `enable --now` starts on it, so restarting that would only drop the
+  clients of the daemon it just started), and runs
   `daemon stop` last, only when a daemon started on demand holds the lock
   at the default location (its lock record does not say it is
   supervised). The service's daemon runs with `--wait-for-lock`, so it is
@@ -1210,7 +1212,8 @@ Deviations from the plan, and why:
   (some other unit failed) and for `starting`/`initializing` (still
   booting), in all of which the manager can load and run the service, so
   those answers (and `running`) are accepted; any other answer, or none,
-  errors out with the manual steps as planned.
+  errors out with the manual steps as planned. `--dry-run` asks too and
+  notes a manager a real run would refuse.
 - **Unit search path.** Install (and uninstall) refuse when the manager
   would not see the unit: the check reads the manager's own unit search
   path, `systemctl --user show -p UnitPath`, and refuses only when the
@@ -1221,4 +1224,20 @@ Deviations from the plan, and why:
   path, so it gave false refusals and `set-environment` cannot fix a real
   one. `show-environment` is still what install reads to note a service
   data directory or socket that differs from the shell's defaults, since
-  those come from the environment the service's daemon gets.
+  those come from the environment the service's daemon gets. Only the
+  variables the location depends on (`HOME`, `XDG_RUNTIME_DIR`,
+  `XDG_DATA_HOME`, `AGENTMAIL_DATA_DIR`, `AGENTMAIL_SOCKET`) are read
+  from it: a quoted (`$'...'`) value of one of those skips the note, one
+  of any other variable is ignored.
+- **Whose unit.** "Touches only what it owns" is applied to the unit as:
+  agentmail's own unit is the one it created (its marker), whatever its
+  `ExecStart`, or the one it wrote over a unit of the user's kept as the
+  backup, recognised by an `ExecStart` path in the form agentmail writes
+  (absolute, `%` doubled, quoted only when needed). Every other unit is
+  the user's, including the README's unit written by hand (`%h/...`): it
+  is saved as the backup before install replaces it or uninstall removes
+  it, and both refuse when the backup already keeps a different unit. A
+  hand-written unit identical to what agentmail would write for some
+  binary path is indistinguishable from agentmail's and is treated as
+  such: with a different unit already kept as the backup, it is replaced
+  or removed without being saved (it holds nothing but that path).

@@ -998,12 +998,12 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     } else {
         (None, None)
     };
-    // A unit that was there may be running, and so may the service of one
-    // removed by hand: it is restarted to run ours (enabling a running
-    // service does not).
-    let restart = !uninstall
-        && !changes.is_empty()
-        && (changes.iter().any(|c| c.before.is_some()) || service::is_active(&env));
+    // A service running before install (on a unit that was there, or one
+    // removed by hand) is restarted to run ours: enabling a running service
+    // does not. One that is not running is started on ours by `enable
+    // --now`, and restarting it then would only drop the clients of the
+    // daemon it just started. Asked before anything starts it.
+    let restart = !uninstall && !changes.is_empty() && service::is_active(&env);
     // Only a daemon started on demand is stopped, decided before the
     // service starts: a supervised one (the service's own, say, on a
     // re-run) would only drop its clients while it is restarted.
@@ -1036,6 +1036,12 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         .flatten();
     if dry_run {
         notes.extend(elsewhere);
+        // A real run would refuse (see `service::check`).
+        if !steps.is_empty()
+            && let Some(why) = service::unavailable(&env)
+        {
+            notes.push(format!("{why}; a real run would change nothing."));
+        }
     } else if !steps.is_empty() {
         if let Some(why) = elsewhere {
             bail!("{why} Nothing was changed.");

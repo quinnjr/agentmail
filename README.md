@@ -134,15 +134,18 @@ under `$XDG_CONFIG_HOME`, when it is absolute), with `ExecStart` running the bin
 the path you invoked it as (a symlink stays a symlink, so a unit pointing at
 `~/.local/bin/agentmail` follows it to a newer version; a path that is not
 this binary, or one with `..` in it, gives way to the binary's resolved
-path). A unit already there that matches the one below, whatever its
-`ExecStart` (say, one you wrote by hand from this README), is taken as
-agentmail's and replaced with no backup. Any other unit is saved as
-`agentmail.service.agentmail.bak`, and install refuses to replace it when
-that backup already keeps a different one, so that neither is lost. It then
-runs the commands below, `daemon-reload` and `enable --now`, and, when it
-replaced an existing unit or the service was already running (its unit
-removed by hand), `systemctl --user try-restart agentmail`, since enabling a
-running service does not restart it on the new unit. Last, when a daemon
+path). Only agentmail's own unit is replaced as is: the one it created
+(whatever its `ExecStart`), or the one it wrote in place of a unit of yours
+kept as the backup (its `ExecStart` a path as agentmail writes it). Any
+other unit already there, also one you wrote by hand from this README, is
+saved as `agentmail.service.agentmail.bak` first, and install refuses to
+replace it when that backup already keeps a different one, so that neither
+is lost. It then runs the commands below, `daemon-reload` and
+`enable --now`, and, when the service was already running (on the unit it
+replaced, or on one removed by hand), `systemctl --user try-restart
+agentmail`, since enabling a running service does not restart it on the new
+unit (a service that was not running, `enable --now` starts on the new
+unit). Last, when a daemon
 started on demand runs at the default location (its lock record does not say
 it is supervised), it runs `agentmail daemon stop` (with `AGENTMAIL_DATA_DIR`
 and `AGENTMAIL_SOCKET` unset, so it stops the daemon at the default location,
@@ -162,11 +165,13 @@ services it starts, not where it looks for units.) It first asks
 `systemctl --user is-system-running`: a manager that answers `running`,
 `degraded` (some other unit failed), `starting` or `initializing` can run the
 service; any other answer, or none, changes nothing and prints these steps to
-do by hand. `agentmail uninstall --service` disables and stops the service,
-removes the unit and reloads systemd. It removes only agentmail's unit (the
-one below, whatever its `ExecStart`): one it created and you then edited is
-saved as the backup first, and any other unit is left in place with the
-commands to remove it by hand. Removing it by hand, also remove
+do by hand (`--dry-run` asks too, and notes that a real run would change
+nothing). `agentmail uninstall --service` disables and stops the service,
+removes the unit and reloads systemd. It removes only the unit below
+(whatever its `ExecStart`) or one agentmail created: one you wrote by hand
+from this README, or one agentmail created that you then edited, is saved as
+the backup first, unless that backup already keeps a different unit, and
+any other unit is left in place with the commands to remove it by hand. Removing it by hand, also remove
 `agentmail.service.agentmail.created` next to it (agentmail's marker, which
 a later install or uninstall trusts), and either move a unit kept as
 `agentmail.service.agentmail.bak` back or remove it too. Uninstall does not put a unit kept in the

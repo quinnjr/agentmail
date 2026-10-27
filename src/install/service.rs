@@ -46,6 +46,16 @@ WantedBy=default.target
 /// from their defaults, which the service does not see.
 pub const LOCATION_VARS: [&str; 2] = ["AGENTMAIL_DATA_DIR", "AGENTMAIL_SOCKET"];
 
+/// The variables the daemon's data directory and socket depend on (see
+/// [`crate::paths::Paths::from_vars`]).
+const PATH_VARS: [&str; 5] = [
+    "AGENTMAIL_DATA_DIR",
+    "AGENTMAIL_SOCKET",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "HOME",
+];
+
 /// Of [`LOCATION_VARS`], those set in `env`.
 pub fn location_overrides(env: &Env) -> Vec<&'static str> {
     LOCATION_VARS
@@ -57,8 +67,11 @@ pub fn location_overrides(env: &Env) -> Vec<&'static str> {
 /// The environment the systemd user manager passes to the units it starts,
 /// the service's daemon among them (`systemctl --user show-environment`),
 /// with `HOME` defaulting to `env`'s. Nothing when the
-/// manager cannot be asked, or a value cannot be read (one with special
-/// characters is shown quoted, `$'...'`).
+/// manager cannot be asked, or the value of a variable the daemon's
+/// location depends on ([`PATH_VARS`]) cannot be read (one with special
+/// characters is shown quoted, `$'...'`). Other variables' quoted values
+/// (say, a multi-line one a desktop session imported) are left out: they
+/// matter to nothing here, and a line of one may not even be a variable.
 fn manager_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
     let out = Command::new(systemctl(env))
         .args(["--user", "show-environment"])
@@ -66,13 +79,15 @@ fn manager_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
         .ok()
         .filter(|o| o.status.success())?;
     let text = String::from_utf8(out.stdout).ok()?;
-    let mut manager: std::collections::HashMap<String, String> = text
-        .lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    if manager.values().any(|v| v.starts_with("$'")) {
-        return None;
+    let mut manager = std::collections::HashMap::new();
+    for (k, v) in text.lines().filter_map(|l| l.split_once('=')) {
+        if !PATH_VARS.contains(&k) {
+            continue;
+        }
+        if v.starts_with("$'") {
+            return None;
+        }
+        manager.insert(k.to_string(), v.to_string());
     }
     manager
         .entry("HOME".to_string())
@@ -268,10 +283,49 @@ fn invoked(env: &Env, argv0: &Path) -> Option<PathBuf> {
 
 /// Whether `text` is the unit agentmail writes, for any binary.
 pub fn is_generated(text: &str) -> bool {
+    generated_exec(text).is_some()
+}
+
+/// The `ExecStart` binary of `text`, when it is the unit agentmail writes
+/// (see [`is_generated`]).
+fn generated_exec(text: &str) -> Option<&str> {
     let (head, tail) = UNIT.split_once("{exec}").expect("the unit has {exec}");
     text.strip_prefix(head)
         .and_then(|t| t.strip_suffix(tail))
-        .is_some_and(|exec| !exec.is_empty() && !exec.contains('\n'))
+        .filter(|exec| !exec.is_empty() && !exec.contains('\n'))
+}
+
+/// Whether `exec` is an `ExecStart` binary agentmail writes (see
+/// [`exec_arg`]): an absolute path with every `%` doubled, quoted only
+/// when it must be. Not, say, the README's `%h/.cargo/bin/agentmail`.
+fn written_exec(exec: &str) -> bool {
+    let unquoted = match exec.strip_prefix('"').and_then(|e| e.strip_suffix('"')) {
+        Some(inner) => {
+            let mut out = String::new();
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => match chars.next() {
+                        Some(e @ ('\\' | '"')) => out.push(e),
+                        _ => return false,
+                    },
+                    '"' => return false,
+                    ch => out.push(ch),
+                }
+            }
+            out
+        }
+        None => exec.to_string(),
+    };
+    let mut path = String::new();
+    let mut chars = unquoted.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' && chars.next() != Some('%') {
+            return false;
+        }
+        path.push(ch);
+    }
+    exec_arg(Path::new(&path)).is_ok_and(|e| e == exec)
 }
 
 /// The unit that runs `bin` (an absolute path) as the daemon.
@@ -324,12 +378,16 @@ pub fn unit_path(env: &Env) -> PathBuf {
 /// unit that was there before agentmail's is kept as its backup, also once
 /// the service is uninstalled.
 ///
-/// Only agentmail's unit is replaced or removed as is: one that is not
-/// (see [`is_generated`]) is the user's. Install saves it as the backup,
-/// replacing any older backup of agentmail's, but refuses when a
-/// different earlier unit is kept there. Uninstall saves an edited unit
-/// agentmail created (its marker says so) as the backup, and refuses to
-/// remove any other unit that is not agentmail's.
+/// Only agentmail's own unit is replaced or removed as is: the unit it
+/// created (its marker says so; whatever its `ExecStart`), or the one it
+/// wrote over a unit of the user's, which is kept as the backup (its
+/// `ExecStart` one agentmail writes, see [`written_exec`]). Any other
+/// unit is the user's, also one written by hand from the README: install
+/// saves it as the backup, replacing any older backup of agentmail's, and
+/// uninstall saves it as the backup before removing it when it matches
+/// the README's unit (see [`is_generated`]) or agentmail created it (it
+/// was then edited). Both refuse when a different earlier unit is kept as
+/// the backup, and uninstall refuses to remove any other unit.
 pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
     let path = unit_path(env);
     let before = read_opt(&path)?;
@@ -347,9 +405,14 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
         keep_backup: true,
         restore: false,
     };
-    let Some(text) = c.before.as_deref().filter(|t| !is_generated(t)) else {
+    let Some(text) = c.before.as_deref() else {
         return Ok(vec![c]);
     };
+    let generated = generated_exec(text);
+    let created = std::fs::symlink_metadata(created_marker_path(&c.path)).is_ok();
+    if generated.is_some() && created {
+        return Ok(vec![c]);
+    }
     let bak = backup_path(&c.path);
     let backup = match std::fs::read(&bak) {
         Ok(b) => Some(b),
@@ -357,8 +420,12 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
         Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", bak.display()))),
     };
     let saved = backup.as_deref() == Some(text.as_bytes());
-    if install {
-        if backup.is_some() && !saved {
+    if backup.is_some() && !saved {
+        if generated.is_some_and(written_exec) {
+            // agentmail's unit, written over the user's kept as the backup.
+            return Ok(vec![c]);
+        }
+        if install {
             bail!(
                 "{} is not the unit agentmail writes, and {} already keeps a different earlier \
                  unit; agentmail replaces neither. Move one of them away and run the command \
@@ -367,11 +434,14 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
                 bak.display()
             );
         }
+    }
+    if install {
         // The user's unit is the original to keep, whatever an earlier
         // install recorded.
         c.record_anew = true;
-    } else if backup.is_none() && std::fs::symlink_metadata(created_marker_path(&c.path)).is_ok() {
-        // agentmail's unit with the user's edits.
+    } else if backup.is_none() && (generated.is_some() || created) {
+        // The README's unit, written by hand, or agentmail's with the
+        // user's edits: removed, but kept.
         c.save = Some(bak);
     } else if !saved {
         bail!(
@@ -406,10 +476,10 @@ fn removal_steps(path: &Path) -> String {
 /// `bin` and the daemon location overrides `unset` (see
 /// [`location_overrides`]), which `daemon stop` leaves out so that it stops
 /// the daemon at the default location, the one the service replaces. With
-/// `restart` (install, replacing a unit systemd may be running, or writing
-/// one while the service runs, its unit removed by hand), the service is
-/// restarted so that it runs the new unit: enabling a running service does
-/// not. With `stop_daemon`, install then stops any daemon run
+/// `restart` (install, changing the unit while the service runs, on the
+/// unit replaced or on one removed by hand), the service is restarted so
+/// that it runs the new unit: enabling a running service does not (a
+/// stopped one `enable --now` starts on the new unit). With `stop_daemon`, install then stops any daemon run
 /// on demand: last, so that the service's daemon, already waiting for the
 /// lock, takes over as it exits, leaving no time for a client to start
 /// another on demand. (Install passes `stop_daemon` only when such a daemon
@@ -628,6 +698,15 @@ fn user_systemctl(env: &Env, args: &[&str]) -> Result<()> {
 /// then exits 1) can; one that is `offline` or out of reach cannot.
 /// `manual` is what to do by hand instead.
 pub fn check(env: &Env, manual: &dyn Fn() -> String) -> Result<()> {
+    match unavailable(env) {
+        None => Ok(()),
+        Some(why) => bail!("{why}; nothing was changed. {}", manual()),
+    }
+}
+
+/// Why the user's systemd manager cannot run the service (see [`check`]),
+/// or nothing when it can.
+pub fn unavailable(env: &Env) -> Option<String> {
     let prog = systemctl(env);
     let out = Command::new(&prog)
         .args(["--user", "is-system-running"])
@@ -641,7 +720,7 @@ pub fn check(env: &Env, manual: &dyn Fn() -> String) -> Result<()> {
                     "running" | "degraded" | "starting" | "initializing"
                 );
             if usable {
-                return Ok(());
+                return None;
             }
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
             match (state.is_empty(), err.is_empty()) {
@@ -653,11 +732,9 @@ pub fn check(env: &Env, manual: &dyn Fn() -> String) -> Result<()> {
         }
         Err(e) => e.to_string(),
     };
-    bail!(
-        "the systemd user manager is not available (`{prog} --user is-system-running`: {state}); \
-         nothing was changed. {}",
-        manual()
-    )
+    Some(format!(
+        "the systemd user manager is not available (`{prog} --user is-system-running`: {state})"
+    ))
 }
 
 /// What to do by hand for install (`install`) or uninstall, where the
@@ -770,5 +847,29 @@ mod tests {
             .replace("[Service]\n", "[Service]\nEnvironment=A=1\n");
         assert!(!is_generated(&edited));
         assert!(!is_generated(&UNIT.replace("{exec}", "")));
+    }
+
+    #[test]
+    fn written_exec_takes_only_what_agentmail_writes() {
+        for bin in [
+            "/x/agentmail",
+            "/a b/agent\"mail",
+            "/p%q/agentmail",
+            "/a\\b",
+        ] {
+            let e = exec_arg(Path::new(bin)).unwrap();
+            assert!(written_exec(&e), "{e}");
+        }
+        for e in [
+            "%h/.cargo/bin/agentmail",
+            "/x/%h/agentmail",
+            "x/agentmail",
+            "\"/x/agentmail\"",
+            "\"/a b\\x\"",
+            "/a b",
+            "",
+        ] {
+            assert!(!written_exec(e), "{e}");
+        }
     }
 }
