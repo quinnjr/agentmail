@@ -17,8 +17,10 @@ pub const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";
 /// and hooks (not its MCP servers).
 pub const ENV_KIRO_SESSION: &str = "KIRO_SESSION_ID";
 /// `1` turns waking on by default for kiro-cli agents; `install
-/// --kiro-wake` sets it on the MCP server (kiro does not pass it on to
-/// its shell tool's commands, so the CLI reads the installed config).
+/// --kiro-wake` sets it on the MCP server. kiro does not pass it on to its
+/// shell tool's commands, so the CLI reads it from the agentmail MCP
+/// server that kiro itself started (`kiro_servers_wake`), and falls back
+/// to the installed mcp.json only when no such server is running.
 pub const ENV_KIRO_WAKE: &str = "AGENTMAIL_KIRO_WAKE";
 
 /// The session variables, in the order [`session_from_env`] reads them.
@@ -392,9 +394,12 @@ fn binding_with(
 /// new mail. Yes, except under kiro-cli: its Stop hook waits only when
 /// installed with `--kiro-wake` (kiro holds what the human types while it
 /// waits), which sets [`ENV_KIRO_WAKE`]`=1` for the MCP server. So for
-/// kiro, yes when that variable is `1` or when `kiro_wake_installed` (the
-/// installed config says so, for the CLI, which kiro does not give the
-/// variable); it is asked only then.
+/// kiro, yes when that variable is `1` or when `kiro_wake_installed` says
+/// so; it is asked only then. For the CLI, which kiro does not give the
+/// variable, that is [`default_wake_here`]'s check: the variable in the
+/// environment of the agentmail MCP server kiro itself started
+/// ([`kiro_servers_wake`]), or, only when no such server is running, the
+/// installed mcp.json.
 pub fn default_wake(
     harness: Harness,
     env: impl Fn(&str) -> Option<OsString>,

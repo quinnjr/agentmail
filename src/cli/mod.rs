@@ -96,10 +96,11 @@ pub enum Command {
         /// Always take a new address instead of reclaiming a gone one.
         #[arg(long)]
         fresh: bool,
-        /// Do not wake this agent for new mail (the default under kiro-cli,
-        /// unless `install --kiro-wake` is in effect: AGENTMAIL_KIRO_WAKE=1,
-        /// or agentmail's entry in the kiro mcp.json that applies here
-        /// sets it).
+        /// Do not wake this agent for new mail. The default under kiro-cli,
+        /// unless AGENTMAIL_KIRO_WAKE=1 is set, or agentmail's MCP server
+        /// that kiro is running has it (what `install --kiro-wake` sets).
+        /// Only when no such server is running does agentmail's entry in
+        /// the kiro mcp.json that applies here decide.
         #[arg(long, conflicts_with = "wake")]
         no_wake: bool,
         /// Wake this agent for new mail (the default, except under kiro-cli).

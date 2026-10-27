@@ -1459,7 +1459,9 @@ fn register_wake_defaults_off_for_kiro() {
 
 /// kiro gives `AGENTMAIL_KIRO_WAKE` only to the MCP server, not to the
 /// commands its shell tool runs, so after `install --kiro-wake` the CLI's
-/// `register` reads the installed MCP entry: the user's (`KIRO_HOME`), or
+/// `register`, with no agentmail MCP server of kiro's running (see
+/// `register_wake_follows_kiros_running_mcp_server`), reads the installed
+/// MCP entry: the user's (`KIRO_HOME`), or
 /// the workspace's `.kiro/settings/mcp.json`, which decides when it has
 /// one. Uninstalling (or installing without it) turns the default off.
 #[test]
@@ -1519,4 +1521,92 @@ fn register_wake_reads_kiros_workspace_from_a_subdirectory() {
     install(&["--kiro-wake"]);
     install(&["--project"]);
     assert_eq!(wake("k2"), false);
+}
+
+/// Under kiro-cli the CLI takes its wake default from agentmail's MCP
+/// server that kiro itself is running, read from that process's
+/// environment, before the installed config: the server is what kiro
+/// started with the `env` it settled on. A server that a nested harness
+/// started, or that carries another kiro session (it was started from
+/// kiro's shell), is not kiro's own and does not count; with none of
+/// kiro's own running, the installed config decides.
+#[test]
+fn register_wake_follows_kiros_running_mcp_server() {
+    let env = Env::new();
+    let dir = env.dir.path().to_path_buf();
+    let nested = dir.join("claude");
+    std::os::unix::fs::symlink("/bin/sh", &nested).unwrap();
+    // A fake kiro-cli runs `servers`, which start MCP servers in the
+    // background, each reading the fifo `$F` (so it sees end of input and
+    // exits once this kiro-cli does) and writing its pid to
+    // `$D/pid.$N.<i>`. It waits until each has exec'd agentmail, then runs
+    // `register` (without the fifo, so the daemon it starts does not hold
+    // the servers open).
+    let wake = |name: &str, servers: &str| {
+        let script = format!(
+            r#"F="$D/fifo.$N"; export F; mkfifo "$F" || exit 90
+{servers}
+exec 3<>"$F"
+for i in 1 2; do
+  [ -e "$D/want.$N.$i" ] || continue
+  until [ -s "$D/pid.$N.$i" ] && tr '\0' ' ' <"/proc/$(cat "$D/pid.$N.$i")/cmdline" 2>/dev/null | grep -q ' mcp $'; do sleep 0.05; done
+done
+"$0" "$@" 3>&-; exit $?"#
+        );
+        let mut c = env.under_script("kiro-cli", &script);
+        c.env("D", &dir)
+            .env("N", name)
+            .env_remove("AGENTMAIL_KIRO_WAKE")
+            .args(["register", name, "--json", "--fresh"]);
+        ok_json(&mut c)["agent"]["wake"].clone()
+    };
+    // Server `i`, started by kiro with `vars` set.
+    let own = |i: u32, vars: &str| {
+        format!(
+            r#": >"$D/want.$N.{i}"; {vars} "$0" mcp <"$F" >/dev/null 2>&1 & echo $! >"$D/pid.$N.{i}""#
+        )
+    };
+    // Server `i`, started by a nested `claude` with `vars` set.
+    let under_claude = |i: u32, vars: &str| {
+        format!(
+            r#": >"$D/want.$N.{i}"; P="$D/pid.$N.{i}" {vars} "$D/claude" -c '"$0" mcp <"$F" >/dev/null 2>&1 & echo $! >"$P"; wait' "$0" >/dev/null 2>&1 &"#
+        )
+    };
+    let install = |args: &[&str]| {
+        let mut c = env.cmd();
+        c.args(["install", "--harness", "kiro"]).args(args);
+        c.assert().success();
+    };
+
+    // The installed config says off; kiro's running server says on.
+    install(&[]);
+    assert_eq!(wake("k1", &own(1, "AGENTMAIL_KIRO_WAKE=1")), true);
+    // The installed config says on; kiro's running server says off.
+    install(&["--kiro-wake"]);
+    assert_eq!(wake("k2", &own(1, "")), false);
+    // With no server of kiro's own, the installed config decides.
+    assert_eq!(wake("k3", ""), true);
+
+    install(&[]);
+    // A server a nested harness started is not kiro's.
+    assert_eq!(wake("k4", &under_claude(1, "AGENTMAIL_KIRO_WAKE=1")), false);
+    // Nor is one carrying another kiro session.
+    assert_eq!(
+        wake("k5", &own(1, "KIRO_SESSION_ID=other AGENTMAIL_KIRO_WAKE=1")),
+        false
+    );
+    // Those are ignored next to kiro's own server too.
+    install(&["--kiro-wake"]);
+    let both = format!(
+        "{}\n{}",
+        own(1, ""),
+        own(2, "KIRO_SESSION_ID=other AGENTMAIL_KIRO_WAKE=1")
+    );
+    assert_eq!(wake("k6", &both), false);
+    let both = format!(
+        "{}\n{}",
+        own(1, ""),
+        under_claude(2, "AGENTMAIL_KIRO_WAKE=1")
+    );
+    assert_eq!(wake("k7", &both), false);
 }
