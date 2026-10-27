@@ -1264,6 +1264,145 @@ fn opencode_json_preferred_over_jsonc() {
 }
 
 #[test]
+fn opencode_entry_in_jsonc_beside_json_is_updated_and_removed() {
+    // opencode loads both files, the .jsonc last: a stale entry there
+    // would override the one in opencode.json.
+    let h = Home::new();
+    let jsonc = h.oc_dir().join("opencode.jsonc");
+    write(&h.oc_config(), "{\"theme\": \"dark\"}\n");
+    write(
+        &jsonc,
+        "{\"mcp\": {\"servers\": {\"agentmail\": {\"type\": \"local\", \"command\": [\"/old/agentmail\", \"mcp\"], \"environment\": {\"A\": \"1\"}}}}}\n",
+    );
+    let changes = install(&oc_opts(false, BIN), &h.env(&[]));
+    assert_eq!(paths(&changes), [jsonc.as_path(), h.oc_plugin().as_path()]);
+    assert_eq!(read(&h.oc_config()), "{\"theme\": \"dark\"}\n");
+    let mut want = oc_server(BIN);
+    want["environment"] = json!({"A": "1"});
+    assert_eq!(read_json(&jsonc)["mcp"]["servers"]["agentmail"], want);
+
+    // An entry in both files: both are updated, and uninstall removes both.
+    write(
+        &h.oc_config(),
+        "{\"theme\": \"dark\", \"mcp\": {\"agentmail\": {\"type\": \"local\", \"command\": [\"/old/agentmail\", \"mcp\"]}}}\n",
+    );
+    let changes = install(&oc_opts(false, BIN), &h.env(&[]));
+    assert_eq!(paths(&changes), [h.oc_config().as_path()]);
+    assert_eq!(
+        read_json(&h.oc_config())["mcp"]["servers"]["agentmail"],
+        oc_server(BIN)
+    );
+    let changes = uninstall(&oc_opts(false, BIN), &h.env(&[]));
+    assert_eq!(
+        paths(&changes),
+        [
+            h.oc_config().as_path(),
+            jsonc.as_path(),
+            h.oc_plugin().as_path()
+        ]
+    );
+    assert_eq!(read_json(&h.oc_config()), json!({"theme": "dark"}));
+    assert_eq!(read_json(&jsonc), json!({}));
+}
+
+#[test]
+fn opencode_commented_jsonc_beside_json_is_refused() {
+    let h = Home::new();
+    let jsonc = h.oc_dir().join("opencode.jsonc");
+    write(&h.oc_config(), "{}\n");
+    let text = "{\n  // pasted by hand\n  \"mcp\": {\"servers\": {\"agentmail\": {\"type\": \"local\", \"command\": [\"/old/agentmail\", \"mcp\"], \"codemode\": false}}}\n}\n";
+    write(&jsonc, text);
+    for err in [
+        install::plan_install(&oc_opts(false, BIN), &h.env(&[])).unwrap_err(),
+        install::plan_uninstall(&oc_opts(false, BIN), &h.env(&[])).unwrap_err(),
+    ] {
+        let msg = format!("{err:#}");
+        assert!(msg.contains("opencode.jsonc"), "{msg}");
+        assert!(msg.contains("by hand"), "{msg}");
+    }
+    assert_eq!(read(&jsonc), text);
+    assert_eq!(read(&h.oc_config()), "{}\n");
+    assert!(!h.oc_plugin().exists());
+}
+
+#[test]
+fn opencode_commented_config_with_legacy_entry_says_to_delete_it() {
+    let h = Home::new();
+    let path = h.oc_dir().join("opencode.jsonc");
+    // The V1 entry, plus the servers entry pasted as told.
+    let text = format!(
+        "{{\n  // mine\n  \"mcp\": {{\n    \"agentmail\": {{\"type\": \"local\", \"command\": [\"/old/agentmail\", \"mcp\"]}},\n    \"servers\": {{\"agentmail\": {{\"type\": \"local\", \"command\": [\"{BIN}\", \"mcp\"], \"codemode\": false}}}}\n  }}\n}}\n"
+    );
+    write(&path, &text);
+    let err = install::plan_install(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("delete the \"agentmail\" entry directly under \"mcp\""),
+        "{msg}"
+    );
+    assert_eq!(read(&path), text);
+    // With it deleted, the file is as install would leave it.
+    let fixed = text.replace(
+        "    \"agentmail\": {\"type\": \"local\", \"command\": [\"/old/agentmail\", \"mcp\"]},\n",
+        "",
+    );
+    assert_ne!(fixed, text);
+    write(&path, &fixed);
+    let changes = install(&oc_opts(false, BIN), &h.env(&[]));
+    assert_eq!(paths(&changes), [h.oc_plugin().as_path()]);
+    // Without a V1 entry the message does not mention one.
+    let unpasted = fixed.replace(&format!("\"{BIN}\""), "\"/old/agentmail\"");
+    write(&path, &unpasted);
+    let err = install::plan_install(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
+    assert!(!format!("{err:#}").contains("directly under"), "{err:#}");
+}
+
+#[test]
+fn opencode_legacy_entry_beside_servers_entry_is_carried_over() {
+    let h = Home::new();
+    write(
+        &h.oc_config(),
+        r#"{"mcp": {
+  "agentmail": {"type": "local", "command": ["/old/agentmail", "mcp"], "environment": {"A": "1"}, "cwd": "/w", "timeout": 5, "protocol": "x", "enabled": false},
+  "servers": {"agentmail": {"type": "local", "command": ["/old/agentmail", "mcp"], "timeout": 9}}
+}}"#,
+    );
+    install(&oc_opts(false, BIN), &h.env(&[]));
+    let v = read_json(&h.oc_config());
+    assert!(v["mcp"].get("agentmail").is_none(), "{v}");
+    // The servers entry's own keys win; the rest come from the V1 entry.
+    assert_eq!(
+        v["mcp"]["servers"]["agentmail"],
+        json!({"type": "local", "command": [BIN, "mcp"], "timeout": 9, "codemode": false, "environment": {"A": "1"}, "cwd": "/w", "protocol": "x", "disabled": true})
+    );
+}
+
+#[test]
+fn opencode_trailing_commas_are_jsonc_not_a_parse_error() {
+    let h = Home::new();
+    let path = h.oc_dir().join("opencode.jsonc");
+    let text = "{\n  \"theme\": \"dark\",\n  \"mcp\": {\"servers\": {},},\n}\n";
+    write(&path, text);
+    let err = install::plan_install(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(!msg.contains("cannot parse"), "{msg}");
+    assert!(msg.contains("trailing commas"), "{msg}");
+    assert!(msg.contains("\"codemode\": false"), "{msg}");
+    assert_eq!(read(&path), text);
+    // Pasted: left alone, the plugin installed; uninstall asks again.
+    let pasted = text.replace(
+        "{\"servers\": {},}",
+        &format!("{{\"servers\": {{\"agentmail\": {{\"type\": \"local\", \"command\": [\"{BIN}\", \"mcp\"], \"codemode\": false,}},}},}}"),
+    );
+    write(&path, &pasted);
+    let changes = install(&oc_opts(false, BIN), &h.env(&[]));
+    assert_eq!(paths(&changes), [h.oc_plugin().as_path()]);
+    assert_eq!(read(&path), pasted);
+    let err = install::plan_uninstall(&oc_opts(false, BIN), &h.env(&[])).unwrap_err();
+    assert!(format!("{err:#}").contains("trailing commas"), "{err:#}");
+}
+
+#[test]
 fn opencode_plugin_bin_substituted() {
     let h = Home::new();
     let bin = "/opt/my \"agent\" mail\\bin/agentmail";

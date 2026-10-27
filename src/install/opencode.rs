@@ -2,15 +2,18 @@
 //!
 //! User scope: the config directory is `$XDG_CONFIG_HOME/opencode`, else
 //! `~/.config/opencode`; project scope (`--project`) is the current
-//! directory, with the plugin in `.opencode/plugins/`. The config file is
-//! the first of `opencode.json` and `opencode.jsonc` there, else a new
-//! `opencode.json`. The MCP server goes in `mcp.servers.agentmail`, also
-//! in a file that keeps its other servers in the V1 shape (`mcp.<name>`):
-//! opencode 2.0.27 reads both, but drops `codemode` from a V1 entry, and
-//! its own `opencode mcp add` writes `servers` into such a file too (see
-//! `docs/harness-notes.md`). A V1 entry named `agentmail` is agentmail's:
-//! install moves it to `servers`, uninstall removes it. A config with
-//! comments is never rewritten (they would be lost): install and uninstall
+//! directory, with the plugin in `.opencode/plugins/`. opencode loads and
+//! merges both `opencode.json` and `opencode.jsonc` there (the `.jsonc`
+//! last), so install updates agentmail's entry in each that has one, else
+//! adds it to the first that exists (a new `opencode.json` when neither
+//! does), and uninstall removes it from both. The MCP server goes in
+//! `mcp.servers.agentmail`, also in a file that keeps its other servers in
+//! the V1 shape (`mcp.<name>`): opencode 2.0.27 reads both, but drops
+//! `codemode` from a V1 entry, and its own `opencode mcp add` writes
+//! `servers` into such a file too (see `docs/harness-notes.md`). A V1
+//! entry named `agentmail` is agentmail's: install moves it to `servers`,
+//! uninstall removes it. A config with JSONC syntax (comments, trailing
+//! commas) is never rewritten (it would be lost): install and uninstall
 //! refuse with the entry to add or remove by hand, unless the file is
 //! already as they would leave it. The plugin is `plugin/agentmail.js`,
 //! embedded, with the binary's path in place of its placeholder; a
@@ -38,8 +41,10 @@ const SERVER_KEYS: [&str; 3] = ["type", "command", "codemode"];
 /// V1 entry is moved to `servers`.
 const SHARED_KEYS: [&str; 4] = ["environment", "cwd", "timeout", "protocol"];
 
-/// The files: (config, plugin).
-fn files(o: &InstallOpts, env: &Env) -> (PathBuf, PathBuf) {
+/// The files: (configs, plugin). The configs are those of `opencode.json`
+/// and `opencode.jsonc` that exist, in that order, else a new
+/// `opencode.json` alone.
+fn files(o: &InstallOpts, env: &Env) -> (Vec<PathBuf>, PathBuf) {
     let (dir, plugins) = if o.project {
         (env.cwd.clone(), env.cwd.join(".opencode").join("plugins"))
     } else {
@@ -50,12 +55,15 @@ fn files(o: &InstallOpts, env: &Env) -> (PathBuf, PathBuf) {
         let plugins = dir.join("plugins");
         (dir, plugins)
     };
-    let config = ["opencode.json", "opencode.jsonc"]
+    let mut configs: Vec<PathBuf> = ["opencode.json", "opencode.jsonc"]
         .iter()
         .map(|n| dir.join(n))
-        .find(|p| std::fs::symlink_metadata(p).is_ok())
-        .unwrap_or_else(|| dir.join("opencode.json"));
-    (config, plugins.join("agentmail.js"))
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .collect();
+    if configs.is_empty() {
+        configs.push(dir.join("opencode.json"));
+    }
+    (configs, plugins.join("agentmail.js"))
 }
 
 fn server(bin: &str) -> Value {
@@ -95,25 +103,66 @@ fn edit(v: &mut Map<String, Value>, install: bool, bin: &str, path: &Path) -> Re
     let servers = object_at(mcp, "servers", path)?;
     let want = server(bin);
     let want = want.as_object().expect("an object");
-    match servers.get_mut("agentmail") {
+    let entry = match servers.get_mut("agentmail") {
         // Keep what the user added to the entry, such as `environment`.
-        Some(Value::Object(cur)) => merge_keys(cur, want, &SERVER_KEYS),
-        _ => {
-            let mut entry = want.clone();
-            if let Some(Value::Object(old)) = legacy {
-                for k in SHARED_KEYS {
-                    if let Some(x) = old.get(k) {
-                        entry.insert(k.to_string(), x.clone());
-                    }
-                }
-                if old.get("enabled") == Some(&Value::Bool(false)) {
-                    entry.insert("disabled".into(), Value::Bool(true));
-                }
-            }
-            servers.insert("agentmail".into(), Value::Object(entry));
+        Some(Value::Object(cur)) => {
+            merge_keys(cur, want, &SERVER_KEYS);
+            cur
         }
+        _ => {
+            servers.insert("agentmail".into(), Value::Object(want.clone()));
+            servers["agentmail"].as_object_mut().expect("an object")
+        }
+    };
+    if let Some(Value::Object(old)) = legacy {
+        carry(entry, &old);
     }
     Ok(())
+}
+
+/// Carry over to `entry` what agentmail's V1 entry `old` set and `entry`
+/// lacks: the keys both shapes share, and `enabled: false` as `disabled:
+/// true`.
+fn carry(entry: &mut Map<String, Value>, old: &Map<String, Value>) {
+    for k in SHARED_KEYS {
+        if let Some(x) = old.get(k)
+            && !entry.contains_key(k)
+        {
+            entry.insert(k.to_string(), x.clone());
+        }
+    }
+    if old.get("enabled") == Some(&Value::Bool(false)) && !entry.contains_key("disabled") {
+        entry.insert("disabled".into(), Value::Bool(true));
+    }
+}
+
+/// Whether `v` has an agentmail entry (V2 or V1).
+fn has_entry(v: &Map<String, Value>) -> bool {
+    let mut s = v.clone();
+    strip(&mut s);
+    s != *v
+}
+
+/// The config at `path` parsed as opencode reads it (JSONC), and whether
+/// it has JSONC syntax; `None` when it does not exist.
+fn load(path: &Path, bin: &str) -> Result<Option<(Map<String, Value>, bool)>> {
+    let Some(text) = read_opt(path)? else {
+        return Ok(None);
+    };
+    let bare = super::json::strip_jsonc(&text);
+    match super::json::parse(bare.as_deref().unwrap_or(&text)) {
+        Ok(Value::Object(m)) => Ok(Some((m, bare.is_some()))),
+        Ok(_) => bail!(
+            "{} is not a JSON object; agentmail left it unchanged. Add this by hand:\n{}",
+            path.display(),
+            snippet(bin)
+        ),
+        Err(e) => bail!(
+            "cannot parse {}: {e}; agentmail left it unchanged. Fix it, or add this by hand:\n{}",
+            path.display(),
+            snippet(bin)
+        ),
+    }
 }
 
 /// The snippet to add by hand.
@@ -127,34 +176,37 @@ fn snippet(bin: &str) -> String {
 
 /// The config's change, if any.
 fn plan_config(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>> {
-    let text = read_opt(&path)?;
-    if let Some(bare) = text.as_deref().and_then(super::json::strip_comments) {
-        // Check whether the file is already as it should be; never write it.
-        let value = match super::json::parse(&bare) {
-            Ok(Value::Object(m)) => m,
-            _ => bail!(
-                "cannot parse {}; agentmail left it unchanged. Fix it, or add this by hand:\n{}",
-                path.display(),
-                snippet(bin)
-            ),
-        };
+    if let Some((value, true)) = load(&path, bin)? {
+        // JSONC: check whether the file is already as it should be; never
+        // write it.
         let mut new = value.clone();
         edit(&mut new, install, bin, &path)?;
         if new == value {
             return Ok(None);
         }
+        let jsonc = "uses JSONC syntax (comments or trailing commas), which agentmail cannot keep \
+                     when it edits the file; nothing was changed";
         if install {
+            let v1 = match value.get("mcp") {
+                Some(Value::Object(mcp)) if mcp.contains_key("agentmail") => {
+                    " Also delete the \"agentmail\" entry directly under \"mcp\" (an old shape), \
+                     first copying any \"environment\", \"cwd\", \"timeout\" or \"protocol\" \
+                     it has into the new entry."
+                }
+                _ => "",
+            };
             bail!(
-                "{} has comments, which agentmail cannot keep when it edits the file; nothing was changed. \
-                 Add this by hand (merging it into the \"mcp\" there), then run the install again to add the plugin:\n{}",
+                "{} {jsonc}. Add this by hand, merging it into the \"mcp\" there in place of any \
+                 \"agentmail\" entry in \"mcp\" → \"servers\".{v1} Then run the install again \
+                 to add the plugin:\n{}",
                 path.display(),
                 snippet(bin)
             );
         }
         bail!(
-            "{} has comments, which agentmail cannot keep when it edits the file; nothing was changed. \
-             Remove the \"agentmail\" entry from \"mcp\" → \"servers\" (and any \"agentmail\" directly \
-             under \"mcp\") by hand, then run the uninstall again to remove the plugin.",
+            "{} {jsonc}. Remove the \"agentmail\" entry from \"mcp\" → \"servers\" (and any \
+             \"agentmail\" directly under \"mcp\") by hand, then run the uninstall again to \
+             remove the plugin.",
             path.display()
         );
     }
@@ -198,9 +250,25 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
 
 pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Change>> {
     let bin = bin_str(o)?;
-    let (config, plugin) = files(o, env);
-    // Both are planned before either is written: a refusal changes nothing.
+    let (configs, plugin) = files(o, env);
+    // Install updates the entry where there is one (in both files, since
+    // opencode merges them), else adds it to the first file; uninstall
+    // removes it from both.
+    let mut targets = Vec::new();
+    for path in &configs {
+        if !install || load(path, bin)?.is_some_and(|(v, _)| has_entry(&v)) {
+            targets.push(path.clone());
+        }
+    }
+    if targets.is_empty() {
+        targets.push(configs[0].clone());
+    }
+    // All are planned before any is written: a refusal changes nothing.
     let plugin = plan_plugin(plugin, install, bin)?;
-    let config = plan_config(config, install, bin)?;
-    Ok([config, plugin].into_iter().flatten().collect())
+    let mut changes = Vec::new();
+    for path in targets {
+        changes.extend(plan_config(path, install, bin)?);
+    }
+    changes.extend(plugin);
+    Ok(changes)
 }

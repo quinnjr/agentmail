@@ -17,11 +17,12 @@ pub fn parse(text: &str) -> serde_json::Result<Value> {
     serde_json::from_str(text)
 }
 
-/// `text` with its JSONC comments (`// ...` to the end of the line, and
-/// `/* ... */`) blanked out with spaces, line breaks kept, or `None` when
-/// it has none. Comment markers inside strings are not comments. An
-/// unterminated `/*` blanks the rest of the text.
-pub fn strip_comments(text: &str) -> Option<String> {
+/// `text` with its JSONC syntax blanked out with spaces, line breaks kept,
+/// or `None` when it has none: comments (`// ...` to the end of the line,
+/// and `/* ... */`) and trailing commas (a `,` before the `}` or `]` that
+/// closes its container). Comment markers and commas inside strings are
+/// not JSONC syntax. An unterminated `/*` blanks the rest of the text.
+pub fn strip_jsonc(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut found = false;
     let mut chars = text.chars().peekable();
@@ -66,7 +67,35 @@ pub fn strip_comments(text: &str) -> Option<String> {
             c => out.push(c),
         }
     }
-    found.then_some(out)
+    let commas = blank_trailing_commas(&mut out);
+    (found || commas).then_some(out)
+}
+
+/// Blank the trailing commas of `text`, which has no comments; whether
+/// there were any.
+fn blank_trailing_commas(text: &mut String) -> bool {
+    let mut bytes = std::mem::take(text).into_bytes();
+    let mut found = false;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b',' if !in_string => {
+                let next = bytes[i + 1..].iter().find(|b| !b.is_ascii_whitespace());
+                if matches!(next, Some(b'}' | b']')) {
+                    bytes[i] = b' ';
+                    found = true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Only an ASCII byte was replaced, by another.
+    *text = String::from_utf8(bytes).expect("still UTF-8");
+    found
 }
 
 /// `new` written over `orig` (the text it was parsed from, or `None` for a
@@ -620,15 +649,32 @@ mod tests {
 
     #[test]
     fn comments_are_blanked() {
-        assert_eq!(strip_comments("{\"a\": \"// no /* no */\"}"), None);
-        assert_eq!(strip_comments("{\"a\\\"//\": 1}"), None);
+        assert_eq!(strip_jsonc("{\"a\": \"// no /* no */\"}"), None);
+        assert_eq!(strip_jsonc("{\"a\\\"//\": 1}"), None);
         assert_eq!(
-            strip_comments("{ // c\n \"a\": /* x\n y */ 1 }").as_deref(),
+            strip_jsonc("{ // c\n \"a\": /* x\n y */ 1 }").as_deref(),
             Some("{     \n \"a\":     \n      1 }")
         );
-        assert_eq!(strip_comments("/**/{}").as_deref(), Some("    {}"));
-        assert_eq!(strip_comments("{} /* open").as_deref(), Some("{}        "));
-        let v = parse(&strip_comments("{\r\n// c\r\n\"a\": 1}").unwrap()).unwrap();
+        assert_eq!(strip_jsonc("/**/{}").as_deref(), Some("    {}"));
+        assert_eq!(strip_jsonc("{} /* open").as_deref(), Some("{}        "));
+        let v = parse(&strip_jsonc("{\r\n// c\r\n\"a\": 1}").unwrap()).unwrap();
         assert_eq!(v, json!({"a": 1}));
+    }
+
+    #[test]
+    fn trailing_commas_are_blanked() {
+        assert_eq!(strip_jsonc("{\"a\": [1, 2], \"b\": \",}\"}"), None);
+        assert_eq!(strip_jsonc("{\"a\\\",]\": 1}"), None);
+        assert_eq!(
+            strip_jsonc("{\"a\": [1, 2,],\n \"b\": {\"c\": 1,\n }, }").as_deref(),
+            Some("{\"a\": [1, 2 ],\n \"b\": {\"c\": 1 \n }  }")
+        );
+        // A comment between the comma and the bracket.
+        let v = parse(&strip_jsonc("{\"a\": 1, // c\n}").unwrap()).unwrap();
+        assert_eq!(v, json!({"a": 1}));
+        assert_eq!(
+            strip_jsonc("{\"a\": \"é\",}").as_deref(),
+            Some("{\"a\": \"é\" }")
+        );
     }
 }

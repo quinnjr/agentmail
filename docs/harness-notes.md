@@ -836,7 +836,6 @@ socket path limit), `opencode serve` plus `opencode run --server`:
   true`) and left no `hook wait` process behind.
 - Killing the server left no `hook wait` process behind either.
 
-
 ### Install (Task 7)
 
 `agentmail install --harness opencode` writes the MCP server into
@@ -851,8 +850,12 @@ service restart` (the command says so); the plugin file itself is watched.
 
 - **Where.** The config dir is `$XDG_CONFIG_HOME/opencode` (a relative
   value is taken from the current directory, as opencode does), else
-  `~/.config/opencode`. The file is the first of `opencode.json` and
-  `opencode.jsonc` that exists, else a new `opencode.json`. Plugins are
+  `~/.config/opencode`. opencode loads and merges both `opencode.json`
+  and `opencode.jsonc` there (`opencode debug config` lists both, the
+  `.jsonc` loaded last, so its entries override). So install updates
+  agentmail's entry in each file that has one, else adds it to the first
+  of the two that exists (a new `opencode.json` when neither does), and
+  uninstall removes it from both. Plugins are
   loaded from `plugin/` and `plugins/` next to it, `.js` and `.ts` files
   only, so the `.agentmail.bak` and `.agentmail.created` files there are
   never loaded. `--project`: `./opencode.json` (or `./opencode.jsonc`) and
@@ -872,15 +875,19 @@ service restart` (the command says so); the plugin file itself is watched.
   written, instead of the plan's "same shape", which would lose
   `codemode: false`. A V1 entry named `agentmail` counts as agentmail's:
   install moves it to `servers` (carrying `environment`, `cwd`,
-  `timeout`, `protocol`, and `enabled: false` as `disabled: true`) and
-  uninstall removes it.
-- **Comments.** A config with `//` or `/* */` comments (outside strings)
-  is never rewritten, since they would be lost. If it already is as the
+  `timeout`, `protocol`, and `enabled: false` as `disabled: true`; when a
+  `servers` entry is already there, only those it lacks) and uninstall
+  removes it.
+- **JSONC.** opencode reads both files as JSONC. A config with `//` or
+  `/* */` comments or trailing commas (outside strings) is never
+  rewritten, since they would be lost. If it already is as the
   command would leave it (the entry pasted by hand, or for uninstall no
   agentmail entry), it is left alone and the plugin is still installed or
   removed; otherwise nothing at all is changed and the error shows the
-  exact entry to paste (install) or says what to delete by hand
-  (uninstall), then to run the command again.
+  exact entry to paste (install; also telling to delete a V1
+  `mcp.agentmail` when there is one) or says what to delete by hand
+  (uninstall), then to run the command again. With both files, either
+  one refusing changes nothing in either.
 - **The plugin** is `plugin/agentmail.js` embedded in the binary with its
   one `"__AGENTMAIL_BIN__"` literal replaced by the binary's path as a
   JSON string (quotes and backslashes escaped). A file at
