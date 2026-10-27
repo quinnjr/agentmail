@@ -1125,9 +1125,18 @@ impl Handler {
         }
     }
 
+    /// The agent as others see it. An agent found gone has its hook wait
+    /// files removed ([`crate::hook::clear_wait_state`]): no wait of its
+    /// may run on, and a harness that exited mid-turn leaves them behind.
     fn view(&self, agent: Agent, is_contact: bool) -> AgentView {
+        let presence = Store::presence(&agent, &procinfo::is_alive);
+        if presence == Presence::Gone
+            && let Some(dir) = &self.data_dir
+        {
+            crate::hook::clear_wait_state(dir, &agent.address);
+        }
         AgentView {
-            presence: Store::presence(&agent, &procinfo::is_alive),
+            presence,
             is_contact,
             agent,
         }
@@ -1218,9 +1227,7 @@ impl Handler {
                     return Err(human_has_no("session to sign off"));
                 }
                 self.store.signoff(&me).map_err(store_err)?;
-                if let Some(dir) = &self.data_dir {
-                    crate::hook::clear_wait_state(dir, &me);
-                }
+                // The view finds the agent gone and removes its hook files.
                 let view = self.agent_view(&me)?;
                 self.publish_presence(&view);
                 to_json(&view)
@@ -1396,6 +1403,20 @@ impl Handler {
         }
         req.cwd = lexical(&req.cwd);
         req.repo = git_toplevel(&req.cwd);
+        // Agents bound to the process now: registering may unbind them
+        // (one process-level address per process), and watchers (a hook
+        // waiting for one of them) must hear that they are gone.
+        let bound_before: Vec<String> = match req.proc_id {
+            Some(p) => self
+                .store
+                .list_agents()
+                .map_err(store_err)?
+                .into_iter()
+                .filter(|a| a.proc_id == Some(p) && !a.signed_off)
+                .map(|a| a.address)
+                .collect(),
+            None => Vec::new(),
+        };
         // One transaction: an error never follows a committed registration,
         // so a retry cannot mint an address the caller never learned.
         let (registered, released) = self
@@ -1406,6 +1427,14 @@ impl Handler {
         let existing = registered.existing;
         let view = self.view(registered.agent, false);
         self.publish_presence(&view);
+        for addr in bound_before.iter().filter(|a| **a != view.agent.address) {
+            if let Ok(Some(other)) = self.store.get_agent(addr)
+                && other.proc_id.is_none()
+            {
+                let other = self.view(other, false);
+                self.publish_presence(&other);
+            }
+        }
         for msg in &released {
             self.hub.publish(Event::Delivered {
                 to: view.agent.address.clone(),

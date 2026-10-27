@@ -221,7 +221,7 @@ come from the binary's bundled settings schema.
   but `cli`. Under the IDE and desktop integrations the other hooks work
   (reminders, urgent mail, the Stop block for open questions), but an
   idle session is not woken for new mail. The README's support table
-  (Task 11) must say so.
+  (Task 10) must say so.
 - **Timeouts.** `timeout` is in seconds, any positive number; the schema
   sets no maximum. It applies to `asyncRewake` hooks too: with `timeout: 5`
   a rewake hook sleeping 15 s was killed and never woke the session.
@@ -344,7 +344,11 @@ How `agentmail hook wait` behaves under it:
   session. Every Stop starts one, and the newest replaces the one before
   (a turn file under `<data dir>/hook-wait/`, plus a lock so only one waits
   per agent): the earlier one exits 0, so the agent is never woken twice
-  for the same mail.
+  for the same mail. A new wait keeps trying for the lock for as long as
+  its claim on the turn stands (the one it replaces lets go once it sees
+  the claim, after at most a status call and a tick), and exits 0 if a
+  later claim or a busy mark replaces it meanwhile. With a lock file that
+  cannot be opened or locked it exits 0 at once: two waits never both run.
 - The `session-start`, `prompt` and `post-tool` hooks mark the session
   busy, and a wait exits 0 within half a second of that (it also checks
   just before waking). So a wait started by one Stop never outlives the
@@ -353,24 +357,41 @@ How `agentmail hook wait` behaves under it:
   fresh wait.
 - On a plain stop, unread mail already there wakes at once, unless the
   agent also has open questions (the Stop hook's `decision: block` handles
-  those). This includes mail that came mid-turn and was left unread: the
-  agent gets one wake for it. After a wake or block (`stop_hook_active:
-  true`) only mail that arrives from then on counts, so mail the agent
-  leaves unread cannot wake it in a loop. What is new is decided per
+  those) or a wait already woke it for that mail. This includes mail that
+  came mid-turn and was left unread: the agent gets one wake for it, not
+  one after every human turn (a wake records the unread ids it was for in
+  `<address>.woken`, and later plain stops do not count those). After a
+  wake or block (`stop_hook_active: true`) only mail that arrives from
+  then on counts, so mail the agent leaves unread cannot wake it in a
+  loop. What is new is decided per
   message id, not by the unread count: the agent reading old mail while
   the wait runs does not hide a later message. Mail already read by the
   time the wait looks (just after its delivery) does not count.
-- It exits 0 when the agent signs off, when the daemon stops, or when a
-  process it runs under (Claude Code) exits; it checks the processes and
+- It exits 0 when the agent signs off, when the daemon stops, when a
+  process it runs under (Claude Code) exits, or when the agent is gone
+  because its Claude Code process was registered as another agent
+  (`agentmail register --pid`): the daemon then publishes the unbound
+  agent as gone, and a status re-read that names another agent also ends
+  the wait, so it never wakes the session with the other agent's mail; it checks the processes and
   the turn file every 0.5 s and otherwise sleeps on the daemon's event
   stream (no polling of mail).
 - A `hook` command line this binary cannot parse (a newer config, an older
   binary) prints the usage error and exits 0, so it never blocks a stop.
+  It counts as a `hook` command line when its first positional argument
+  (after global options such as `--json` or `--as human`, before any
+  `--`) is `hook`.
 - Its files under `<data dir>/hook-wait/` (`<address>.turn`,
-  `<address>.lock`) exist only for agents that have had a wait (a busy
-  mark rewrites an existing turn file and never creates one). They are
-  removed when the agent signs off (by the daemon, and by a running wait)
-  and when a wait ends because its harness exited. A wait still holding a
+  `<address>.lock`, `<address>.woken`) exist only for agents that have
+  had a wait (a busy mark rewrites an existing turn file and never
+  creates one). The daemon removes them, with any temporary
+  `<address>.<kind>.<pid>-<nanos>` file a crashed write left, whenever it
+  finds the agent gone (signed off, unbound, or its process dead) while
+  computing its presence: on sign-off, on a registration that unbinds it,
+  and on any listing or lookup that includes it. A running wait also
+  removes them when it ends on sign-off, on the agent going away, or on
+  its harness exiting. So a Claude Code closed mid-turn, with no wait
+  running, leaves its files only until the daemon next looks at the
+  agent. A wait still holding a
   lock whose file was removed does not block a new wait: a lock counts
   only while the file at the path is the one locked.
 
@@ -403,8 +424,9 @@ The code differs from the plan's sketch; build on the code:
   Skip }`). The wait is not a loop over `WaitForMail { timeout_secs: 300
   }`: it subscribes with `Request::Watch { agent }` and wakes on
   `Delivered` events (re-reading `HookStatus` to decide per message id
-  whether the mail is new), ends on the agent's sign-off `Presence` event,
-  a lost connection, a dead harness process (checked every 0.5 s) or a
+  whether the mail is new, and ending when the re-read names another
+  agent), ends on a `Presence` event showing the agent signed off or
+  gone, a lost connection, a dead harness process (checked every 0.5 s) or a
   busy mark, and keeps one waiter per agent with the turn file and lock
   above. It has no timeout of its own; the harness's hook `timeout` bounds
   it. kiro's Stop (Task 8) maps `Mail` to its exit code and the rest to 0.

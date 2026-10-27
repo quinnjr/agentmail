@@ -26,12 +26,12 @@
 //! - [`Daemon::status`], [`Daemon::mark_busy`] and [`Daemon::wait`]. The
 //!   wait is not a `WaitForMail { timeout_secs }` loop: it watches the
 //!   daemon's event stream ([`Request::Watch`]) for deliveries and the
-//!   agent's sign-off, and coordinates with other hooks of the same agent
+//!   agent's sign-off or going away, and coordinates with other hooks of the same agent
 //!   through a turn file and a lock under `<data dir>/hook-wait/` (see
 //!   [`Daemon::wait`]). It ends with a [`WaitOutcome`], which the harness
 //!   module maps to its exit code.
-//! - [`clear_wait_state`]: the daemon removes an agent's files there when
-//!   it signs off.
+//! - [`clear_wait_state`]: the daemon removes an agent's files there once
+//!   it finds the agent gone (signed off, unbound, or its process dead).
 
 pub mod claude;
 pub mod text;
@@ -48,7 +48,7 @@ use serde_json::Value;
 
 use crate::client::Client;
 use crate::identity::ENV_HUMAN;
-use crate::model::{Harness, Message, ProcId, SessionKey};
+use crate::model::{Harness, Message, Presence, ProcId, SessionKey};
 use crate::paths::Paths;
 use crate::procinfo;
 use crate::protocol::{Caller, ErrorCode, Event, Request};
@@ -61,8 +61,14 @@ pub const CALL_LIMIT: Duration = Duration::from_secs(5);
 /// still alive and that its session is still idle.
 const CHECK_EVERY: Duration = Duration::from_millis(500);
 
-/// How long a waiting hook waits for the one it replaces to let go.
+/// How long a waiting hook whose turn claim could not be written waits
+/// for the one it replaces to let go. With its claim written it waits for
+/// as long as the claim stands: the wait it replaces lets go once it sees
+/// the claim, which can take a status call ([`CALL_LIMIT`]) and a tick.
 const TAKEOVER_LIMIT: Duration = Duration::from_secs(5);
+
+/// The kinds of per-agent files under `<data dir>/hook-wait/`.
+const STATE_KINDS: [&str; 3] = ["turn", "lock", "woken"];
 
 /// Claude Code sets this in its hooks' environment to its own pid.
 const ENV_CLAUDE_PID: &str = "CLAUDE_PID";
@@ -191,14 +197,16 @@ pub struct OpenQuestion {
 pub enum WaitOutcome {
     /// The agent has mail to wake up for; its status after it came.
     Mail(HookStatus),
-    /// The agent signed off, the processes the hook runs under are gone,
-    /// or the daemon went away.
+    /// The agent signed off or is gone (its process now names another
+    /// agent, or no process names it), the processes the hook runs under
+    /// are gone, or the daemon went away.
     Gone,
     /// The session is busy again (a prompt or tool call since the wait
     /// began), or a later wait took over.
     Busy,
-    /// Nothing to wait for: the agent does not want waking, or the wait it
-    /// would replace did not let go in time.
+    /// Nothing to wait for: the agent does not want waking, the wait it
+    /// would replace did not let go in time (only when this wait could not
+    /// claim the turn), or the waiter lock is unusable.
     Skip,
 }
 
@@ -283,15 +291,18 @@ impl Daemon {
     /// Only an agent that has had a wait has a turn file to mark: with none
     /// there is no wait to end, and nothing is written.
     pub fn mark_busy(&self, address: &str) {
-        if turn_path(&self.paths, address).exists() {
-            let _ = write_turn(&self.paths, address, &format!("busy {}", unique()));
+        let path = state_path(&self.paths.data_dir, address, "turn");
+        if path.exists() {
+            let _ = write_state(&path, &format!("busy {}", unique()));
         }
     }
 
     /// Block until the idle agent has mail to be woken for.
     ///
     /// With `wake_for_unread`, unread mail already there counts, unless the
-    /// agent also has open questions (a Stop hook deals with those).
+    /// agent also has open questions (a Stop hook deals with those) or a
+    /// wait already woke it for that mail (the `woken` file): mail it
+    /// chose to leave unread wakes it once, not after every human turn.
     /// Otherwise (the agent was just woken, or blocked, and stopped again
     /// without reading) only mail that arrives from now on counts, so
     /// mail it chose to leave unread never wakes it twice. Which mail is
@@ -305,12 +316,16 @@ impl Daemon {
     /// starts one, the newest replaces the one before, and only one waits
     /// per agent, so the agent is never woken twice for the same mail.
     ///
-    /// Ends with [`WaitOutcome::Gone`] when the agent signs off, the daemon
-    /// goes away, or a process the hook runs under (its harness) exits; and
-    /// with [`WaitOutcome::Skip`] at once when the agent has `wake` off.
-    /// On sign-off and harness exit the wait removes the agent's turn and
-    /// lock files ([`clear_wait_state`]); they are kept while the agent
-    /// lives, for the next wait.
+    /// Ends with [`WaitOutcome::Gone`] when the agent signs off or is
+    /// otherwise gone (its harness process was rebound to another agent:
+    /// a re-read that names another agent, or a `Presence` event that
+    /// shows it gone), the daemon goes away, or a process the hook runs
+    /// under (its harness) exits; and with [`WaitOutcome::Skip`] at once
+    /// when the agent has `wake` off. On sign-off, on going away and on
+    /// harness exit the wait removes the agent's files
+    /// ([`clear_wait_state`]); they are kept while the agent lives, for
+    /// the next wait, and the daemon removes them once it finds the agent
+    /// gone.
     pub async fn wait(&mut self, wake_for_unread: bool) -> WaitOutcome {
         let Some(status) = self.status(false).await else {
             return WaitOutcome::Gone;
@@ -319,14 +334,21 @@ impl Daemon {
             return WaitOutcome::Skip;
         }
         let address = status.address.clone();
+        let turn = state_path(&self.paths.data_dir, &address, "turn");
         // Claim the turn first, so the wait holding the lock lets go.
         let token = format!("wait {}", unique());
-        let claimed = write_turn(&self.paths, &address, &token).is_ok();
-        let Some(_lock) = self.take_waiter_lock(&address).await else {
-            return WaitOutcome::Skip;
+        let claimed = write_state(&turn, &token).is_ok();
+        let _lock = match self
+            .take_waiter_lock(&address, claimed.then_some(token.as_str()))
+            .await
+        {
+            Ok(lock) => lock,
+            Err(NoLock::Busy) => return WaitOutcome::Busy,
+            Err(NoLock::Gone) => return WaitOutcome::Gone,
+            Err(NoLock::Skip) => return WaitOutcome::Skip,
         };
-        let busy = |paths: &Paths| claimed && read_turn(paths, &address) != Some(token.clone());
-        if busy(&self.paths) {
+        let busy = || claimed && read_state(&turn).as_deref() != Some(token.as_str());
+        if busy() {
             return WaitOutcome::Busy;
         }
         let caller = self.caller.clone();
@@ -347,22 +369,18 @@ impl Daemon {
                 return WaitOutcome::Gone;
             };
             let mut events = Box::pin(events);
-            let Some(now) = self.status(false).await else {
+            let Some(now) = self.status_of(&address).await else {
                 return WaitOutcome::Gone;
             };
             let known = known.get_or_insert_with(|| {
                 if wake_for_unread && now.open_questions.is_empty() {
-                    HashSet::new()
+                    read_woken(&self.paths.data_dir, &address)
                 } else {
                     now.unread_ids.iter().cloned().collect()
                 }
             });
             if has_news(known, &now) {
-                return if busy(&self.paths) {
-                    WaitOutcome::Busy
-                } else {
-                    WaitOutcome::Mail(now)
-                };
+                return self.wake(busy(), now);
             }
             let mut tick = tokio::time::interval(CHECK_EVERY);
             tick.tick().await;
@@ -370,19 +388,17 @@ impl Daemon {
                 tokio::select! {
                     ev = events.next() => match ev {
                         Some(Ok(Event::Delivered { to, .. })) if to == address => {
-                            let Some(now) = self.status(false).await else {
+                            let Some(now) = self.status_of(&address).await else {
                                 return WaitOutcome::Gone;
                             };
                             if has_news(known, &now) {
-                                return if busy(&self.paths) {
-                                    WaitOutcome::Busy
-                                } else {
-                                    WaitOutcome::Mail(now)
-                                };
+                                return self.wake(busy(), now);
                             }
                         }
                         Some(Ok(Event::Presence { agent }))
-                            if agent.agent.address == address && agent.agent.signed_off =>
+                            if agent.agent.address == address
+                                && (agent.agent.signed_off
+                                    || agent.presence == Presence::Gone) =>
                         {
                             clear_wait_state(&self.paths.data_dir, &address);
                             return WaitOutcome::Gone;
@@ -394,11 +410,11 @@ impl Daemon {
                         Some(Err(_)) | None => return WaitOutcome::Gone,
                     },
                     _ = tick.tick() => {
-                        if !self.procs.iter().all(procinfo::is_alive) {
+                        if !self.procs_alive() {
                             clear_wait_state(&self.paths.data_dir, &address);
                             return WaitOutcome::Gone;
                         }
-                        if busy(&self.paths) {
+                        if busy() {
                             return WaitOutcome::Busy;
                         }
                     }
@@ -407,16 +423,59 @@ impl Daemon {
         }
     }
 
-    /// The waiter lock for `address`, waiting up to [`TAKEOVER_LIMIT`] for
-    /// the wait it replaces to let go. `None` when it never did.
-    async fn take_waiter_lock(&self, address: &str) -> Option<Option<File>> {
+    /// The status of `address`, the agent the wait started for. `None`
+    /// also when the hook's caller now resolves to another agent (its
+    /// harness process was registered as someone else): that agent's mail
+    /// is not this wait's to wake for.
+    async fn status_of(&mut self, address: &str) -> Option<HookStatus> {
+        self.status(false).await.filter(|s| s.address == address)
+    }
+
+    /// The outcome for mail to wake for, seen in `now`: [`WaitOutcome::Busy`]
+    /// when the session got busy meanwhile. A wake records the unread mail
+    /// it is for (the `woken` file), so a later plain stop does not wake
+    /// for the same mail again.
+    fn wake(&self, busy: bool, now: HookStatus) -> WaitOutcome {
+        if busy {
+            return WaitOutcome::Busy;
+        }
+        let woken = state_path(&self.paths.data_dir, &now.address, "woken");
+        let _ = write_state(&woken, &now.unread_ids.join("\n"));
+        WaitOutcome::Mail(now)
+    }
+
+    /// Whether every process the hook runs under is still alive.
+    fn procs_alive(&self) -> bool {
+        self.procs.iter().all(procinfo::is_alive)
+    }
+
+    /// The waiter lock for `address`, waiting for the wait it replaces to
+    /// let go. With this wait's turn claim `token` written, it waits for as
+    /// long as the claim stands (the old wait ends once it sees it), and
+    /// ends with [`WaitOutcome::Busy`] when a later claim replaces it.
+    /// Without one it waits up to [`TAKEOVER_LIMIT`], then
+    /// [`WaitOutcome::Skip`]. A lock file that cannot be opened or locked
+    /// is [`WaitOutcome::Skip`] too: two waits must never both run. Ends
+    /// with [`WaitOutcome::Gone`] when the hook's harness exits.
+    async fn take_waiter_lock(&self, address: &str, token: Option<&str>) -> Result<File, NoLock> {
         let started = Instant::now();
+        let turn = state_path(&self.paths.data_dir, address, "turn");
         loop {
-            if let Some(lock) = waiter_lock(&self.paths, address) {
-                return Some(lock);
+            match waiter_lock(&self.paths, address) {
+                Lock::Held(file) => return Ok(file),
+                Lock::Unusable => return Err(NoLock::Skip),
+                Lock::Taken => {}
             }
-            if started.elapsed() >= TAKEOVER_LIMIT {
-                return None;
+            match token {
+                Some(token) if read_state(&turn).as_deref() != Some(token) => {
+                    return Err(NoLock::Busy);
+                }
+                Some(_) => {}
+                None if started.elapsed() >= TAKEOVER_LIMIT => return Err(NoLock::Skip),
+                None => {}
+            }
+            if !self.procs_alive() {
+                return Err(NoLock::Gone);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -452,52 +511,114 @@ fn wait_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("hook-wait")
 }
 
-/// The file that says who last claimed the agent's turn: the newest wait,
-/// or a busy mark. A wait whose token is no longer there ends.
-fn turn_path(paths: &Paths, address: &str) -> PathBuf {
-    wait_dir(&paths.data_dir).join(format!("{address}.turn"))
+/// `address`'s file of `kind` (one of [`STATE_KINDS`]):
+///
+/// - `turn`: who last claimed the agent's turn: the newest wait, or a busy
+///   mark. A wait whose token is no longer there ends.
+/// - `lock`: the waiter lock ([`waiter_lock`]).
+/// - `woken`: the unread mail ids the last wake was for, one per line.
+fn state_path(data_dir: &Path, address: &str, kind: &str) -> PathBuf {
+    wait_dir(data_dir).join(format!("{address}.{kind}"))
 }
 
-fn lock_path(data_dir: &Path, address: &str) -> PathBuf {
-    wait_dir(data_dir).join(format!("{address}.lock"))
+/// Whether `name` is one of `address`'s files under the wait directory:
+/// `<address>.<kind>`, or a temporary `<address>.<kind>.<pid>-<nanos>` a
+/// write left behind ([`write_state`]).
+fn is_state_of(name: &str, address: &str) -> bool {
+    let Some(rest) = name.strip_prefix(address).and_then(|r| r.strip_prefix('.')) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    STATE_KINDS
+        .iter()
+        .any(|kind| match rest.strip_prefix(kind) {
+            Some("") => true,
+            Some(tmp) => tmp
+                .strip_prefix('.')
+                .and_then(|t| t.split_once('-'))
+                .is_some_and(|(pid, nanos)| digits(pid) && digits(nanos)),
+            None => false,
+        })
 }
 
-/// Remove `address`'s turn and lock files under `data_dir`, for an agent
-/// that signed off or whose harness exited. Best effort. A wait still
+/// Remove all of `address`'s files under `data_dir` (turn, lock, woken,
+/// and temporary files a crashed write left), for an agent that signed
+/// off, is gone, or whose harness exited. Best effort. A wait still
 /// holding the removed lock keeps it; one that opens the path afterwards
 /// gets a new file, and [`waiter_lock`] makes sure the two never both
 /// count as held.
 pub fn clear_wait_state(data_dir: &Path, address: &str) {
-    let _ = std::fs::remove_file(wait_dir(data_dir).join(format!("{address}.turn")));
-    let _ = std::fs::remove_file(lock_path(data_dir, address));
+    let Ok(entries) = std::fs::read_dir(wait_dir(data_dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| is_state_of(n, address))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
-fn write_turn(paths: &Paths, address: &str, token: &str) -> std::io::Result<()> {
-    let path = turn_path(paths, address);
+/// Write `content` to `path`, whole: written to a temporary file next to
+/// it and renamed into place, so a reader never sees half.
+fn write_state(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // Written whole and renamed into place, so a reader never sees half.
-    let tmp = path.with_extension(format!("turn.{}", unique().replace(' ', "-")));
-    std::fs::write(&tmp, token)?;
-    std::fs::rename(&tmp, &path).inspect_err(|_| {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}", unique().replace(' ', "-")));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
 
-fn read_turn(paths: &Paths, address: &str) -> Option<String> {
-    std::fs::read_to_string(turn_path(paths, address)).ok()
+fn read_state(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
 }
 
-/// Take the lock only one waiting hook per agent may hold: `None` when
-/// another holds it. A lock file that cannot be opened does not stop the
-/// wait. A lock taken on a file that was removed meanwhile
-/// ([`clear_wait_state`]) does not count: another wait may already hold
-/// the new file at that path, so this one tries again.
-fn waiter_lock(paths: &Paths, address: &str) -> Option<Option<File>> {
+/// The mail ids the agent's last wake was for (empty when none).
+fn read_woken(data_dir: &Path, address: &str) -> HashSet<String> {
+    read_state(&state_path(data_dir, address, "woken"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why [`Daemon::take_waiter_lock`] got no lock; the wait ends with the
+/// [`WaitOutcome`] of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoLock {
+    Busy,
+    Gone,
+    Skip,
+}
+
+/// What [`waiter_lock`] got.
+#[derive(Debug)]
+enum Lock {
+    /// This wait holds the lock.
+    Held(File),
+    /// Another wait holds it.
+    Taken,
+    /// The lock file cannot be opened or locked.
+    Unusable,
+}
+
+/// Take the lock only one waiting hook per agent may hold. A lock taken on
+/// a file that was removed meanwhile ([`clear_wait_state`]) does not
+/// count: another wait may already hold the new file at that path, so
+/// this one tries again.
+fn waiter_lock(paths: &Paths, address: &str) -> Lock {
     use std::os::unix::fs::MetadataExt;
     let dir = wait_dir(&paths.data_dir);
-    let path = lock_path(&paths.data_dir, address);
+    let path = state_path(&paths.data_dir, address, "lock");
     let file = std::fs::create_dir_all(&dir).and_then(|()| {
         OpenOptions::new()
             .create(true)
@@ -506,7 +627,7 @@ fn waiter_lock(paths: &Paths, address: &str) -> Option<Option<File>> {
             .open(&path)
     });
     let Ok(file) = file else {
-        return Some(None);
+        return Lock::Unusable;
     };
     match file.try_lock() {
         Ok(()) => {
@@ -514,13 +635,13 @@ fn waiter_lock(paths: &Paths, address: &str) -> Option<Option<File>> {
                 a.dev() == b.dev() && a.ino() == b.ino()
             };
             match (file.metadata(), std::fs::metadata(&path)) {
-                (Ok(held), Ok(now)) if same(&held, &now) => Some(Some(file)),
-                (Ok(_), _) => None,
-                (Err(_), _) => Some(Some(file)),
+                (Ok(held), Ok(now)) if same(&held, &now) => Lock::Held(file),
+                (Ok(_), _) => Lock::Taken,
+                (Err(_), _) => Lock::Held(file),
             }
         }
-        Err(std::fs::TryLockError::WouldBlock) => None,
-        Err(std::fs::TryLockError::Error(_)) => Some(None),
+        Err(std::fs::TryLockError::WouldBlock) => Lock::Taken,
+        Err(std::fs::TryLockError::Error(_)) => Lock::Unusable,
     }
 }
 
@@ -626,24 +747,82 @@ mod tests {
         assert_eq!(HookInput::parse(br#"{"agent_id":"#).agent_id, None);
     }
 
+    fn held(lock: Lock) -> File {
+        match lock {
+            Lock::Held(f) => f,
+            other => panic!("not held: {other:?}"),
+        }
+    }
+
+    fn names_in(data_dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(wait_dir(data_dir))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn clear_wait_state_removes_the_agent_files() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::in_dir(&dir.path().join("data"));
-        write_turn(&paths, "a-1", "wait 1").unwrap();
-        write_turn(&paths, "b-2", "wait 1").unwrap();
-        let lock = waiter_lock(&paths, "a-1").unwrap().unwrap();
+        let path = |a: &str, k: &str| state_path(&paths.data_dir, a, k);
+        write_state(&path("a-1", "turn"), "wait 1").unwrap();
+        write_state(&path("a-1", "woken"), "m1").unwrap();
+        write_state(&path("b-2", "turn"), "wait 1").unwrap();
+        let lock = held(waiter_lock(&paths, "a-1"));
+        // Temporary files a crashed write left behind go too; files of
+        // other agents whose address starts the same way stay.
+        let wd = wait_dir(&paths.data_dir);
+        for name in [
+            "a-1.turn.123-456",
+            "a-1.woken.7-8",
+            "a-10.turn",
+            "a-1.turn-x.turn",
+            "a-1.turn.x-1.turn",
+        ] {
+            std::fs::write(wd.join(name), "").unwrap();
+        }
         clear_wait_state(&paths.data_dir, "a-1");
-        let names: Vec<_> = std::fs::read_dir(wait_dir(&paths.data_dir))
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![OsString::from("b-2.turn")]);
+        assert_eq!(
+            names_in(&paths.data_dir),
+            vec![
+                "a-1.turn-x.turn",
+                "a-1.turn.x-1.turn",
+                "a-10.turn",
+                "b-2.turn"
+            ]
+        );
         // The old holder's lock does not block a new wait, and the new
         // wait's file is a fresh one.
-        let again = waiter_lock(&paths, "a-1").unwrap().unwrap();
+        let again = held(waiter_lock(&paths, "a-1"));
         drop(lock);
-        assert!(waiter_lock(&paths, "a-1").is_none(), "{again:?}");
+        assert!(
+            matches!(waiter_lock(&paths, "a-1"), Lock::Taken),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn unopenable_lock_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(&dir.path().join("data"));
+        // A directory where the lock file should be.
+        std::fs::create_dir_all(state_path(&paths.data_dir, "a-1", "lock")).unwrap();
+        assert!(matches!(waiter_lock(&paths, "a-1"), Lock::Unusable));
+    }
+
+    #[test]
+    fn woken_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(&dir.path().join("data"));
+        assert!(read_woken(&paths.data_dir, "a-1").is_empty());
+        write_state(&state_path(&paths.data_dir, "a-1", "woken"), "m1\nm2").unwrap();
+        let ids = read_woken(&paths.data_dir, "a-1");
+        assert_eq!(ids, ["m1".to_string(), "m2".to_string()].into());
+        write_state(&state_path(&paths.data_dir, "a-1", "woken"), "").unwrap();
+        assert!(read_woken(&paths.data_dir, "a-1").is_empty());
     }
 
     #[test]
@@ -651,15 +830,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::in_dir(&dir.path().join("data"));
         // Opened before the removal, locked after: that lock is stale.
-        let path = lock_path(&paths.data_dir, "a-1");
+        let path = state_path(&paths.data_dir, "a-1", "lock");
         std::fs::create_dir_all(wait_dir(&paths.data_dir)).unwrap();
         std::fs::write(&path, "").unwrap();
         let stale = OpenOptions::new().write(true).open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         stale.try_lock().unwrap();
-        let held = waiter_lock(&paths, "a-1").unwrap().unwrap();
-        assert!(waiter_lock(&paths, "a-1").is_none());
-        drop(held);
+        let lock = held(waiter_lock(&paths, "a-1"));
+        assert!(matches!(waiter_lock(&paths, "a-1"), Lock::Taken));
+        drop(lock);
     }
 
     #[test]
@@ -687,17 +866,14 @@ mod tests {
     fn turn_marker_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::in_dir(&dir.path().join("data"));
-        assert_eq!(read_turn(&paths, "a-1"), None);
-        write_turn(&paths, "a-1", "wait 1").unwrap();
-        assert_eq!(read_turn(&paths, "a-1").as_deref(), Some("wait 1"));
-        write_turn(&paths, "a-1", "busy 2").unwrap();
-        assert_eq!(read_turn(&paths, "a-1").as_deref(), Some("busy 2"));
+        let turn = state_path(&paths.data_dir, "a-1", "turn");
+        assert_eq!(read_state(&turn), None);
+        write_state(&turn, "wait 1").unwrap();
+        assert_eq!(read_state(&turn).as_deref(), Some("wait 1"));
+        write_state(&turn, "busy 2").unwrap();
+        assert_eq!(read_state(&turn).as_deref(), Some("busy 2"));
         // No temporary files are left behind.
-        let names: Vec<_> = std::fs::read_dir(paths.data_dir.join("hook-wait"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![OsString::from("a-1.turn")]);
+        assert_eq!(names_in(&paths.data_dir), vec!["a-1.turn"]);
     }
 
     #[test]

@@ -618,7 +618,7 @@ pub async fn main() -> ExitCode {
         // A hook must never fail its harness: Claude Code reads exit 2 as
         // "block", kiro reads 1 as "continue the turn". A hook this binary
         // does not know (a newer config, an older binary) stays silent.
-        Err(e) if e.use_stderr() && is_hook(std::env::args_os().nth(1)) => {
+        Err(e) if e.use_stderr() && is_hook(std::env::args_os().skip(1)) => {
             let _ = e.print();
             return ExitCode::SUCCESS;
         }
@@ -634,9 +634,41 @@ pub async fn main() -> ExitCode {
     }
 }
 
-/// Whether the first argument names the `hook` subcommand.
-fn is_hook(first: Option<std::ffi::OsString>) -> bool {
-    first.is_some_and(|a| a == "hook")
+/// Whether the command line (without the program name) runs the `hook`
+/// subcommand: its first positional argument, after any global options
+/// (`--json`, `--as WHO`) and before a `--`, is `hook`.
+fn is_hook(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    // Global options that take their value as the next argument.
+    let takes_value = |flag: &str| {
+        cmd.get_arguments().any(|a| {
+            a.get_action().takes_values()
+                && (flag
+                    .strip_prefix("--")
+                    .is_some_and(|l| a.get_long() == Some(l))
+                    || (flag.len() == 2
+                        && flag.starts_with('-')
+                        && flag.chars().nth(1) == a.get_short()))
+        })
+    };
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let Some(a) = arg.to_str() else {
+            return false;
+        };
+        if a == "--" {
+            return false;
+        }
+        if a.starts_with('-') && a != "-" {
+            if !a.contains('=') && takes_value(a) {
+                args.next();
+            }
+            continue;
+        }
+        return a == "hook";
+    }
+    false
 }
 
 /// Longest hook payload read from stdin, in bytes. Claude Code's tool
@@ -1414,6 +1446,20 @@ async fn daemon(paths: &Paths, action: DaemonAction, json: bool) -> Result<ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_hook_finds_the_subcommand_after_global_options() {
+        let hook = |args: &[&str]| is_hook(args.iter().map(std::ffi::OsString::from));
+        assert!(hook(&["hook", "no-such-event"]));
+        assert!(hook(&["--json", "hook", "no-such-event"]));
+        assert!(hook(&["--as", "human", "hook", "x"]));
+        assert!(hook(&["--as=human", "--json", "hook"]));
+        assert!(!hook(&["send", "hook"]));
+        assert!(!hook(&["--as", "hook", "send"]));
+        assert!(!hook(&["--", "hook"]));
+        assert!(!hook(&["--json"]));
+        assert!(!hook(&[]));
+    }
 
     #[test]
     fn no_session_cause_names_what_happened() {

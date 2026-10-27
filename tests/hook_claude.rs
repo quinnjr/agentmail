@@ -853,3 +853,214 @@ async fn wait_exits_when_its_harness_exits() {
     // A wait whose harness is gone cleans up after itself.
     assert_eq!(wait_files(&d.paths), Vec::<String>::new());
 }
+
+#[tokio::test]
+async fn wait_ends_when_its_process_is_registered_as_another_agent() {
+    // The harness process was registered as `a`, then as `b`: the wait for
+    // `a` must neither wake for `a`'s mail with `b`'s reminder nor for `b`'s
+    // mail. It ends silently.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    let b = register_here(&d, "frontend", true).await;
+    assert_ne!(a, b);
+    send(&d, &a, "for a", "x", false).await;
+    send(&d, &b, "for b", "y", false).await;
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
+}
+
+#[tokio::test]
+async fn plain_stops_wake_once_for_mail_left_unread() {
+    // Mail the agent was woken for and chose to leave unread does not wake
+    // it again after every human turn; new mail still does.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "fyi", "no action needed", false).await;
+    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    // A human turn, then a plain stop with the same mail still unread.
+    run(&env, HookEvent::Prompt, "prompt").await;
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await, "woke again for the same mail");
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    assert!(out.stderr.contains("2 unread"), "{out:?}");
+}
+
+#[test]
+fn cli_hook_unknown_event_after_a_global_flag_is_silent() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    for args in [
+        &[
+            "--json",
+            "hook",
+            "no-such-event",
+            "--harness",
+            "claude-code",
+        ][..],
+        &["--as", "human", "hook", "no-such-event"][..],
+    ] {
+        let out = cli(&paths, args, "stop");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+    }
+    // Not a hook: a usage error still fails.
+    let out = cli(&paths, &["--json", "no-such-command"], "stop");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harness_exit_between_waits_leaves_no_files() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let d = TestDaemon::start().await;
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks/claude-code");
+    // A stand-in harness that starts a wait, then (on the next line) runs
+    // a prompt hook, which ends the wait, and says so once the wait exited.
+    // It is then closed mid-turn, with no wait running.
+    let script = r#"
+        read go
+        "$0" hook wait --harness claude-code < "$1/stop.json" > /dev/null 2>&1 &
+        read go
+        "$0" hook prompt --harness claude-code < "$1/prompt.json" > /dev/null 2>&1
+        wait
+        echo done
+        read go
+    "#;
+    let mut harness = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(BIN)
+        .arg(&fixtures)
+        .env("AGENTMAIL_DATA_DIR", &d.paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &d.paths.socket)
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("CLAUDE_PID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let harness_id = procinfo::proc_id(harness.id()).unwrap();
+    let mut c = d.client().await;
+    c.call(
+        &Caller::Human,
+        Request::Register {
+            name: "backend".into(),
+            role: None,
+            working_on: None,
+            harness: Harness::ClaudeCode,
+            cwd: d.dir.path().to_path_buf(),
+            proc_id: Some(harness_id),
+            fresh: true,
+            wake: true,
+            session: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut stdin = harness.stdin.take().unwrap();
+    stdin.write_all(b"go\n").unwrap();
+    let started = Instant::now();
+    while wait_files(&d.paths).is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(10), "no wait ran");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stdin.write_all(b"go\n").unwrap();
+    let stdout = harness.stdout.take().unwrap();
+    let line = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        line
+    });
+    let line = tokio::time::timeout(Duration::from_secs(10), line)
+        .await
+        .expect("the wait did not end")
+        .unwrap();
+    assert_eq!(line.trim(), "done");
+    assert!(!wait_files(&d.paths).is_empty(), "kept for the next wait");
+    harness.kill().unwrap();
+    harness.wait().unwrap();
+    // The daemon finds the agent gone (here, listing agents) and removes
+    // its files.
+    c.call(
+        &Caller::Human,
+        Request::Agents {
+            name_prefix: None,
+            repo: None,
+            all: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn wait_outlasts_a_slow_takeover() {
+    // The wait it replaces may take a while to let go of the lock (a
+    // status call, then a tick). While its claim on the turn stands, the
+    // new wait keeps trying instead of giving up, so the idle agent is
+    // still woken for mail.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let dir = d.paths.data_dir.join("hook-wait");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stuck = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{a}.lock")))
+        .unwrap();
+    stuck.try_lock().unwrap();
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 5.5).await, "gave up on the lock");
+    drop(stuck);
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_for_the_lock_ends_when_the_session_is_busy() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let dir = d.paths.data_dir.join("hook-wait");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stuck = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{a}.lock")))
+        .unwrap();
+    stuck.try_lock().unwrap();
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    run(&env, HookEvent::Prompt, "prompt").await;
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
+    drop(stuck);
+}
+
+#[tokio::test]
+async fn unusable_wait_lock_skips() {
+    // Two waits must never both run: without a usable lock, none does.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    std::fs::create_dir_all(d.paths.data_dir.join(format!("hook-wait/{a}.lock"))).unwrap();
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    assert!(silent(&out), "{out:?}");
+}
