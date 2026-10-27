@@ -104,9 +104,10 @@ async function status(sessionID, surfaceUrgent) {
  * killed when `signal` aborts. `from` says which unread mail does not
  * count as news: `continued`, all there is now (only mail that arrives
  * from now on counts); `afterWake`, the mail agentmail last woke the
- * session for (the turn that just ended was started by a wake, or did not
- * succeed); `known`, exactly these ids (the unread mail when the plugin
- * queued open questions as a turn, or the `known` ids of the timed-out
+ * session for (the turn that just ended was started by a wake);
+ * `known`, exactly these ids (the unread mail when the plugin queued open
+ * questions as a turn, the unread mail when a turn was interrupted or
+ * failed, or the `known` ids of the timed-out
  * wait before this one, so mail that came between counts); none of them,
  * mail already woken for (a plain end of turn). The result is agentmail's
  * answer (`{mail}`, `{busy}`, `{skip}`, `{gone}`), or null when it failed
@@ -170,8 +171,10 @@ function unreadIds(st) {
 }
 
 /**
- * What a turn the plugin queued with `st` (a status from just before)
- * leaves as already there for the wait after it: the unread mail then.
+ * The unread mail in `st` as already there for a wait: what a turn the
+ * plugin queued with `st` (a status from just before) leaves for the wait
+ * after it, and what an interrupted or failed turn leaves (`st` from its
+ * end). Without listed ids, all mail there now (only new mail counts).
  */
 function before(st) {
   const known = unreadIds(st);
@@ -441,9 +444,18 @@ async function setup(ctx) {
     // Urgent mail that never reached the agent, and open questions, are
     // queued as the next turn; questions once: not after the turn they
     // started.
+    // A turn that did not succeed (the human interrupted it, or it
+    // failed) queues nothing, and its waiter counts all mail unread now as
+    // already there: mail waiting at the stop must not start a turn the
+    // human just stopped, nor one more failing turn. Urgent text and a
+    // dropped wake stay pending for the next turn.
+    if (!succeeded) {
+      if (st.wake === true) runWaiter(sessionID, before(st));
+      return;
+    }
     let questionsFailed = false;
     const questions = st.text?.questions;
-    const ask = succeeded && !started && typeof questions === "string" && questions;
+    const ask = !started && typeof questions === "string" && questions;
     const urgent = urgentPending.get(sessionID);
     const parts = [urgent, ask && questions].filter(Boolean);
     if (parts.length) {
@@ -471,16 +483,16 @@ async function setup(ctx) {
     if (st.wake !== true) return;
     // Which unread mail the wait counts as already there. After a turn of
     // the open questions: the mail unread when they were queued. After a
-    // wake (or urgent mail) this plugin queued, or a turn that did not
-    // succeed: the mail agentmail last woke the session for, so mail that
-    // came during the turn (after its last tool call) still wakes it. When
+    // wake (or urgent mail) this plugin queued: the mail agentmail last
+    // woke the session for, so mail that came during the turn (after its
+    // last tool call) still wakes it. When
     // the questions could not be queued: the mail unread now (they would
     // otherwise hold the wait as a continuation). Else (a human's turn):
     // unread mail not yet woken for wakes the session at once.
     let from = {};
     if (started?.known) from = { known: started.known };
     else if (questionsFailed) from = before(st);
-    else if (started || !succeeded) from = { afterWake: true };
+    else if (started) from = { afterWake: true };
     runWaiter(sessionID, from);
   }
 

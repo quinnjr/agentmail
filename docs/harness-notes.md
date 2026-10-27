@@ -705,7 +705,8 @@ How the plugin (`plugin/agentmail.js`) behaves, built on that:
   will not report that mail as urgent again. A failed tool call (status
   `error`) has no result to append to: its urgent text is kept by the
   plugin and pushed after the next tool call, or, if the turn ends first,
-  queued at its end (`resume: true`, with any open questions).
+  queued at its end (`resume: true`, with any open questions) when that
+  turn succeeded.
 - At the end of a successful turn, open questions are queued as the next
   turn (`queue`, `resume: true`), unless that turn was itself one the
   plugin started (a wake or the questions): like Claude Code's
@@ -730,9 +731,19 @@ How the plugin (`plugin/agentmail.js`) behaves, built on that:
   - a human's turn that succeeded: `{"stop_hook_active": false}`, as
     Claude Code's plain Stop; unread mail not yet woken for wakes the
     session at once, and open questions answer `{"busy":true}`;
+  - a turn that failed or was interrupted (the human pressed Esc):
+    nothing is queued (no urgent text, dropped wake or open questions;
+    they stay pending for the next successful turn's end), and the wait
+    gets `{"stop_hook_active": false, "known": [<ids>]}` with the unread
+    mail at that moment (`{"stop_hook_active": true}` when the status
+    lists no ids). Mail that was waiting when the human stopped the agent
+    does not restart it a second later, and a failed turn does not queue
+    another turn, likely to fail too, for old mail; only mail that comes
+    after wakes it. Claude Code runs no Stop hook on a user interrupt, so
+    there no wait follows at all;
   - a turn the plugin queued for a wake (or for a dropped wake's
-    reminder, or urgent mail), or any turn that failed or was
-    interrupted: `{"stop_hook_active": false, "after_wake": true}`. The
+    reminder, or urgent mail) that succeeded: `{"stop_hook_active":
+    false, "after_wake": true}`. The
     mail agentmail last woke the session for (its `woken` file) is
     already there; anything else wakes it, so mail that came during the
     turn, after its last tool call, is not lost. This is what a woken

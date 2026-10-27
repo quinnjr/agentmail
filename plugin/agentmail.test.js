@@ -804,7 +804,7 @@ test("questions_turn_waits_for_mail_that_came_during_it", async () => {
   expect(ctx.synthetic).toHaveLength(1);
 });
 
-test("waiter_after_a_failed_or_interrupted_turn_counts_mail_since_the_last_wake", async () => {
+test("waiter_after_a_failed_or_interrupted_turn_counts_only_new_mail", async () => {
   const { ctx } = await start();
   setStatus("ses_a", registered({ unread: 1, unread_ids: ["m1"], text: { questions: "❓ q" } }));
   for (const [type, extra] of [
@@ -815,11 +815,49 @@ test("waiter_after_a_failed_or_interrupted_turn_counts_mail_since_the_last_wake"
     ctx.emit("session.execution.started", { sessionID: "ses_a" });
     ctx.emit(type, { sessionID: "ses_a", ...extra });
     await until(() => waits("ses_a").length === n + 1);
-    // Not the questions (the turn did not succeed), and the wait counts
-    // mail that came during the turn.
-    expect(JSON.parse(waits("ses_a")[n].stdin)).toEqual({ stop_hook_active: false, after_wake: true });
+    // Not the questions (the turn did not succeed), and the mail unread
+    // at the stop is already there: only mail that comes after counts.
+    expect(JSON.parse(waits("ses_a")[n].stdin)).toEqual({ stop_hook_active: false, known: ["m1"] });
   }
+  // Without listed ids: all mail there now.
+  setStatus("ses_a", registered({ unread: 1, unread_ids: undefined }));
+  const n = waits("ses_a").length;
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.interrupted", { sessionID: "ses_a", reason: "user" });
+  await until(() => waits("ses_a").length === n + 1);
+  expect(JSON.parse(waits("ses_a")[n].stdin)).toEqual({ stop_hook_active: true });
   expect(ctx.synthetic).toEqual([]);
+});
+
+test("unread_mail_at_an_interrupt_queues_no_turn", async () => {
+  let fail = true;
+  const { ctx } = await start({
+    synthetic: () => {
+      if (fail) throw new Error("no");
+    },
+  });
+  // A plugin-started turn the human interrupts, with unread mail it was
+  // only reminded of, urgent text pending (steer failed after a failed
+  // tool call) and open questions: nothing is queued as a new turn.
+  setStatus("ses_a", registered({ unread: 2, unread_ids: ["m1", "m2"], urgent: [{ id: "m2" }], text: { urgent: "🚨 prod" } }));
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  await ctx.hooks["execute.after"]({ tool: "shell", sessionID: "ses_a", status: "error", error: new Error("x") });
+  fail = false;
+  setStatus(
+    "ses_a",
+    registered({ unread: 2, unread_ids: ["m1", "m2"], text: { reminder: "📬 2 unread", questions: "❓ q" } }),
+  );
+  ctx.emit("session.execution.interrupted", { sessionID: "ses_a", reason: "user" });
+  await until(() => waits("ses_a").length === 1);
+  expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: false, known: ["m1", "m2"] });
+  await Bun.sleep(200);
+  expect(ctx.synthetic).toEqual([]);
+  // The urgent text waits for the human's next turn, and is queued at its end.
+  ctx.emit("session.inbox.enqueued", { sessionID: "ses_a", item: { type: "user" } });
+  ctx.emit("session.execution.started", { sessionID: "ses_a" });
+  ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
+  await until(() => ctx.synthetic.length === 1);
+  expect(ctx.synthetic[0].text).toBe("🚨 prod\n\n❓ q");
 });
 
 test("waiter_after_queued_urgent_mail_counts_mail_since_the_last_wake", async () => {
