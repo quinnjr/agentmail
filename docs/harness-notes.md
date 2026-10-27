@@ -181,3 +181,100 @@ model credentials that an isolated config does not have).
 - **Resolution order** in the CLI: `--as human`, `AGENTMAIL_ADDRESS`,
   `AGENTMAIL_HUMAN=1`, `OPENCODE_SESSION_ID` (checked as above), then
   process ancestry.
+
+## Claude Code hooks (Task 4)
+
+Checked live against Claude Code 2.1.311 (the newest binary under
+`~/.local/share/claude/versions/`), interactive in a detached tmux pane and
+with `-p`, in a throwaway `CLAUDE_CONFIG_DIR` and `HOME` (only the login
+copied in, removed afterwards), with `--model haiku`. The schema details
+come from the binary's bundled settings schema.
+
+- **Waking an idle session: `asyncRewake` works, so the fallback (a
+  synchronous Stop hook holding the turn open for up to 540 s) is not
+  used.** The key is a boolean on a command hook: `{"type": "command",
+  "command": "...", "asyncRewake": true, "timeout": N}` ("runs in
+  background and wakes the model on exit code 2 (blocking error). Implies
+  async."). Observed: on a Stop hook, after the turn ended and the prompt
+  sat idle, the hook exited 2 25 s later and Claude Code started a new turn
+  by itself. The model sees a user turn carrying
+  `<task-notification><summary>Stop hook feedback</summary>` and a
+  system reminder `Stop hook blocking error from command "Stop": <stderr>`;
+  the terminal shows "Stop hook feedback". The Stop hook of that woken turn
+  gets `"stop_hook_active": true`. The `rewakeMessage`/`rewakeSummary` keys
+  exist but are marked `@internal`; agentmail does not use them.
+- **`claude -p` runs `asyncRewake` hooks synchronously** (the binary gates
+  backgrounding on an interactive session or streaming input). Observed: a
+  `-p` run waited the hook's 12 s out, then took a second turn for its exit
+  2. So `agentmail hook wait` does nothing unless `CLAUDE_CODE_ENTRYPOINT`
+  is unset or `cli` (the interactive UI; `-p` sets `sdk-cli`): waiting
+  would hold every headless run open until mail came.
+- **Timeouts.** `timeout` is in seconds, any positive number; the schema
+  sets no maximum. It applies to `asyncRewake` hooks too: with `timeout: 5`
+  a rewake hook sleeping 15 s was killed and never woke the session. A hook
+  with no `timeout` on `UserPromptSubmit` was killed after about 30 s
+  (both interactive and `-p`), and the prompt went ahead. agentmail sets
+  `timeout` on every hook: 10 for the quick ones, 86400 (a day) for the
+  wait hook, observed to be accepted and to stay alive past the shorter
+  waits. Node timers overflow above 2^31-1 ms (about 24.8 days), so
+  larger values must not be used. When the wait hook times out, the next
+  Stop starts a new one.
+- **Hook processes are descendants of the `claude` process**: hook command
+  -> `sh` -> `claude`, for SessionStart, UserPromptSubmit, PostToolUse and
+  Stop alike (spawned detached, in their own session, but the parent stays
+  `claude`). So `Caller::Procs` (ancestry) finds the agent bound to the
+  Claude Code process. Hooks also get `CLAUDE_PID` (that process),
+  `CLAUDE_CODE_SESSION_ID` (= the payload's `session_id`),
+  `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_PROJECT_DIR`. A `claude` started
+  through the versioned binary path directly has command name `2.1.311`,
+  not `claude`; through the usual `~/.local/bin/claude` symlink it is
+  `claude`. The hooks cut their ancestry at `CLAUDE_PID` (else at the
+  nearest process with a harness name), so a Claude Code started from a
+  registered agent's shell never acts as that outer agent. The e2e script
+  should run Claude Code through a symlink named `claude`, so that the
+  CLI's own harness detection (by command name) sees it.
+- **Payloads** (stdin) are recorded in `tests/fixtures/hooks/claude-code/`
+  (paths anonymised): `session-start.json` (`source`, `model`),
+  `prompt.json` (`prompt`), `post-tool.json` (`tool_name`, `tool_input`,
+  `tool_response`, `tool_use_id`, `duration_ms`), `stop.json` and
+  `stop-active.json` (`stop_hook_active`, `last_assistant_message`). All
+  carry `session_id`, `transcript_path`, `cwd` and `hook_event_name`.
+- **End to end with agentmail itself** (debug build, private data dir):
+  hooks installed as below, the agent registered with `register --pid
+  <claude pid>`, the session left idle; `agentmail --as human send` woke it
+  within seconds with the reminder. The woken model did not read its mail
+  and stopped again; the next wait hook (`stop_hook_active: true`) kept
+  waiting instead of waking it again for the same mail. After `/exit` no
+  wait hook was left running.
+
+Hook configuration (`settings.json`), as Task 5 installs it:
+
+```json
+{"hooks": {
+  "SessionStart":     [{"hooks": [{"type": "command", "command": "<bin> hook session-start --harness claude-code", "timeout": 10}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<bin> hook prompt --harness claude-code", "timeout": 10}]}],
+  "PostToolUse":      [{"matcher": "*", "hooks": [{"type": "command", "command": "<bin> hook post-tool --harness claude-code", "timeout": 10}]}],
+  "Stop":             [{"hooks": [
+    {"type": "command", "command": "<bin> hook stop --harness claude-code", "timeout": 10},
+    {"type": "command", "command": "<bin> hook wait --harness claude-code", "asyncRewake": true, "timeout": 86400}
+  ]}]
+}}
+```
+
+How `agentmail hook wait` behaves under it:
+
+- It waits only for an agent registered with `wake`, and only one per
+  agent at a time (a lock under `<data dir>/hook-wait/`): every Stop starts
+  one, and two would wake the agent twice for the same mail. A later one
+  exits 0 at once while the first still waits.
+- On a plain stop, unread mail already there wakes at once, unless the
+  agent also has open questions (the Stop hook's `decision: block` handles
+  those). After a wake or block (`stop_hook_active: true`) only mail that
+  arrives from then on counts, so mail the agent leaves unread cannot wake
+  it in a loop. Mail read as soon as it arrives does not count.
+- It exits 0 when the agent signs off, when the daemon stops, or when a
+  process it runs under (Claude Code) exits; it checks the processes every
+  2 s and otherwise sleeps on the daemon's event stream (no polling of
+  mail).
+- A `hook` command line this binary cannot parse (a newer config, an older
+  binary) prints the usage error and exits 0, so it never blocks a stop.

@@ -1,0 +1,636 @@
+//! Harness Task 4: `agentmail hook` with Claude Code's events.
+//!
+//! The hooks resolve their agent by process ancestry, like a hook command
+//! Claude Code runs. Each test registers its agent bound to this test
+//! process's parent, which is in the ancestry of `hook::run` (called in
+//! process) and of a spawned `agentmail hook`. Every test has its own
+//! daemon, so the shared parent never names two agents.
+
+mod common;
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use agentmail::hook::{self, HookEvent, HookOutput};
+use agentmail::model::{Harness, ProcId};
+use agentmail::paths::Paths;
+use agentmail::procinfo;
+use agentmail::protocol::{Caller, Request};
+use common::{TestDaemon, agent, send_req};
+use serde_json::Value;
+use tempfile::TempDir;
+
+fn fixture(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hooks/claude-code")
+        .join(format!("{name}.json"));
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The environment a hook sees: this daemon's paths, plus `extra`.
+#[derive(Clone)]
+struct Env(HashMap<String, OsString>);
+
+impl Env {
+    fn of(paths: &Paths) -> Env {
+        let mut m = HashMap::new();
+        m.insert("AGENTMAIL_DATA_DIR".into(), paths.data_dir.clone().into());
+        m.insert("AGENTMAIL_SOCKET".into(), paths.socket.clone().into());
+        Env(m)
+    }
+
+    fn with(mut self, k: &str, v: &str) -> Env {
+        self.0.insert(k.into(), v.into());
+        self
+    }
+
+    fn get(&self, k: &str) -> Option<OsString> {
+        self.0.get(k).cloned()
+    }
+}
+
+async fn run(env: &Env, event: HookEvent, payload: &str) -> HookOutput {
+    hook::run(Harness::ClaudeCode, event, &fixture(payload), &|k| {
+        env.get(k)
+    })
+    .await
+}
+
+/// Run a hook on its own task, so the test can act while it waits.
+fn spawn(env: &Env, event: HookEvent, payload: &str) -> tokio::task::JoinHandle<HookOutput> {
+    let env = env.clone();
+    let stdin = fixture(payload);
+    tokio::spawn(
+        async move { hook::run(Harness::ClaudeCode, event, &stdin, &|k| env.get(k)).await },
+    )
+}
+
+fn parent() -> ProcId {
+    procinfo::ancestors(std::process::id())[0]
+}
+
+/// Register `name` bound to this test process's parent (the "harness").
+async fn register_here(d: &TestDaemon, name: &str, wake: bool) -> String {
+    let mut c = d.client().await;
+    let data = c
+        .call(
+            &Caller::Human,
+            Request::Register {
+                name: name.into(),
+                role: None,
+                working_on: None,
+                harness: Harness::ClaudeCode,
+                cwd: d.dir.path().to_path_buf(),
+                proc_id: Some(parent()),
+                fresh: true,
+                wake,
+                session: None,
+            },
+        )
+        .await
+        .unwrap();
+    data["address"].as_str().unwrap().to_string()
+}
+
+async fn send(d: &TestDaemon, to: &str, subject: &str, body: &str, urgent: bool) {
+    let mut c = d.client().await;
+    let mut req = send_req(&[to], subject, body);
+    if let Request::Send { urgent: u, .. } = &mut req {
+        *u = urgent;
+    }
+    c.call(&Caller::Human, req).await.unwrap();
+}
+
+async fn ask(d: &TestDaemon, to: &str, subject: &str) -> String {
+    let mut c = d.client().await;
+    let data = c
+        .call(
+            &Caller::Human,
+            Request::Ask {
+                to: vec![to.into()],
+                subject: subject.into(),
+                body: "which fields?".into(),
+                refs: Vec::new(),
+                urgent: false,
+                timeout_secs: 0,
+            },
+        )
+        .await
+        .unwrap();
+    data["question_id"].as_str().unwrap().to_string()
+}
+
+fn silent(out: &HookOutput) -> bool {
+    out.stdout.is_empty() && out.stderr.is_empty() && out.exit == 0
+}
+
+fn context(out: &HookOutput, event_name: &str) -> String {
+    assert_eq!(out.exit, 0, "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let v: Value = serde_json::from_str(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    let hso = &v["hookSpecificOutput"];
+    assert_eq!(hso["hookEventName"], event_name, "{v}");
+    assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
+    hso["additionalContext"].as_str().unwrap().to_string()
+}
+
+const ALL_EVENTS: [(HookEvent, &str); 5] = [
+    (HookEvent::SessionStart, "session-start"),
+    (HookEvent::Prompt, "prompt"),
+    (HookEvent::PostTool, "post-tool"),
+    (HookEvent::Stop, "stop"),
+    (HookEvent::Wait, "stop"),
+];
+
+/// Whether `handle` is still running after `secs`.
+async fn still_waiting<T>(handle: &tokio::task::JoinHandle<T>, secs: f64) -> bool {
+    tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+    !handle.is_finished()
+}
+
+async fn finish(handle: tokio::task::JoinHandle<HookOutput>) -> HookOutput {
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("hook did not finish")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn unregistered_is_silent() {
+    let d = TestDaemon::start().await;
+    let env = Env::of(&d.paths);
+    // Mail for someone else changes nothing.
+    let other = common::register(&mut d.client().await, "other", d.dir.path()).await;
+    send(&d, &other, "hi", "x", true).await;
+    for (event, payload) in ALL_EVENTS {
+        let out = run(&env, event, payload).await;
+        assert!(silent(&out), "{event:?}: {out:?}");
+    }
+}
+
+#[tokio::test]
+async fn human_is_silent() {
+    let d = TestDaemon::start().await;
+    register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths).with("AGENTMAIL_HUMAN", "1");
+    for (event, payload) in ALL_EVENTS {
+        let out = run(&env, event, payload).await;
+        assert!(silent(&out), "{event:?}: {out:?}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_down_is_silent_and_spawns_nothing() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let env = Env::of(&paths).with("AGENTMAIL_BIN", "/nonexistent/agentmail");
+    for (event, payload) in ALL_EVENTS {
+        let started = Instant::now();
+        let out = run(&env, event, payload).await;
+        assert!(silent(&out), "{event:?}: {out:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{event:?}");
+    }
+    assert!(!paths.socket.exists(), "a daemon socket appeared");
+    assert!(!paths.lock.exists(), "a daemon lock appeared");
+    assert!(!paths.db.exists(), "a database appeared");
+}
+
+#[tokio::test]
+async fn bad_paths_are_silent() {
+    // A relative override cannot be honoured: still no output.
+    let env = Env(HashMap::new()).with("AGENTMAIL_DATA_DIR", "relative/dir");
+    let out = run(&env, HookEvent::PostTool, "post-tool").await;
+    assert!(silent(&out), "{out:?}");
+}
+
+#[tokio::test]
+async fn session_start_and_prompt_carry_guidance() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+
+    let ctx = context(
+        &run(&env, HookEvent::SessionStart, "session-start").await,
+        "SessionStart",
+    );
+    assert!(ctx.contains(&a), "{ctx}");
+    assert!(ctx.contains("inbox"), "{ctx}");
+    assert!(!ctx.contains("unread"), "no mail yet: {ctx}");
+
+    send(&d, &a, "schema", "see the PR", false).await;
+    let ctx = context(
+        &run(&env, HookEvent::Prompt, "prompt").await,
+        "UserPromptSubmit",
+    );
+    assert!(ctx.contains(&a), "{ctx}");
+    assert!(ctx.contains("1 unread"), "{ctx}");
+}
+
+#[tokio::test]
+async fn post_tool_reminder_json_shape() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+
+    // Nothing to say: no output at all.
+    let out = run(&env, HookEvent::PostTool, "post-tool").await;
+    assert!(silent(&out), "{out:?}");
+
+    send(&d, &a, "schema", "see the PR", false).await;
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let ctx = context(
+        &run(&env, HookEvent::PostTool, "post-tool").await,
+        "PostToolUse",
+    );
+    assert!(ctx.contains(&format!("you are {a}")), "{ctx}");
+    assert!(ctx.contains("3 unread"), "{ctx}");
+    assert!(
+        ctx.contains("1 question from human: \"POST /orders body?\""),
+        "{ctx}"
+    );
+    assert!(!ctx.contains(&q), "the reminder names, not lists: {ctx}");
+}
+
+#[tokio::test]
+async fn post_tool_urgent_once() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "STOP", "the schema changed: do not migrate", true).await;
+
+    let first = context(
+        &run(&env, HookEvent::PostTool, "post-tool").await,
+        "PostToolUse",
+    );
+    assert!(
+        first.contains("the schema changed: do not migrate"),
+        "{first}"
+    );
+    assert!(first.contains("urgent"), "{first}");
+
+    // Surfaced once; afterwards only the plain reminder (it is still unread).
+    let second = context(
+        &run(&env, HookEvent::PostTool, "post-tool").await,
+        "PostToolUse",
+    );
+    assert!(!second.contains("do not migrate"), "{second}");
+    assert!(second.contains("1 unread"), "{second}");
+}
+
+#[tokio::test]
+async fn urgent_body_is_capped() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let body = "é".repeat(10_000);
+    send(&d, &a, "big", &body, true).await;
+    let ctx = context(
+        &run(&env, HookEvent::PostTool, "post-tool").await,
+        "PostToolUse",
+    );
+    assert!(ctx.contains("(truncated; read "), "{}", &ctx[..200]);
+    assert!(ctx.len() < 4096 + 1024, "{}", ctx.len());
+}
+
+#[tokio::test]
+async fn stop_blocks_on_open_question() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+
+    // No question: Claude may stop.
+    send(&d, &a, "note", "fyi", false).await;
+    let out = run(&env, HookEvent::Stop, "stop").await;
+    assert!(silent(&out), "{out:?}");
+
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let out = run(&env, HookEvent::Stop, "stop").await;
+    assert_eq!(out.exit, 0, "{out:?}");
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["decision"], "block", "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains(&q), "{reason}");
+    assert!(reason.contains("POST /orders body?"), "{reason}");
+}
+
+#[tokio::test]
+async fn stop_respects_stop_hook_active() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    ask(&d, &a, "POST /orders body?").await;
+    let out = run(&env, HookEvent::Stop, "stop-active").await;
+    assert!(silent(&out), "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_exits_2_on_mail() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await, "returned with no mail");
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(out.stderr.contains(&a), "{out:?}");
+    assert!(out.stderr.contains("1 unread"), "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_wakes_at_once_for_unread_mail() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_after_a_wake_waits_for_new_mail() {
+    // Woken (stop_hook_active) and still not reading its mail: waking it
+    // again for the same mail would loop. Only new mail counts.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "schema", "see the PR", false).await;
+    let h = spawn(&env, HookEvent::Wait, "stop-active");
+    assert!(still_waiting(&h, 0.5).await, "woke for old mail");
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    assert!(out.stderr.contains("2 unread"), "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_leaves_open_questions_to_the_stop_hook() {
+    // The Stop hook already blocks for an open question; waking as well
+    // would run a second turn for it.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    ask(&d, &a, "POST /orders body?").await;
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await, "woke for the open question");
+    h.abort();
+}
+
+#[tokio::test]
+async fn wait_ignores_mail_already_read() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let mut c = d.client().await;
+    let sent = c
+        .call(&Caller::Human, send_req(&[&a], "x", "y"))
+        .await
+        .unwrap();
+    let id = sent["id"].as_str().unwrap().to_string();
+    c.call(&agent(&a), Request::Read { id }).await.unwrap();
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await, "woke for read mail");
+    h.abort();
+}
+
+#[tokio::test]
+async fn wait_exits_0_on_signoff() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    d.client()
+        .await
+        .call(&agent(&a), Request::Signoff)
+        .await
+        .unwrap();
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_exits_0_when_daemon_stops() {
+    let mut d = TestDaemon::start().await;
+    register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    d.shutdown().await;
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_respects_no_wake() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", false).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "schema", "see the PR", false).await;
+    let started = Instant::now();
+    let out = run(&env, HookEvent::Wait, "stop").await;
+    assert!(silent(&out), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn wait_skips_headless_claude() {
+    // `claude -p` runs async hooks synchronously: waiting would hold the
+    // run open until mail came.
+    let d = TestDaemon::start().await;
+    register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths).with("CLAUDE_CODE_ENTRYPOINT", "sdk-cli");
+    let started = Instant::now();
+    let out = run(&env, HookEvent::Wait, "stop").await;
+    assert!(silent(&out), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn one_waiter_per_agent() {
+    // Every Stop starts a wait hook; a second one while the first still
+    // waits must not wake the agent twice for the same mail.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths).with("CLAUDE_CODE_ENTRYPOINT", "cli");
+    let first = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&first, 0.5).await);
+    let second = finish(spawn(&env, HookEvent::Wait, "stop")).await;
+    assert!(silent(&second), "{second:?}");
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(first).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
+async fn hook_latency_under_20ms() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    send(&d, &a, "schema", "see the PR", false).await;
+    let env = Env::of(&d.paths);
+    // Warm up.
+    run(&env, HookEvent::PostTool, "post-tool").await;
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let out = run(&env, HookEvent::PostTool, "post-tool").await;
+        times.push(started.elapsed());
+        assert!(!out.stdout.is_empty());
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    assert!(median < Duration::from_millis(20), "median {median:?}");
+}
+
+// Through the binary.
+
+const BIN: &str = env!("CARGO_BIN_EXE_agentmail");
+
+fn cli(paths: &Paths, args: &[&str], payload: &str) -> std::process::Output {
+    assert_cmd::Command::new(BIN)
+        .args(args)
+        .env("AGENTMAIL_DATA_DIR", &paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &paths.socket)
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("OPENCODE_SESSION_ID")
+        .env_remove("KIRO_SESSION_ID")
+        .env_remove("CLAUDE_PID")
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .write_stdin(fixture(payload))
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap()
+}
+
+// The daemon runs in this process: the blocking CLI call needs another
+// worker thread to serve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_hook_post_tool_and_wait() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    send(&d, &a, "schema", "see the PR", false).await;
+
+    let out = cli(
+        &d.paths,
+        &["hook", "post-tool", "--harness", "claude-code"],
+        "post-tool",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains(&a), "{ctx}");
+
+    let out = cli(
+        &d.paths,
+        &["hook", "wait", "--harness", "claude-code"],
+        "stop",
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 unread"));
+}
+
+#[test]
+fn cli_hook_daemon_down_is_silent() {
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    for event in ["session-start", "prompt", "post-tool", "stop", "wait"] {
+        let payload = match event {
+            "wait" => "stop",
+            e => e,
+        };
+        let out = cli(
+            &paths,
+            &["hook", event, "--harness", "claude-code"],
+            payload,
+        );
+        assert_eq!(out.status.code(), Some(0), "{event}: {out:?}");
+        assert!(out.stdout.is_empty(), "{event}: {out:?}");
+        assert!(out.stderr.is_empty(), "{event}: {out:?}");
+    }
+    assert!(!paths.socket.exists());
+    assert!(!paths.lock.exists());
+}
+
+#[test]
+fn cli_hook_unknown_event_is_silent() {
+    // A config newer than the binary must not block Claude Code (exit 2).
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let out = cli(
+        &paths,
+        &["hook", "no-such-event", "--harness", "claude-code"],
+        "stop",
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_exits_when_its_harness_exits() {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let d = TestDaemon::start().await;
+    let payload =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks/claude-code/stop.json");
+    // A stand-in harness: a shell that stays the hook's parent. It starts
+    // the hook once its agent is registered (a line on its stdin).
+    let mut harness = Command::new("sh")
+        .arg("-c")
+        .arg(r#"read go; "$0" hook wait --harness claude-code < "$1"; exit $?"#)
+        .arg(BIN)
+        .arg(&payload)
+        .env("AGENTMAIL_DATA_DIR", &d.paths.data_dir)
+        .env("AGENTMAIL_SOCKET", &d.paths.socket)
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env_remove("AGENTMAIL_ADDRESS")
+        .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("CLAUDE_PID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let harness_id = procinfo::proc_id(harness.id()).unwrap();
+    let mut c = d.client().await;
+    c.call(
+        &Caller::Human,
+        Request::Register {
+            name: "backend".into(),
+            role: None,
+            working_on: None,
+            harness: Harness::ClaudeCode,
+            cwd: d.dir.path().to_path_buf(),
+            proc_id: Some(harness_id),
+            fresh: true,
+            wake: true,
+            session: None,
+        },
+    )
+    .await
+    .unwrap();
+    harness.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    // The hook holds the stdout pipe open for as long as it runs.
+    let mut stdout = harness.stdout.take().unwrap();
+    let done = tokio::task::spawn_blocking(move || {
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        Instant::now()
+    });
+    assert!(still_waiting(&done, 1.0).await, "the hook did not wait");
+    harness.kill().unwrap();
+    harness.wait().unwrap();
+    let killed = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(10), done)
+        .await
+        .expect("the hook outlived its harness")
+        .unwrap();
+    assert!(ended.duration_since(killed) < Duration::from_secs(5));
+}

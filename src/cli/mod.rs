@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, ClientError, DataDirMismatch, settled_lock_record};
 use crate::daemon::handler::MAX_WAIT;
 use crate::daemon::{DaemonConfig, serve_until, shutdown_signal};
+use crate::hook::HookEvent;
 use crate::identity;
 use crate::ids::now_ms;
 use crate::model::{AgentView, HUMAN, Harness, MAX_BODY_BYTES, Message, ProcId, SessionKey};
@@ -277,6 +278,21 @@ pub enum Command {
     },
     /// Serve MCP on stdin/stdout (run by harnesses, not by people).
     Mcp,
+    /// Run a harness hook: read its payload on stdin and print what the
+    /// harness shows the agent (run by harnesses, not by people). Never
+    /// starts the daemon; prints nothing when it is down or the session
+    /// has no agent.
+    Hook {
+        /// The harness event the hook runs for.
+        #[arg(value_enum)]
+        event: HookEvent,
+        /// The harness running the hook.
+        #[arg(long, value_parser = ["claude-code", "opencode", "kiro"])]
+        harness: String,
+        /// The harness session the hook is for (opencode's plugin).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Manage the background daemon (default: status).
     Daemon {
         #[command(subcommand)]
@@ -599,6 +615,13 @@ fn clap_exit(e: &clap::Error) -> ExitCode {
 pub async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
+        // A hook must never fail its harness: Claude Code reads exit 2 as
+        // "block", kiro reads 1 as "continue the turn". A hook this binary
+        // does not know (a newer config, an older binary) stays silent.
+        Err(e) if e.use_stderr() && is_hook(std::env::args_os().nth(1)) => {
+            let _ = e.print();
+            return ExitCode::SUCCESS;
+        }
         Err(e) => return clap_exit(&e),
     };
     let json = cli.json;
@@ -609,6 +632,38 @@ pub async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Whether the first argument names the `hook` subcommand.
+fn is_hook(first: Option<std::ffi::OsString>) -> bool {
+    first.is_some_and(|a| a == "hook")
+}
+
+/// Longest hook payload read from stdin, in bytes. Claude Code's tool
+/// results can be large; a hook needs only a few fields, and a payload cut
+/// short reads as an empty one.
+const MAX_HOOK_INPUT: u64 = 16 * 1024 * 1024;
+
+/// `agentmail hook`: read the payload (unless stdin is a terminal), run
+/// the hook and print its output. Never fails: see [`crate::hook`].
+async fn hook(event: HookEvent, harness: &str, session: Option<&str>) -> ExitCode {
+    use std::io::IsTerminal;
+    let mut stdin = Vec::new();
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::stdin()
+            .lock()
+            .take(MAX_HOOK_INPUT)
+            .read_to_end(&mut stdin);
+    }
+    let harness = harness_from(harness).unwrap_or(Harness::Other);
+    let out = crate::hook::run_as(harness, event, session, &stdin, &|k| std::env::var_os(k)).await;
+    if !out.stdout.is_empty() {
+        let _ = print_text(&out.stdout);
+    }
+    if !out.stderr.is_empty() {
+        print_err(&out.stderr);
+    }
+    ExitCode::from(out.exit)
 }
 
 /// Print an error as `error: <message>` on stderr, with the candidate table
@@ -721,6 +776,14 @@ pub(crate) fn normalize_full_id(id: &str) -> Option<String> {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
+    if let Command::Hook {
+        event,
+        harness,
+        session,
+    } = cli.command
+    {
+        return Ok(hook(event, &harness, session.as_deref()).await);
+    }
     let paths = Paths::from_env()?;
     if let Command::Daemon { action } = cli.command {
         return daemon(&paths, action.unwrap_or(DaemonAction::Status), cli.json).await;
@@ -1127,7 +1190,9 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 ))
             })?;
         }
-        Command::Daemon { .. } | Command::Mcp => unreachable!("handled in run"),
+        Command::Daemon { .. } | Command::Mcp | Command::Hook { .. } => {
+            unreachable!("handled in run")
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

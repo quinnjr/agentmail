@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod client;
 pub mod daemon;
+pub mod hook;
 pub mod identity;
 pub mod ids;
 pub mod mcp;
