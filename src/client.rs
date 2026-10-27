@@ -777,8 +777,16 @@ mod tests {
             let path = paths.lock.clone();
             let rec = rec.clone();
             move || {
+                // Rewrite it the way the daemon does (write over, then cut
+                // to length): `fs::write` would truncate first, and a read
+                // in between would find the file empty, which counts as no
+                // record at once.
+                use std::os::unix::fs::FileExt;
                 std::thread::sleep(Duration::from_millis(5));
-                std::fs::write(path, rec.encode()).unwrap();
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                let bytes = rec.encode();
+                file.write_all_at(&bytes, 0).unwrap();
+                file.set_len(bytes.len() as u64).unwrap();
             }
         });
         assert_eq!(settled_lock_record(&paths).await, Some(rec));

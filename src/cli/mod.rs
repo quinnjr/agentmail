@@ -836,8 +836,10 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
             // A session from the environment names its harness: the
             // process found may be another harness further up the tree.
             // Only the session of the harness this process runs under
-            // counts, not one inherited from an outer harness.
-            let session = identity::env_session();
+            // counts, not one inherited from an outer harness, and only
+            // when the process bound is that harness: `--pid` naming a
+            // process outside it binds that process without the session.
+            let session = identity::register_session(pid);
             // A harness that runs every session in one process (opencode)
             // has no identity of its own: binding its process without one
             // of its sessions would make the agent the caller of every

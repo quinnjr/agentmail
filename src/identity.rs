@@ -93,6 +93,49 @@ pub fn env_session() -> Option<SessionKey> {
     )
 }
 
+/// The session a CLI `register` carries: [`env_session`], but only when the
+/// process the registration binds ([`register_harness`]'s pick, PID 1
+/// included) is the harness process that session belongs to. `--pid` naming
+/// a process outside that harness (an unrelated process, or another
+/// harness) binds that process alone: the session of the shell the command
+/// runs in has nothing to do with it, and attaching it would record the
+/// agent under this harness while bound to a foreign process.
+pub fn register_session(explicit_pid: Option<u32>) -> Option<SessionKey> {
+    let me = std::process::id();
+    let target = binding_with(
+        me,
+        explicit_pid,
+        procinfo::find_harness_ancestor,
+        |_| true,
+        |_| true,
+    )
+    .map(|(p, _)| p);
+    session_of_target(
+        |k| std::env::var_os(k),
+        me,
+        procinfo::find_harness_ancestor,
+        procinfo::env_var,
+        target,
+    )
+}
+
+/// [`session_in`] process `me`, kept only when `target` is the harness
+/// process the session was read for.
+fn session_of_target(
+    var: impl Fn(&str) -> Option<OsString>,
+    me: u32,
+    find_harness: impl Fn(u32) -> Option<(ProcId, Harness)>,
+    environ: impl Fn(u32, &str) -> Option<OsString>,
+    target: Option<ProcId>,
+) -> Option<SessionKey> {
+    session_from_env(&var)?;
+    let nearest = find_harness(me);
+    if nearest.map(|(p, _)| p) != target {
+        return None;
+    }
+    session_for(var, nearest, environ)
+}
+
 /// [`session_for`] process `pid`, looking up its harness ancestor only when
 /// a session variable is set.
 fn session_in(
@@ -605,6 +648,38 @@ mod tests {
         assert_eq!(session_in(env(&[]), me, panics, no_environ), None);
         assert_eq!(
             session_in(&outer, me, under(Harness::ClaudeCode), no_environ),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_register_session_only_for_its_harness_process() {
+        // The session is kept only when the process bound is the harness
+        // the session was read for: `--pid` naming a process outside that
+        // opencode binds it without the session.
+        let me = std::process::id();
+        let harness = procinfo::proc_id(me).unwrap();
+        let session = env(&[(ENV_OPENCODE_SESSION, "s1")]);
+        let found = under(Harness::Opencode);
+        assert_eq!(
+            session_of_target(&session, me, &found, no_environ, Some(harness)),
+            Some(opencode("s1"))
+        );
+        let outside = ProcId {
+            pid: harness.pid + 1,
+            ..harness
+        };
+        assert_eq!(
+            session_of_target(&session, me, &found, no_environ, Some(outside)),
+            None
+        );
+        assert_eq!(
+            session_of_target(&session, me, &found, no_environ, None),
+            None
+        );
+        // No harness ancestor and nothing bound: still no session.
+        assert_eq!(
+            session_of_target(&session, me, none, no_environ, None),
             None
         );
     }

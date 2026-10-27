@@ -381,7 +381,13 @@ processes, so they find their address through the harness process they share
   shell (`$$`) or any other non-harness process between it and opencode is
   replaced by the opencode process, and refused the same way. In a session,
   `--harness` (or the MCP `harness` parameter) can only name the session's
-  own harness.
+  own harness. A `--pid` naming a process outside the session's opencode
+  binds that process alone, without the session.
+- opencode subagents (its task tool) run in child sessions with their own
+  session id, which their MCP `_meta` and `OPENCODE_SESSION_ID` carry. So
+  they are separate identities, not the parent's agent: until a subagent
+  calls `register` (or acts through `AGENTMAIL_ADDRESS`), its calls are
+  refused with `NoIdentity`.
 - Session variables count only under the harness that sets them: the CLI
   uses `OPENCODE_SESSION_ID` only when its nearest harness ancestor is
   opencode. A `claude` started from an opencode shell, or a tmux or `setsid`
@@ -436,6 +442,9 @@ never taken. `register --fresh` (MCP: `fresh: true`) always gets a new address.
 
 - **One address per harness process** for Claude Code and kiro-cli (opencode
   gets one per session). Their subagents share the parent's address.
+  opencode subagents run in their own sessions instead, so each is a
+  separate identity that must `register` (or use `AGENTMAIL_ADDRESS`) before
+  it can act.
 - macOS process inspection is not implemented yet; Linux and WSL are the
   supported platforms.
 

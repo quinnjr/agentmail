@@ -1366,3 +1366,37 @@ fn register_ignored_opencode_session_bound_to_opencode_is_refused() {
     let v = ok_json(env.as_human().args(["agents", "--json", "--all"]));
     assert_eq!(v, serde_json::json!([]), "{v}");
 }
+
+/// `--pid` naming a process outside the opencode whose session the command
+/// runs in binds that process alone: the session is not attached, so the
+/// agent is not recorded as an opencode agent bound to a foreign process,
+/// and the session itself stays without an identity.
+#[test]
+fn register_in_session_with_outside_pid_drops_the_session() {
+    let mut env = Env::new();
+    let sleep = StdCommand::new("sleep").arg("300").spawn().unwrap();
+    let pid = sleep.id().to_string();
+    env.sleeps.push(sleep);
+    let r = ok_json(
+        env.in_session_of("s1")
+            .args(["register", "outside", "--json", "--pid", &pid]),
+    );
+    let address = r["address"].as_str().unwrap().to_string();
+    let me = ok_json(env.as_agent(&address).args(["whoami", "--json"]));
+    assert_eq!(me["agent"]["harness"], "other", "{me}");
+    let agents = ok_json(env.as_human().args(["agents", "--json", "--all"]));
+    let agent = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["address"] == address.as_str())
+        .unwrap_or_else(|| panic!("{agents}"));
+    assert!(agent.get("session").is_none_or(|s| s.is_null()), "{agent}");
+    let out = env
+        .in_session_of("s1")
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    assert_eq!(json(&out)["error"]["code"], "NoIdentity");
+}

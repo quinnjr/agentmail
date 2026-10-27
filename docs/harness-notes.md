@@ -153,6 +153,27 @@ model credentials that an isolated config does not have).
   `identity_mcp_bind_skips_harness_redirect_from_its_shell`. Like the
   Claude Code decision, this follows from the process model and the
   bundle reading above, not a live model run.
+  - **Assumption (kiro, unverified live):** the check covers every process
+    between the server and `kiro-cli`, so under kiro it includes
+    `kiro-cli-chat` and the engine's `node`. The rule holds only if
+    neither of them is started with a `KIRO_SESSION_ID` that differs from
+    the one `kiro-cli` itself carries (normally none). If one were, kiro's
+    own MCP server would be taken for a foreign client: it would bind its
+    parent (`node`, harness `other`) and kiro identity would break
+    entirely. What was checked: the KAS bundle adds `KIRO_SESSION_ID` only
+    to the environment of the shell commands it runs (see above), not to
+    the MCP transport environment. The `kiro-cli-chat` binary contains the
+    literal four times: once next to `SHELL` and `.kiro/steering` in the
+    V2 agent code (the shell tool's environment), once in the list of
+    environment variables the CLI reads, and twice as search keywords in
+    its bundled help pages (hooks, session management). None of these
+    shows it being set for the `kiro-cli-chat` or `node` children, but that
+    is a static reading. The process environments themselves were not
+    observed, because in an isolated `HOME`/`KIRO_HOME` the real
+    `kiro-cli chat` stops at the browser login before it starts either
+    process. The Task 10 kiro e2e (`scripts/e2e.sh kiro`) closes this: it
+    asserts that the V3 MCP `register` records harness `kiro`, bound to the
+    `kiro-cli` pid.
 - **`register --pid` under opencode.** A `--pid` naming a non-harness
   ancestor (the shell, `$$`) is redirected to the opencode process above it,
   and so refused without a session like any other sessionless opencode
