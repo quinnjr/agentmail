@@ -1026,23 +1026,26 @@ config schema and exit-code rules come from the engine bundle
   kiro needs nothing like Claude Code's `stop_hook_active`; but after a
   wake (or an open-question continuation) the agent is not woken again
   until the human's next prompt.
-- **Open questions at every stop, except while waking.** Without
-  `--kiro-wake` the Stop hook never waits, so it exits 1 with the open
-  questions at every stop (as the plan says); kiro continues only once
-  per human prompt, so this cannot hold a model that cannot answer. With
-  `--kiro-wake` a stop that shows open questions (exit 1) is one that
-  does not wait, so a question the model leaves open (not its call, or
-  ignored) would otherwise be shown at every later stop and keep the
-  agent from ever being woken while it stays open. The waiting Stop hook
-  therefore records the open questions it showed (the agent's `shown`
-  file under `hook-wait/`, removed with the other wait files; the plain
-  Stop hook neither reads nor writes it) and continues a stop only for a
-  question it has not shown yet (listing all open ones). Otherwise it
-  falls through to the wait, where the unread messages of the questions
-  it has shown do not count as mail to wake for (nor does mail the last
-  wake was for); a question that arrives while it waits wakes the agent
-  like other mail, and the next stop shows it. The prompt hooks'
-  reminder still counts questions left open.
+- **Open questions at every stop, except while waking.** A Stop hook
+  that will not wait (installed without `--kiro-wake`, the agent
+  registered with `wake: false`, or a headless run: `chat
+  --no-interactive`, `--output-format stream-json`, `acp`) exits 1 with
+  the open questions at every stop (as the plan says) and records
+  nothing; kiro continues only once per human prompt, so this cannot hold
+  a model that cannot answer. A stop that would wait (`--kiro-wake`, the
+  agent's `wake` on, someone typing into the run) and shows open
+  questions (exit 1) does not wait, so a question the model leaves open
+  (not its call, or ignored) would otherwise be shown at every later stop
+  and keep the agent from ever being woken while it stays open. Such a
+  stop therefore records the open questions it showed (the agent's
+  `shown` file under `hook-wait/`, removed with the other wait files;
+  stops that would not wait neither read nor write it) and continues a
+  stop only for a question it has not shown yet (listing all open ones).
+  Otherwise it falls through to the wait, where the unread messages of
+  the questions it has shown do not count as mail to wake for (nor does
+  mail the last wake was for); a question that arrives while it waits
+  wakes the agent like other mail, and the next stop shows it. The
+  prompt hooks' reminder still counts questions left open.
 - **(c) The human cannot reach the agent while a Stop hook blocks.** While
   it runs, the TUI shows "Kiro is working · Type to steer". A message
   typed and submitted then is queued ("1 message queued") and delivered

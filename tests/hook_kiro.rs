@@ -447,6 +447,22 @@ async fn stop_silent_without_wake() {
 }
 
 #[tokio::test]
+async fn stop_shows_open_questions_at_every_stop_when_wake_is_off() {
+    // Installed with `--kiro-wake`, but the agent registered without
+    // `wake`: no stop waits, so a question left open is shown at every
+    // stop, not at one only.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", false).await;
+    let env = Env::of(&d.paths);
+    let q = ask(&d, &a, "POST /orders body?").await;
+    for _ in 0..2 {
+        let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+        assert_eq!(out.exit, 1, "{out:?}");
+        assert!(out.stderr.contains(&q), "{out:?}");
+    }
+}
+
+#[tokio::test]
 async fn stop_wait_ends_on_signoff() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
@@ -509,23 +525,59 @@ async fn stop_wait_replaced_by_a_later_stop() {
     assert_eq!(finish(second).await.exit, 1);
 }
 
+/// The median time of 20 runs of `event` (after one warm-up run), each
+/// checked by `check`.
+async fn median_time(
+    env: &Env,
+    event: HookEvent,
+    payload: &str,
+    wake: bool,
+    check: impl Fn(&HookOutput),
+) -> Duration {
+    run_wake(env, event, payload, wake).await;
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let out = run_wake(env, event, payload, wake).await;
+        times.push(started.elapsed());
+        check(&out);
+    }
+    times.sort();
+    times[times.len() / 2]
+}
+
 #[tokio::test]
 async fn hook_latency_under_20ms() {
+    // Every hook path that does not wait, with the daemon up.
+    let limit = Duration::from_millis(20);
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", false).await;
     send(&d, &a, "schema", "see the PR", false).await;
     let env = Env::of(&d.paths);
-    run(&env, HookEvent::PreTool, "pre-tool").await;
-    let mut times = Vec::new();
-    for _ in 0..20 {
-        let started = Instant::now();
-        let out = run(&env, HookEvent::PreTool, "pre-tool").await;
-        times.push(started.elapsed());
-        assert!(silent(&out), "{out:?}");
+    for (event, payload) in [
+        (HookEvent::SessionStart, "session-start"),
+        (HookEvent::Prompt, "prompt"),
+    ] {
+        let median = median_time(&env, event, payload, false, |out| {
+            assert_eq!(out.exit, 0, "{out:?}");
+            assert!(out.stdout.contains("agentmail"), "{out:?}");
+        })
+        .await;
+        assert!(median < limit, "{event:?}: median {median:?}");
     }
-    times.sort();
-    let median = times[times.len() / 2];
-    assert!(median < Duration::from_millis(20), "median {median:?}");
+    let median = median_time(&env, HookEvent::PreTool, "pre-tool", false, |out| {
+        assert!(silent(out), "{out:?}");
+    })
+    .await;
+    assert!(median < limit, "PreTool: median {median:?}");
+    // Stop without `--wake`, and with it for an agent whose `wake` is off.
+    for wake in [false, true] {
+        let median = median_time(&env, HookEvent::Stop, "stop", wake, |out| {
+            assert!(silent(out), "{out:?}");
+        })
+        .await;
+        assert!(median < limit, "Stop, wake {wake}: median {median:?}");
+    }
 }
 
 // Through the binary.
@@ -607,6 +659,18 @@ fn wake_flag_is_kiro_stop_only() {
 /// is its harness process) started with `extra` arguments. Returns the
 /// running fake and its pid; the hook starts once `go` exists.
 fn fake_kiro(dir: &Path, paths: &Paths, extra: &[&str]) -> (std::process::Child, u32) {
+    fake_kiro_stops(dir, paths, extra, 1)
+}
+
+/// [`fake_kiro`] running the Stop hook `stops` times in a row: each run
+/// before the last ends with a line `exit <code>` on stderr; the fake
+/// exits with the last run's code.
+fn fake_kiro_stops(
+    dir: &Path,
+    paths: &Paths,
+    extra: &[&str],
+    stops: usize,
+) -> (std::process::Child, u32) {
     let fake = dir.join("kiro-cli");
     if !fake.exists() {
         std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
@@ -615,9 +679,11 @@ fn fake_kiro(dir: &Path, paths: &Paths, extra: &[&str]) -> (std::process::Child,
     let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid_file = dir.join(format!("kiro-{n}.pid"));
     let go = dir.join("go");
+    let stop = "\"$0\" hook stop --harness kiro --wake < /dev/null";
+    let earlier = format!("{stop}; echo \"exit $?\" >&2; ").repeat(stops - 1);
     let script = format!(
         "echo $$ > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done; \
-         \"$0\" hook stop --harness kiro --wake < /dev/null; exit $?",
+         {earlier}{stop}; exit $?",
         pid_file.display(),
         go.display()
     );
@@ -719,4 +785,33 @@ async fn stop_never_waits_in_a_headless_run() {
     .expect("the chat's stop did not wake")
     .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_stops_show_open_questions_at_every_stop() {
+    // A headless run never waits, so a question left open is shown at
+    // every stop there too, not at one only.
+    let d = TestDaemon::start().await;
+    let dir = TempDir::new().unwrap();
+    let (headless, pid) = fake_kiro_stops(
+        dir.path(),
+        &d.paths,
+        &["chat", "--v3", "--no-interactive"],
+        2,
+    );
+    let a = register_proc(&d, "headless", pid).await;
+    let q = ask(&d, &a, "POST /orders body?").await;
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || headless.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("a headless stop waited")
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (first, second) = stderr.split_once("exit 1\n").expect("first stop exit 1");
+    assert!(first.contains(&q), "{stderr}");
+    assert!(second.contains(&q), "{stderr}");
 }

@@ -18,10 +18,12 @@
 //! - `stop`: open questions to the agent continue the turn (exit 1) at
 //!   every stop; kiro runs Stop hooks once per human prompt (the continued
 //!   turn ends without another Stop), so a model that cannot answer is
-//!   never held. With `--wake` each is shown at one stop only (the `shown`
-//!   file), so a question it leaves open does not keep later stops from
-//!   waiting. Otherwise,
-//!   with `--wake` (`install --kiro-wake`) and the agent's `wake` on, it
+//!   never held. When the stop would wait (`--wake`, the agent's `wake`
+//!   on, and not a headless run) each is shown at one stop only (the
+//!   `shown` file), so a question it leaves open does not keep later stops
+//!   from waiting; a stop that would not wait shows them every time.
+//!   Otherwise, with `--wake` (`install --kiro-wake`), the agent's `wake`
+//!   on and someone typing into the run, it
 //!   waits while the agent is idle ([`Daemon::wait`]) and continues the
 //!   turn with the reminder (exit 1) when mail comes. While it waits kiro
 //!   shows the agent as working and holds what the human types until the
@@ -153,18 +155,20 @@ async fn stop(d: &mut Daemon, wake: bool) -> HookOutput {
     let Some(status) = d.status(false).await else {
         return HookOutput::default();
     };
-    // Open questions continue the turn. With `--wake` each continues one
-    // stop only: kiro runs Stop once per human prompt, so showing a
-    // question the model leaves open at every stop would keep every stop
-    // from waiting for as long as it stays open. Without `--wake` no stop
-    // waits, so every stop shows them.
+    // Open questions continue the turn. When this stop would wait, each
+    // continues one stop only: kiro runs Stop once per human prompt, so
+    // showing a question the model leaves open at every stop would keep
+    // every stop from waiting for as long as it stays open. A stop that
+    // would not wait (no `--wake`, the agent's `wake` off, or a headless
+    // run) shows them at every stop and records nothing.
+    let will_wait = wake && status.wake && !headless(d);
     let open: Vec<String> = status.open_questions.iter().map(|q| q.id.clone()).collect();
-    let unshown = !wake || {
+    let unshown = !will_wait || {
         let shown = d.shown_questions(&status.address);
         open.iter().any(|id| !shown.contains(id))
     };
     if unshown && let Some(questions) = text::open_questions(&status) {
-        if wake {
+        if will_wait {
             d.record_shown_questions(&status.address, &open);
         }
         return HookOutput {
@@ -173,7 +177,7 @@ async fn stop(d: &mut Daemon, wake: bool) -> HookOutput {
             ..HookOutput::default()
         };
     }
-    if !wake || !status.wake || headless(d) {
+    if !will_wait {
         return HookOutput::default();
     }
     // kiro gives a Stop hook no key: the wait decides by itself. Unread
