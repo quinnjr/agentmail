@@ -489,14 +489,35 @@ Checked live against Claude Code 2.1.311 in a throwaway
   another path replaces the old entries, including ones on events this
   version no longer uses, and uninstall removes every one of them, keeping
   other hooks that share a group with them.
+- Install updates agentmail's entries in place rather than replacing
+  them: on the MCP server it sets only `type`, `command` and `args`
+  (keeping, say, the user's `env`), on each of its hooks only `type`,
+  `command`, `timeout`, `async` and `asyncRewake`, and a hook stays in its
+  group, so a matcher the user changed or a `statusMessage` they added
+  survives a reinstall. A missing hook joins the group of its sibling (the
+  Stop group holds `stop` and `wait`), else gets a group of its own.
 - Uninstall restores an equivalent file. A container (`hooks`, an event's
   list, `mcpServers`) that agentmail's entries emptied is removed only
   when the file had no such key before agentmail (a `"hooks": {}` that was
-  there stays), and a file emptied entirely is deleted, with its backup,
-  only when agentmail created it; a file that was `{}` is left as `{}`.
-  "Before agentmail" is the backup when there is one (with agentmail's
-  entries taken out, so a backup a reinstall made of a file agentmail
-  created still counts as created), else the file as it is.
+  there stays). "Before agentmail" is the backup when there is one (with
+  agentmail's entries taken out), else the file as it is.
+- Creation is recorded, never inferred: when install creates a file it
+  first writes `<file>.agentmail.created`, listing the directories it
+  creates for the file (`.claude/` in a project, `~/.claude/` or
+  `$CLAUDE_CONFIG_DIR`). An uninstall that empties such a file deletes it
+  with its backup and marker, then those directories once empty. Any other
+  file is kept, even one that held only agentmail's entries (one added by
+  hand with `claude mcp add`, say): it is left as `{}` and its backup
+  stays.
+- New files are created with mode 0600: Claude Code keeps `.claude.json`
+  (account and project data) private, and keeps the mode it finds. An
+  existing file keeps its mode, and its backup gets the same.
+- A symlinked config file is written through: the file it points to
+  changes and the link stays, also when the target does not exist yet (a
+  dotfiles link made before the file); a relative link is resolved from
+  its own directory.
+- A file using CRLF line endings keeps them: new lines use the file's own
+  ending, so install then uninstall gives back the same bytes.
 - A backup is written to a temporary file and hard-linked into place, so
   a failed write never leaves a partial `<file>.agentmail.bak` (which
   would stop the real original from ever being saved).
@@ -558,7 +579,8 @@ has these instead (Claude Code's `claude.rs` shows the pattern):
   (`None` when nothing changes). `strip` removes agentmail's entries from
   an object and nothing else; with it, containers agentmail emptied are
   removed unless they were there before agentmail, and an uninstall
-  deletes the file only when agentmail created it.
+  deletes the file only when agentmail created it, which `apply` records
+  in `<file>.agentmail.created` (`created_marker_path`).
 - Ownership: `is_agentmail_hook(cmd)` (program named `agentmail…` run
   with `hook`) and `owns_hook(cmd, bin)` (that, or the program is `bin`
   itself); MCP servers are owned by their key `agentmail`.

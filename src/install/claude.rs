@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
 
-use super::{Change, Env, InstallOpts, JsonFile, bin_str, object_at, owns_hook, shell_quote};
+use super::{
+    Change, Env, InstallOpts, JsonFile, bin_str, object_at, owns_hook, shell_quote, shell_words,
+};
 
 /// Timeout for the quick hooks, in seconds.
 const HOOK_TIMEOUT: u64 = 10;
@@ -82,14 +84,6 @@ fn is_owned_hook(h: &Value, bin: &Path) -> bool {
         .is_some_and(|c| owns_hook(c, bin))
 }
 
-/// Whether a hook group holds any of agentmail's hooks.
-fn has_owned(group: &Value, bin: &Path) -> bool {
-    group
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|hs| hs.iter().any(|h| is_owned_hook(h, bin)))
-}
-
 /// Remove agentmail's hooks from an event's groups, and the groups that
 /// held nothing else.
 fn strip(groups: &mut Vec<Value>, bin: &Path) {
@@ -103,7 +97,36 @@ fn strip(groups: &mut Vec<Value>, bin: &Path) {
     });
 }
 
-/// `hooks` with agentmail's entries replaced by `want` (none to uninstall).
+/// The keys of a hook entry that agentmail sets; others (such as a
+/// `statusMessage` the user added) are kept.
+const HOOK_KEYS: [&str; 5] = ["type", "command", "timeout", "async", "asyncRewake"];
+/// The keys of the MCP server entry that agentmail sets; others (such as
+/// `env`) are kept.
+const SERVER_KEYS: [&str; 3] = ["type", "command", "args"];
+
+/// Set the `keys` of `cur` to their values in `want`, removing those
+/// `want` lacks, and keep every other key.
+fn merge_keys(cur: &mut Map<String, Value>, want: &Map<String, Value>, keys: &[&str]) {
+    for k in keys {
+        match want.get(*k) {
+            Some(v) if cur.get(*k) != Some(v) => {
+                cur.insert(k.to_string(), v.clone());
+            }
+            Some(_) => {}
+            None => {
+                cur.shift_remove(*k);
+            }
+        }
+    }
+}
+
+/// Which of agentmail's hooks a command runs: the word after `hook`.
+fn hook_kind(h: &Value) -> Option<String> {
+    let cmd = h.get("command")?.as_str()?;
+    shell_words(cmd, 3).into_iter().nth(2)
+}
+
+/// `hooks` with agentmail's entries made `want` (none to uninstall).
 /// Events left empty stay; [`JsonFile::change`] removes the ones agentmail
 /// emptied.
 fn edit_hooks(
@@ -113,10 +136,13 @@ fn edit_hooks(
     path: &Path,
 ) -> Result<()> {
     for (ev, groups) in hooks.iter_mut() {
-        let wanted = want.iter().find(|(e, _)| e == ev).map(|(_, g)| g);
+        let wanted = want
+            .iter()
+            .find(|(e, _)| e == ev)
+            .map_or(&[][..], |(_, g)| g.as_slice());
         let Some(groups) = groups.as_array_mut() else {
             // Not ours to fix; only refuse when we have to add to it.
-            if wanted.is_some() {
+            if !wanted.is_empty() {
                 bail!(
                     "`hooks.{ev}` in {} is not a JSON array; agentmail left the file unchanged",
                     path.display()
@@ -124,17 +150,7 @@ fn edit_hooks(
             }
             continue;
         };
-        let owned: Vec<&Value> = groups.iter().filter(|g| has_owned(g, bin)).collect();
-        if let Some(w) = wanted
-            && owned.len() == w.len()
-            && owned.iter().zip(w).all(|(a, b)| *a == b)
-        {
-            continue;
-        }
-        strip(groups, bin);
-        if let Some(w) = wanted {
-            groups.extend(w.iter().cloned());
-        }
+        merge_event(groups, wanted, bin);
     }
     for (ev, groups) in want {
         if !hooks.contains_key(*ev) {
@@ -142,6 +158,81 @@ fn edit_hooks(
         }
     }
     Ok(())
+}
+
+/// One event's groups with agentmail's hooks made `wanted`. A hook of
+/// agentmail's already there for the same kind (`stop`, `wait`, ...) is
+/// updated in place, keeping its group (and so its matcher) and the keys
+/// agentmail does not set; the rest of agentmail's hooks are removed, with
+/// the groups that held nothing else; missing ones are added to the group
+/// holding their siblings, else as a new group.
+fn merge_event(groups: &mut Vec<Value>, wanted: &[Value], bin: &Path) {
+    // (wanted group, kind, hook) for every hook agentmail wants here.
+    let want: Vec<(usize, Option<String>, &Value)> = wanted
+        .iter()
+        .enumerate()
+        .flat_map(|(gi, g)| {
+            g["hooks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |h| (gi, hook_kind(h), h))
+        })
+        .collect();
+    // The group each wanted hook was found in.
+    let mut found: Vec<Option<usize>> = vec![None; want.len()];
+    let mut emptied = Vec::new();
+    for (gi, g) in groups.iter_mut().enumerate() {
+        let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let n = hs.len();
+        hs.retain_mut(|h| {
+            if !is_owned_hook(h, bin) {
+                return true;
+            }
+            let kind = hook_kind(h);
+            let slot = (0..want.len()).find(|&i| found[i].is_none() && want[i].1 == kind);
+            match (
+                slot,
+                h.as_object_mut(),
+                slot.and_then(|i| want[i].2.as_object()),
+            ) {
+                (Some(i), Some(cur), Some(w)) => {
+                    merge_keys(cur, w, &HOOK_KEYS);
+                    found[i] = Some(gi);
+                    true
+                }
+                _ => false,
+            }
+        });
+        if n > 0 && hs.is_empty() {
+            emptied.push(gi);
+        }
+    }
+    for (wg, group) in wanted.iter().enumerate() {
+        let missing: Vec<Value> = (0..want.len())
+            .filter(|&i| want[i].0 == wg && found[i].is_none())
+            .map(|i| want[i].2.clone())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let host = (0..want.len()).find_map(|i| (want[i].0 == wg).then_some(found[i]).flatten());
+        match host.and_then(|gi| groups[gi].get_mut("hooks")?.as_array_mut()) {
+            Some(hs) => hs.extend(missing),
+            None => {
+                let mut g = group.clone();
+                g["hooks"] = Value::Array(missing);
+                groups.push(g);
+            }
+        }
+    }
+    let mut i = 0;
+    groups.retain(|_| {
+        i += 1;
+        !emptied.contains(&(i - 1))
+    });
 }
 
 /// Remove agentmail's hooks from a settings object, for
@@ -203,8 +294,15 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
     let mut new_mcp = mcp.value.clone();
     if install {
         let servers = object_at(&mut new_mcp, "mcpServers", &mcp.path)?;
-        if servers.get("agentmail") != Some(&server(bin)) {
-            servers.insert("agentmail".into(), server(bin));
+        let want = server(bin);
+        match servers.get_mut("agentmail") {
+            // Keep what the user added to the entry, such as `env`.
+            Some(Value::Object(cur)) => {
+                merge_keys(cur, want.as_object().expect("an object"), &SERVER_KEYS)
+            }
+            _ => {
+                servers.insert("agentmail".into(), want);
+            }
         }
     } else {
         strip_mcp(&mut new_mcp);

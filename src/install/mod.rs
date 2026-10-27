@@ -7,7 +7,9 @@
 //! run `agentmail hook`, the MCP server named `agentmail`), everything else
 //! in a file is kept as it was written ([`json::render`]), and planning
 //! twice in a row finds nothing more to do. Before a file is first changed
-//! its original is saved next to it as `<file>.agentmail.bak`.
+//! its original is saved next to it as `<file>.agentmail.bak`; a file
+//! agentmail creates is marked as such by `<file>.agentmail.created`, and
+//! only such a file is ever deleted again.
 
 mod claude;
 pub mod json;
@@ -100,19 +102,33 @@ pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
 
 /// Where the original of `path` is kept: `<path>.agentmail.bak`.
 pub fn backup_path(path: &Path) -> PathBuf {
+    with_suffix(path, ".agentmail.bak")
+}
+
+/// The marker saying agentmail created `path`: `<path>.agentmail.created`.
+/// It lists the directories agentmail created for the file, one per line.
+pub fn created_marker_path(path: &Path) -> PathBuf {
+    with_suffix(path, ".agentmail.created")
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
-    s.push(".agentmail.bak");
+    s.push(suffix);
     PathBuf::from(s)
 }
 
 /// Make `changes`. First checks that every file still has the text it was
 /// planned from (else nothing is written: run the command again). Then, per
 /// file: saves the original as `<path>.agentmail.bak` unless a backup is
-/// already there, and replaces the file atomically (a temporary file in the
-/// same directory, renamed over it), keeping its permissions. A symlink is
-/// followed: the file it points to changes, the link stays. A file to
-/// delete (one agentmail created, emptied by an uninstall) goes with its
-/// backup, which can only hold agentmail's own entries.
+/// already there, or, for a file that does not exist yet, records that
+/// agentmail creates it (and the directories it creates for it) in
+/// `<path>.agentmail.created`. The file is replaced atomically (a temporary
+/// file in the same directory, renamed over it), keeping its permissions; a
+/// new file is private to its owner (mode 0600). A symlink is followed, even
+/// one whose target does not exist yet: the file it points to changes, the
+/// link stays. A file to delete (one agentmail created, emptied by an
+/// uninstall) goes with its backup and marker, and so do the directories
+/// agentmail created for it once they are empty.
 pub fn apply(changes: &[Change]) -> Result<()> {
     for c in changes {
         if read_opt(&c.path)? != c.before {
@@ -122,10 +138,11 @@ pub fn apply(changes: &[Change]) -> Result<()> {
             );
         }
     }
+    let mut dirs = Vec::new();
     for c in changes {
-        apply_one(c).with_context(|| format!("writing {}", c.path.display()))?;
+        dirs.extend(apply_one(c).with_context(|| format!("writing {}", c.path.display()))?);
     }
-    Ok(())
+    remove_empty_dirs(dirs)
 }
 
 /// A file's text, or `None` when it does not exist.
@@ -139,34 +156,100 @@ fn read_opt(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn apply_one(c: &Change) -> Result<()> {
+/// The file `path` names once symlinks are followed, whether or not it
+/// exists: a dangling link resolves to the file it would point to.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    let mut p = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let t = std::fs::read_link(&p)?;
+                p = match p.parent() {
+                    Some(dir) => dir.join(t),
+                    None => t,
+                };
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => return Ok(p),
+        }
+    }
+    bail!("too many levels of symbolic links at {}", path.display())
+}
+
+/// Remove `path`, which may already be gone.
+fn remove_if_there(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(anyhow::Error::new(e).context(format!("removing {}", path.display())))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Remove the directories in `dirs` that are empty, deepest first.
+fn remove_empty_dirs(mut dirs: Vec<PathBuf>) -> Result<()> {
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    dirs.dedup();
+    for d in dirs {
+        match std::fs::remove_dir(&d) {
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                return Err(anyhow::Error::new(e).context(format!("removing {}", d.display())));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Make one change; returns the directories to remove when they are empty.
+fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
     let perms = std::fs::metadata(&c.path).ok().map(|m| m.permissions());
     let bak = backup_path(&c.path);
+    let marker = created_marker_path(&c.path);
+    // Write through a symlink to its target, so the link stays a link.
+    let target = resolve(&c.path)?;
     let Some(after) = &c.after else {
         // Only a file agentmail created is deleted ([`JsonFile::change`]):
-        // it and any backup of it hold nothing but agentmail's entries.
-        std::fs::remove_file(&c.path)?;
-        return match std::fs::remove_file(&bak) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(anyhow::Error::new(e).context(format!("removing {}", bak.display())))
-            }
-            _ => Ok(()),
+        // any backup of it holds nothing but agentmail's entries.
+        let dirs = match std::fs::read_to_string(&marker) {
+            Ok(text) => text.lines().map(PathBuf::from).collect(),
+            Err(_) => Vec::new(),
         };
+        std::fs::remove_file(&target)?;
+        remove_if_there(&bak)?;
+        remove_if_there(&marker)?;
+        return Ok(dirs);
     };
     if let Some(before) = &c.before {
         write_backup(&bak, perms.as_ref(), |f| f.write_all(before.as_bytes()))
             .with_context(|| format!("writing {}", bak.display()))?;
     }
-    // Write through a symlink to its target, so the link stays a link.
-    let target = if c.before.is_some() {
-        std::fs::canonicalize(&c.path)?
-    } else {
-        c.path.clone()
-    };
     let dir = target
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", target.display()))?;
+    // The directories this creates, deepest first.
+    let new_dirs: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && std::fs::symlink_metadata(d).is_err())
+        .collect();
     std::fs::create_dir_all(dir)?;
+    if c.before.is_none() && std::fs::symlink_metadata(&bak).is_err() {
+        // Recorded before the file is created: without it an uninstall
+        // keeps the file (as `{}`) rather than delete what it cannot tell
+        // agentmail created.
+        let list: String = new_dirs
+            .iter()
+            .filter_map(|d| d.to_str().filter(|s| !s.contains('\n')))
+            .map(|s| format!("{s}\n"))
+            .collect();
+        write_backup(&marker, None, |f| f.write_all(list.as_bytes()))
+            .with_context(|| format!("writing {}", marker.display()))?;
+    }
     let name = target
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", target.display()))?
@@ -174,8 +257,9 @@ fn apply_one(c: &Change) -> Result<()> {
     let tmp = dir.join(format!(".{name}.agentmail-{}.tmp", std::process::id()));
     let write = || -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
-        if let Some(p) = &perms {
-            f.set_permissions(p.clone())?;
+        match &perms {
+            Some(p) => f.set_permissions(p.clone())?,
+            None => set_private(&f)?,
         }
         f.write_all(after.as_bytes())?;
         f.sync_all()?;
@@ -184,7 +268,23 @@ fn apply_one(c: &Change) -> Result<()> {
     };
     write().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
-    })
+    })?;
+    Ok(Vec::new())
+}
+
+/// Make a new file readable and writable by its owner only: config files
+/// such as `.claude.json` hold account data.
+fn set_private(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        Ok(())
+    }
 }
 
 /// Save a backup at `bak` unless one is there already, never leaving a
@@ -256,7 +356,7 @@ struct JsonFile {
     value: Map<String, Value>,
     /// The file before agentmail first changed it, as far as known: its
     /// backup when there is one, else the file as it is now; `None` when
-    /// neither exists.
+    /// agentmail created it (its marker is there) or it does not exist.
     original: Option<Map<String, Value>>,
 }
 
@@ -279,14 +379,18 @@ impl JsonFile {
                 entry()
             ),
         };
-        // A backup that cannot be read as an object still shows the file
-        // existed before agentmail.
-        let original = match read_opt(&backup_path(&path))? {
-            Some(text) => Some(match json::parse(&text) {
-                Ok(Value::Object(m)) => m,
-                _ => Map::new(),
-            }),
-            None => before.is_some().then(|| value.clone()),
+        // Only the marker says agentmail created the file. A backup, even
+        // one that cannot be read as an object, shows it existed before.
+        let original = if std::fs::symlink_metadata(created_marker_path(&path)).is_ok() {
+            None
+        } else {
+            match read_opt(&backup_path(&path))? {
+                Some(text) => Some(match json::parse(&text) {
+                    Ok(Value::Object(m)) => m,
+                    _ => Map::new(),
+                }),
+                None => before.is_some().then(|| value.clone()),
+            }
         };
         Ok(JsonFile {
             path,
@@ -299,21 +403,20 @@ impl JsonFile {
     /// The change to `new`, if any. `strip` removes agentmail's entries
     /// from an object (and nothing else); with it the file as it was
     /// before agentmail is worked out, so that containers agentmail's
-    /// entries emptied are removed only when they were not there before,
-    /// and a file emptied by an uninstall is deleted only when agentmail
-    /// created it (else it is left as `{}`).
+    /// entries emptied are removed only when they were not there before.
+    /// A file emptied by an uninstall is deleted only when agentmail
+    /// created it (its marker says so); else it is left as `{}`.
     fn change(
         self,
         mut new: Map<String, Value>,
         uninstall: bool,
         strip: &dyn Fn(&mut Map<String, Value>),
     ) -> Option<Change> {
-        let original = self.original.as_ref().and_then(|raw| {
+        let original = self.original.as_ref().map(|raw| {
             let mut o = raw.clone();
             strip(&mut o);
             prune_emptied(raw, &mut o, None);
-            // Only agentmail's entries: agentmail created the file.
-            (raw.is_empty() || !o.is_empty()).then_some(o)
+            o
         });
         prune_emptied(&self.value, &mut new, original.as_ref());
         if new == self.value {

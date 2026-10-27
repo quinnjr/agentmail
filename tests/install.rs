@@ -98,6 +98,12 @@ fn bak(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn marker(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".agentmail.created");
+    PathBuf::from(s)
+}
+
 fn hook(bin: &str, event: &str) -> Value {
     json!({"type": "command", "command": format!("{bin} hook {event} --harness claude-code"), "timeout": 10})
 }
@@ -339,6 +345,97 @@ fn claude_files_agentmail_created_go_even_after_reinstall() {
     // The backups held only agentmail's entries: nothing is left behind.
     assert!(!bak(&h.settings()).exists());
     assert!(!bak(&h.user_mcp()).exists());
+    assert!(!marker(&h.settings()).exists());
+    assert!(!marker(&h.user_mcp()).exists());
+    assert!(!h.home().join(".claude").exists());
+}
+
+#[test]
+fn claude_pre_existing_file_with_only_agentmail_survives_uninstall() {
+    // Added by hand (say with `claude mcp add`), with the user's own `env`.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let mine = json!({"mcpServers": {"agentmail": {
+        "type": "stdio", "command": "/old/agentmail", "args": ["mcp"], "env": {"AGENTMAIL_X": "1"}
+    }}});
+    let text = format!("{}\n", serde_json::to_string_pretty(&mine).unwrap());
+    write(&h.user_mcp(), &text);
+    install(&opts(false, BIN), &env);
+    assert_eq!(read(&bak(&h.user_mcp())), text);
+    assert!(!marker(&h.user_mcp()).exists());
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(read_json(&h.user_mcp()), json!({}));
+    assert_eq!(read(&bak(&h.user_mcp())), text);
+
+    // Without a backup (agentmail never changed it) the same holds.
+    let h = Home::new();
+    write(&h.user_mcp(), &text);
+    uninstall(&opts(false, BIN), &h.env(&[]));
+    assert_eq!(read_json(&h.user_mcp()), json!({}));
+}
+
+#[test]
+fn claude_install_keeps_fields_the_user_added() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&opts(false, "/old/agentmail"), &env);
+    let mut v = read_json(&h.user_mcp());
+    v["mcpServers"]["agentmail"]["env"] = json!({"AGENTMAIL_X": "1"});
+    v["mcpServers"]["agentmail"]["timeout"] = json!(5000);
+    write(&h.user_mcp(), &serde_json::to_string_pretty(&v).unwrap());
+    let mut s = read_json(&h.settings());
+    s["hooks"]["Stop"][0]["hooks"][1]["statusMessage"] = json!("waiting for mail");
+    s["hooks"]["PostToolUse"][0]["matcher"] = json!("Bash");
+    write(&h.settings(), &serde_json::to_string_pretty(&s).unwrap());
+
+    install(&opts(false, BIN), &env);
+    let server = &read_json(&h.user_mcp())["mcpServers"]["agentmail"];
+    assert_eq!(
+        *server,
+        json!({"type": "stdio", "command": BIN, "args": ["mcp"], "env": {"AGENTMAIL_X": "1"}, "timeout": 5000})
+    );
+    let mut want = expected_hooks(BIN);
+    want["Stop"][0]["hooks"][1]["statusMessage"] = json!("waiting for mail");
+    want["PostToolUse"][0]["matcher"] = json!("Bash");
+    assert_eq!(read_json(&h.settings())["hooks"], want);
+    assert!(
+        install::plan_install(&opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A missing hook goes back into the group of its sibling.
+    let mut s = read_json(&h.settings());
+    s["hooks"]["Stop"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    write(&h.settings(), &serde_json::to_string_pretty(&s).unwrap());
+    install(&opts(false, BIN), &env);
+    let stop = &read_json(&h.settings())["hooks"]["Stop"];
+    assert_eq!(stop.as_array().unwrap().len(), 1);
+    assert_eq!(stop[0]["hooks"][1], hook(BIN, "stop"));
+}
+
+#[test]
+fn claude_crlf_file_round_trips() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    let crlf = FOREIGN_SETTINGS.replace('\n', "\r\n");
+    write(&h.settings(), &crlf);
+    install(&opts(false, BIN), &env);
+    let text = read(&h.settings());
+    assert_eq!(
+        read_json(&h.settings())["hooks"]["Stop"],
+        expected_hooks(BIN)["Stop"]
+    );
+    assert_eq!(
+        text.matches('\n').count(),
+        text.matches("\r\n").count(),
+        "a bare LF in {text:?}"
+    );
+    uninstall(&opts(false, BIN), &env);
+    assert_eq!(read(&h.settings()), crlf);
 }
 
 #[test]
@@ -513,6 +610,9 @@ fn claude_respects_config_dir() {
     assert!(!h.settings().exists());
     assert!(!h.user_mcp().exists());
     assert!(!h.home().join(".claude").exists());
+    // The directory agentmail created goes again on uninstall.
+    uninstall(&opts(false, BIN), &env);
+    assert!(!cfg.exists());
 }
 
 #[test]
@@ -533,6 +633,18 @@ fn claude_project_scope() {
     uninstall(&opts(true, BIN), &env);
     assert!(!h.proj().join(".claude/settings.json").exists());
     assert!(!h.proj().join(".mcp.json").exists());
+    assert!(!h.proj().join(".claude").exists());
+    assert_eq!(std::fs::read_dir(h.proj()).unwrap().count(), 0);
+
+    // A `.claude/` that was there stays, even when emptied.
+    std::fs::create_dir(h.proj().join(".claude")).unwrap();
+    install(&opts(true, BIN), &env);
+    uninstall(&opts(true, BIN), &env);
+    assert!(h.proj().join(".claude").is_dir());
+    assert_eq!(
+        std::fs::read_dir(h.proj().join(".claude")).unwrap().count(),
+        0
+    );
 }
 
 #[test]
@@ -611,6 +723,47 @@ fn file_mode_is_kept() {
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&h.user_mcp()), 0o600);
     assert_eq!(mode(&bak(&h.user_mcp())), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn new_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Home::new();
+    install(&opts(false, BIN), &h.env(&[]));
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&h.user_mcp()), 0o600);
+    assert_eq!(mode(&h.settings()), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_is_written_through() {
+    let h = Home::new();
+    let env = h.env(&[]);
+    std::fs::create_dir_all(h.settings().parent().unwrap()).unwrap();
+    // A relative link to a dotfiles directory that does not exist yet.
+    std::os::unix::fs::symlink("../dotfiles/claude/settings.json", h.settings()).unwrap();
+    let real = h.home().join("dotfiles/claude/settings.json");
+    install(&opts(false, BIN), &env);
+    let is_link = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    };
+    assert!(is_link(&h.settings()));
+    assert_eq!(read_json(&real), json!({"hooks": expected_hooks(BIN)}));
+    assert!(
+        install::plan_install(&opts(false, BIN), &env)
+            .unwrap()
+            .is_empty()
+    );
+    // Uninstall removes what it created, and leaves the link as it was.
+    uninstall(&opts(false, BIN), &env);
+    assert!(is_link(&h.settings()));
+    assert!(!real.exists());
+    assert!(!h.home().join("dotfiles").exists());
 }
 
 fn paths(changes: &[Change]) -> Vec<&Path> {
@@ -712,4 +865,103 @@ fn cli_set_default_is_kiro_only() {
     assert!(err.contains("--set-default"), "{err}");
     assert!(!h.settings().exists());
     assert!(!h.user_mcp().exists());
+}
+
+#[test]
+fn cli_json_reports_changes() {
+    let h = Home::new();
+    write(&h.settings(), FOREIGN_SETTINGS);
+    let out = cli(&h)
+        .args(["--json", "install", "--harness", "claude-code"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    let settings = h.settings().display().to_string();
+    let mcp = h.user_mcp().display().to_string();
+    assert_eq!(
+        v,
+        json!({"dry_run": false, "changes": [
+            {"path": settings, "action": "update", "backup": bak(&h.settings()).display().to_string()},
+            {"path": mcp, "action": "create", "backup": null},
+        ]})
+    );
+    let out = cli(&h)
+        .args([
+            "uninstall",
+            "--harness",
+            "claude-code",
+            "--json",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        v,
+        json!({"dry_run": true, "changes": [
+            {"path": settings, "action": "update", "backup": null},
+            {"path": mcp, "action": "delete", "backup": null},
+        ]})
+    );
+}
+
+#[test]
+fn cli_uninstall_dry_run_writes_nothing() {
+    let h = Home::new();
+    write(&h.settings(), FOREIGN_SETTINGS);
+    cli(&h)
+        .args(["install", "--harness", "claude-code"])
+        .assert()
+        .success();
+    let installed = read(&h.settings());
+    let out = cli(&h)
+        .args(["uninstall", "--harness", "claude-code", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let settings = h.settings().display().to_string();
+    let mcp = h.user_mcp().display().to_string();
+    assert!(
+        out.contains(&format!("--- {settings}\n+++ {settings}\n")),
+        "{out}"
+    );
+    assert!(out.contains("-    \"SessionStart\": ["), "{out}");
+    assert!(
+        out.contains(&format!("--- {mcp}\n+++ /dev/null\n")),
+        "{out}"
+    );
+    assert_eq!(read(&h.settings()), installed);
+    assert!(h.user_mcp().exists());
+}
+
+#[test]
+fn cli_refuses_unparsable_settings() {
+    let h = Home::new();
+    let text = "{\n  // a comment\n  \"model\": \"opus\"\n}\n";
+    write(&h.settings(), text);
+    let out = cli(&h)
+        .args(["install", "--harness", "claude-code"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.starts_with("error: "), "{err}");
+    assert!(err.contains("settings.json"), "{err}");
+    assert!(
+        err.contains("agentmail hook"),
+        "the snippet to add by hand: {err}"
+    );
+    assert_eq!(read(&h.settings()), text);
+    assert!(!h.user_mcp().exists());
+    assert!(!bak(&h.settings()).exists());
 }

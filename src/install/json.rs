@@ -19,15 +19,17 @@ pub fn parse(text: &str) -> serde_json::Result<Value> {
 
 /// `new` written over `orig` (the text it was parsed from, or `None` for a
 /// new file), changing only what differs. Always ends with a newline when
-/// the original did, or when the file is new.
+/// the original did, or when the file is new. New lines use the original's
+/// line ending (`\r\n` when it uses that, else `\n`).
 pub fn render(orig: Option<&str>, new: &Value) -> String {
     let Some(orig) = orig.filter(|t| !t.trim().is_empty()) else {
         return format!("{}\n", pretty(new, "  ", ""));
     };
     let unit = indent_unit(orig);
+    let nl = if orig.contains("\r\n") { "\r\n" } else { "\n" };
     let fallback = || {
-        let nl = if orig.ends_with('\n') { "\n" } else { "" };
-        format!("{}{nl}", pretty(new, &unit, ""))
+        let end = if orig.ends_with('\n') { nl } else { "" };
+        format!("{}{end}", with_newline(pretty(new, &unit, ""), nl))
     };
     let Some(root) = Spans::parse(orig) else {
         return fallback();
@@ -35,6 +37,7 @@ pub fn render(orig: Option<&str>, new: &Value) -> String {
     let r = Renderer {
         text: orig,
         unit: unit.clone(),
+        nl,
     };
     let mut out = String::with_capacity(orig.len() + 1024);
     out.push_str(&orig[..root.start]);
@@ -63,6 +66,11 @@ pub fn pretty(v: &Value, unit: &str, indent: &str) -> String {
     } else {
         s.replace('\n', &format!("\n{indent}"))
     }
+}
+
+/// `s` (with `\n` line endings) with `nl` line endings instead.
+fn with_newline(s: String, nl: &str) -> String {
+    if nl == "\n" { s } else { s.replace('\n', nl) }
 }
 
 /// The file's indent unit: the leading whitespace of its first indented
@@ -246,6 +254,8 @@ impl<'a> Spans<'a> {
 struct Renderer<'a> {
     text: &'a str,
     unit: String,
+    /// The line ending of new lines.
+    nl: &'static str,
 }
 
 /// One entry of a rebuilt container: its text and, when it was in the
@@ -258,6 +268,11 @@ struct Item {
 impl Renderer<'_> {
     fn slice(&self, start: usize, end: usize) -> &str {
         &self.text[start..end]
+    }
+
+    /// `v` pretty-printed at `indent`, with the file's line ending.
+    fn pretty(&self, v: &Value, indent: &str) -> String {
+        with_newline(pretty(v, &self.unit, indent), self.nl)
     }
 
     fn value_of(&self, n: &Node) -> Option<Value> {
@@ -279,7 +294,7 @@ impl Renderer<'_> {
         match (new, &n.kind) {
             (Value::Object(map), Kind::Object(members)) => self.object(map, n, members, out),
             (Value::Array(items), Kind::Array(nodes)) => self.array(items, n, nodes, out),
-            _ => out.push_str(&pretty(new, &self.unit, self.line_indent(n.start))),
+            _ => out.push_str(&self.pretty(new, self.line_indent(n.start))),
         }
     }
 
@@ -295,10 +310,11 @@ impl Renderer<'_> {
         let Some(first) = spans.first() else {
             let base = self.line_indent(n.start);
             let inner = format!("{base}{}", self.unit);
+            let nl = self.nl;
             return (
-                format!("\n{inner}"),
-                format!("\n{base}"),
-                format!(",\n{inner}"),
+                format!("{nl}{inner}"),
+                format!("{nl}{base}"),
+                format!(",{nl}{inner}"),
                 Some(inner),
             );
         };
@@ -353,7 +369,7 @@ impl Renderer<'_> {
     /// container sits on one line.
     fn fresh(&self, v: &Value, indent: &Option<String>) -> String {
         match indent {
-            Some(i) => pretty(v, &self.unit, i),
+            Some(i) => self.pretty(v, i),
             None => v.to_string(),
         }
     }
@@ -520,6 +536,25 @@ mod tests {
             "{\"a\": \"x\"}"
         );
         assert_eq!(edit("[1]", |v| *v = json!({"a": 1})), "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn crlf_lines_stay_crlf() {
+        let t = "{\r\n  \"a\": 1,\r\n  \"e\": {}\r\n}\r\n";
+        let out = edit(t, |v| {
+            v["b"] = json!({"c": [1]});
+            v["e"]["x"] = json!(2);
+        });
+        assert_eq!(
+            out,
+            "{\r\n  \"a\": 1,\r\n  \"e\": {\r\n    \"x\": 2\r\n  },\r\n  \"b\": {\r\n    \"c\": [\r\n      1\r\n    ]\r\n  }\r\n}\r\n"
+        );
+        assert_eq!(render(Some(&out), &parse(t).unwrap()), t);
+        // A root replaced whole too.
+        assert_eq!(
+            edit("[1]\r\n", |v| *v = json!({"a": 1})),
+            "{\r\n  \"a\": 1\r\n}\r\n"
+        );
     }
 
     #[test]
