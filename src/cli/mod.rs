@@ -989,7 +989,17 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     let argv0 = std::env::args_os().next();
     let bin = service::binary(&env, argv0.as_deref())?;
     let changes = service::plan(&bin, &env, !uninstall)?;
-    let unset = service::location_overrides(&env);
+    // Where the service's daemon runs (its unit, drop-ins and the systemd
+    // user manager's environment say), as far as systemd has loaded the
+    // unit: told again once it has (see below).
+    let service_env = service::service_env(&env);
+    let mut location = service::service_paths(&env, service_env.as_ref());
+    let stop_env = |location: Option<&Paths>| {
+        location.map_or_else(
+            || service::unset_env(&service::location_overrides(&env)),
+            |p| service::stop_env(&env, p),
+        )
+    };
     // Uninstalling a service whose unit is not there touches only what
     // systemd still has of it (its unit removed by hand), if anything;
     // installing one that is runs its commands again, so it is running.
@@ -1008,17 +1018,20 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     // service's own, say, on a re-run) would only drop its clients while
     // it is restarted. Asked before the service starts, and again once it
     // has (see below).
-    let mut stop_daemon = !uninstall && service::on_demand_daemon(&env);
+    let mut stop_daemon = !uninstall && location.as_ref().is_some_and(service::on_demand_daemon);
+    let mut stop = stop_env(location.as_ref());
     let mut steps = if uninstall && changes.is_empty() {
         orphan
             .as_ref()
             .map(service::orphan_steps)
             .unwrap_or_default()
     } else {
-        service::steps(&bin, &unset, !uninstall, stop_daemon, restart)
+        service::steps(&bin, &stop, !uninstall, stop_daemon, restart)
     };
     let path = service::unit_path(&env);
     let mut notes = Vec::new();
+    // Only those the service does not already get the same value of.
+    let unset = service::overrides_unlike_service(&env, service_env.as_ref());
     if !uninstall && !unset.is_empty() {
         // A drop-in, not the unit: install replaces the unit, and would
         // drop the lines from it.
@@ -1032,9 +1045,9 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
             })
             .collect();
         notes.push(format!(
-            "{} {} set here but not in the service, which uses the default data directory \
-             and socket. To give the service the same, run `systemctl --user edit {}`, add \
-             under [Service]:{lines}\nand restart it (`systemctl --user restart {}`). That \
+            "{} {} set here but the service does not get the same value, so its daemon is \
+             not the one clients run here use. To give the service the same, run \
+             `systemctl --user edit {}`, add under [Service]:{lines}\nand restart it (`systemctl --user restart {}`). That \
              drop-in ({}) is never touched by install or uninstall.",
             unset.join(" and "),
             if unset.len() == 1 { "is" } else { "are" },
@@ -1076,7 +1089,11 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         ));
     }
     if !uninstall {
-        notes.extend(service::location_mismatch(&env));
+        notes.extend(service::location_mismatch(
+            &env,
+            service_env.as_ref(),
+            &unset,
+        ));
     }
     notes.extend(foreign);
     // The manager would never see a unit put where it does not look.
@@ -1155,15 +1172,26 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
             // A client may have started a daemon on demand since the
             // check above, before the service's daemon took the lock: the
             // service's would wait behind it for as long as it runs.
-            if !stop_daemon && service::on_demand_daemon(&env) {
-                stop_daemon = true;
-                steps = service::steps(&bin, &unset, true, true, restart);
+            // Now that systemd has loaded the unit, its drop-ins too, the
+            // service's location is known for sure; a daemon found on
+            // demand at another before counts for nothing.
+            let loaded = service::service_paths(&env, service::service_env(&env).as_ref());
+            if loaded != location {
+                location = loaded;
+                stop_daemon = false;
+                stop = stop_env(location.as_ref());
             }
+            if !stop_daemon && location.as_ref().is_some_and(service::on_demand_daemon) {
+                stop_daemon = true;
+            }
+            steps = service::steps(&bin, &stop, true, stop_daemon, restart);
             if stop_daemon {
-                service::stop_on_demand(&bin).with_context(|| {
-                    "the service is enabled and running, but stopping the daemon started on \
-                     demand failed; stop it with `agentmail daemon stop` (with \
-                     AGENTMAIL_DATA_DIR and AGENTMAIL_SOCKET unset)"
+                service::stop_on_demand(&bin, &stop).with_context(|| {
+                    format!(
+                        "the service is enabled and running, but stopping the daemon started on \
+                         demand failed; stop it with `{}`",
+                        service::stop_command(&bin, &stop)
+                    )
                 })?;
             }
         }

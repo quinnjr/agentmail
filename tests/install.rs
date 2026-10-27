@@ -2963,7 +2963,8 @@ fn service_unit_quotes_the_binary_for_systemd() {
 /// `FAKE_ACTIVE=active`, `show-environment`, which prints `FAKE_ENV`
 /// (by default, the manager's `XDG_CONFIG_HOME` the same as the CLI's),
 /// `show -p UnitPath`, which prints the manager's unit search path
-/// `FAKE_UNITPATH` (by default, nothing), and `show`, which prints
+/// `FAKE_UNITPATH` (by default, nothing), `show -p Environment`, which
+/// prints the unit's `FAKE_UNITENV` (by default, nothing), and `show`, which prints
 /// `FAKE_SHOW` (by default, no unit file), starts a daemon on demand at
 /// the default location during `enable --now` with `FAKE_START_ON_ENABLE`,
 /// and fails a call holding `FAKE_FAIL`; and the daemon's default data
@@ -2985,6 +2986,7 @@ case "$*" in
   *"show -p UnitPath"*)
     if [ -n "${FAKE_UNITPATH+x}" ]; then printf 'UnitPath=%s\n' "$FAKE_UNITPATH"; fi
     exit 0 ;;
+  *"show -p Environment"*) printf '%s' "$FAKE_UNITENV"; exit 0 ;;
   "--user show "*) printf '%s' "${FAKE_SHOW:-LoadState=not-found
 FragmentPath=
 }"; exit 0 ;;
@@ -3061,6 +3063,7 @@ exit 0
             )
             .env_remove("FAKE_SHOW")
             .env_remove("FAKE_UNITPATH")
+            .env_remove("FAKE_UNITENV")
             .env_remove("FAKE_FAIL")
             .env_remove("FAKE_START_ON_ENABLE")
             .env_remove("FAKE_RO");
@@ -3392,6 +3395,29 @@ fn service_notes_a_manager_with_other_default_locations() {
     let note = v["notes"][0].as_str().unwrap();
     assert!(note.contains("socket /run/user/4242/agentmail.sock"), "{v}");
     assert!(!note.contains("data directory"), "{v}");
+    assert!(note.contains("gets XDG_RUNTIME_DIR differently"), "{v}");
+    // An AGENTMAIL_SOCKET the manager has (imported, say) is named as the
+    // cause, not the XDG variables.
+    let out = s
+        .cli()
+        .env(
+            "FAKE_ENV",
+            format!(
+                "AGENTMAIL_SOCKET=/run/elsewhere.sock\nXDG_CONFIG_HOME={}\n",
+                s.config().display()
+            ),
+        )
+        .args(["--json", "install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    let note = v["notes"][0].as_str().unwrap();
+    assert!(note.contains("socket /run/elsewhere.sock"), "{v}");
+    assert!(note.contains("gets AGENTMAIL_SOCKET differently"), "{v}");
+    assert!(!note.contains("XDG"), "{v}");
     // Matching values: no note.
     let run = s.h.dir.path().join("run");
     std::fs::create_dir_all(&run).unwrap();
@@ -4611,4 +4637,139 @@ fn service_stops_a_daemon_started_on_demand_while_it_starts() {
         "{v}"
     );
     assert!(!s.daemon_up(s.cli()));
+}
+
+/// The service's location as its environment sets it: by a drop-in, or by
+/// the manager's environment (imported, say), the same as or unlike this
+/// shell's. Install stops the on-demand daemon there, not at the default
+/// location, and notes overrides only where they differ.
+#[test]
+fn service_stops_the_on_demand_daemon_where_the_service_runs() {
+    let s = ServiceHome::new();
+    let d = s.h.dir.path();
+    let data = d.join("svc-data");
+    let at_data = || {
+        let mut c = s.cli();
+        c.env("AGENTMAIL_DATA_DIR", &data);
+        c
+    };
+    let dropin = format!("Environment=AGENTMAIL_DATA_DIR={}\n", data.display());
+    let imported = format!(
+        "AGENTMAIL_DATA_DIR={}\nXDG_CONFIG_HOME={}\n",
+        data.display(),
+        s.config().display()
+    );
+    for (var, value) in [("FAKE_UNITENV", &dropin), ("FAKE_ENV", &imported)] {
+        // The shell has the service's value: `daemon stop` as is, and no
+        // note to give the service what it has.
+        at_data().args(["daemon", "start"]).assert().success();
+        s.cli().args(["daemon", "start"]).assert().success();
+        let out = at_data()
+            .env(var, value)
+            .args(["install", "--service"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(&format!("ran {} daemon stop", bin_path())),
+            "{var}: {out}"
+        );
+        assert!(!out.contains("note:"), "{var}: {out}");
+        assert!(!s.daemon_up(at_data()), "{var}: {out}");
+        assert!(
+            s.daemon_up(s.cli()),
+            "{var}: the default daemon was stopped"
+        );
+
+        // The shell has none: `daemon stop` is told the service's
+        // location, and the note names the variable.
+        at_data().args(["daemon", "start"]).assert().success();
+        let out = s
+            .cli()
+            .env(var, value)
+            .args(["install", "--service"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(&format!(
+                "ran env AGENTMAIL_DATA_DIR={} AGENTMAIL_SOCKET={} {} daemon stop",
+                data.display(),
+                data.join("agentmail.sock").display(),
+                bin_path()
+            )),
+            "{var}: {out}"
+        );
+        assert!(
+            out.contains(&format!("data directory {} (here: ", data.display())),
+            "{var}: {out}"
+        );
+        assert!(
+            out.contains("gets AGENTMAIL_DATA_DIR differently"),
+            "{var}: {out}"
+        );
+        assert!(!s.daemon_up(at_data()), "{var}: {out}");
+        assert!(
+            s.daemon_up(s.cli()),
+            "{var}: the default daemon was stopped"
+        );
+        s.cli().args(["daemon", "stop"]).assert().success();
+    }
+    // The shell's value unlike the service's: noted, and the daemon at the
+    // service's location is the one stopped.
+    at_data().args(["daemon", "start"]).assert().success();
+    let out = s
+        .cli()
+        .env("AGENTMAIL_DATA_DIR", d.join("mine"))
+        .env("FAKE_UNITENV", &dropin)
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("note: AGENTMAIL_DATA_DIR is set here but the service does not get"),
+        "{out}"
+    );
+    assert!(!s.daemon_up(at_data()), "{out}");
+    // An environment file the unit names counts too, over its
+    // `Environment=` lines; a missing one is skipped.
+    let file = d.join("svc.env");
+    write(
+        &file,
+        &format!("AGENTMAIL_DATA_DIR='{}'\n", d.join("from-file").display()),
+    );
+    let out = s
+        .cli()
+        .env(
+            "FAKE_UNITENV",
+            format!(
+                "{dropin}EnvironmentFiles={} (ignore_errors=no)\nEnvironmentFiles={} \
+                 (ignore_errors=yes)\n",
+                file.display(),
+                d.join("missing.env").display()
+            ),
+        )
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!(
+            "data directory {} (here: ",
+            d.join("from-file").display()
+        )),
+        "{out}"
+    );
 }

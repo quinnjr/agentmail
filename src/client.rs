@@ -71,6 +71,20 @@ async fn settled_waiter_record(paths: &Paths) -> Option<LockRecord> {
     settled_record(read, || paths.waiter_held(), false).await
 }
 
+/// [`settled_lock_record`] for a caller without an async runtime (say,
+/// `install --service`), sleeping the thread between reads.
+pub fn settled_lock_record_blocking(paths: &Paths) -> Option<LockRecord> {
+    let read = || std::fs::read(&paths.lock).ok();
+    let held = || paths.lock_held();
+    for _ in 1..RECORD_READS {
+        if let Some(settled) = settle_step(read(), &held, true) {
+            return settled;
+        }
+        std::thread::sleep(RECORD_REREAD_INTERVAL);
+    }
+    LockRecord::decode(&read()?)
+}
+
 /// The record that `read` returns the bytes of, read again while `held`
 /// and it does not decode; see [`settled_lock_record`]. With `empty_is_none`
 /// an empty file is none at once. (A waiter file is empty for an instant
@@ -81,19 +95,34 @@ async fn settled_record(
     empty_is_none: bool,
 ) -> Option<LockRecord> {
     for _ in 1..RECORD_READS {
-        let bytes = read()?;
-        if empty_is_none && bytes.is_empty() {
-            return None;
-        }
-        if let Some(rec) = LockRecord::decode(&bytes) {
-            return Some(rec);
-        }
-        if !held() {
-            return None;
+        if let Some(settled) = settle_step(read(), &held, empty_is_none) {
+            return settled;
         }
         tokio::time::sleep(RECORD_REREAD_INTERVAL).await;
     }
     LockRecord::decode(&read()?)
+}
+
+/// One read of [`settled_record`]: the answer (`Some`), or `None` when the
+/// bytes do not decode while the file is still `held`, to read again.
+fn settle_step(
+    bytes: Option<Vec<u8>>,
+    held: &impl Fn() -> bool,
+    empty_is_none: bool,
+) -> Option<Option<LockRecord>> {
+    let Some(bytes) = bytes else {
+        return Some(None);
+    };
+    if empty_is_none && bytes.is_empty() {
+        return Some(None);
+    }
+    if let Some(rec) = LockRecord::decode(&bytes) {
+        return Some(Some(rec));
+    }
+    if !held() {
+        return Some(None);
+    }
+    None
 }
 
 /// Whether `rec` is the record of a daemon serving the socket of `paths`.

@@ -151,14 +151,24 @@ replaced, or on one removed by hand), `systemctl --user try-restart
 agentmail`, since enabling a running service does not restart it on the new
 unit (a service that was not running, `enable --now` starts on the new
 unit). Last, when a daemon
-started on demand runs at the default location (its lock record does not say
-it is supervised), it runs `agentmail daemon stop` (with `AGENTMAIL_DATA_DIR`
-and `AGENTMAIL_SOCKET` unset, so it stops the daemon at the default location,
-the one the service replaces): the service's daemon, already waiting for the
+started on demand runs where the service's daemon runs (its lock record does
+not say it is supervised), it runs `agentmail daemon stop` there: the
+service's location is what its environment makes it, the systemd user
+manager's (`systemctl --user show-environment`) with the unit's and its
+drop-ins' `Environment=` and `EnvironmentFile=` over it (`systemctl --user
+show -p Environment agentmail`), and the command is shown with
+`AGENTMAIL_DATA_DIR` and `AGENTMAIL_SOCKET` unset or set as that takes
+(when the manager or unit cannot be asked, the default location, those two
+unset). The service's daemon, already waiting for the
 lock, takes over as the on-demand one exits, so no client can start another
 on demand in between. It looks again once the service is started, so a
 daemon a client started on demand while systemd was starting the service
-(which the service's would otherwise wait behind) is stopped too. With no daemon running, or the service's own
+(which the service's would otherwise wait behind) is stopped too; that look
+also reads the service's location again, now that systemd has loaded the
+unit and its drop-ins. A lock file without a record yet (a daemon records
+itself a moment after taking the lock), or with one caught mid-rewrite, is
+read again for up to a second first, so the service's own daemon that has
+just taken over is not mistaken for one on demand. With no daemon running, or the service's own
 (supervised) one, it skips that step, so a re-run leaves the service's daemon
 alone; should the step fail, the service is running all the same, and the
 error says to stop the on-demand daemon yourself. It refuses, changing
@@ -191,12 +201,14 @@ when systemd has no unit file for it any more (or still loads it from
 agentmail's removed unit), and the link only when it points to agentmail's
 unit. A service named `agentmail` loaded from elsewhere (say,
 `~/.local/share/systemd/user` or a package's), and a link to it, are yours,
-and left alone with a note saying so. The service uses
-the default data directory and socket, whatever `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you
-run the install (install notes those it finds set, with the drop-in lines
-that give the service the same; see below), as the systemd user manager's
-environment sets them (`XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `HOME`); install
-notes when those put them elsewhere than the defaults in your shell.
+and left alone with a note saying so. The service's daemon does not see
+the `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` of the shell you run the
+install in: install notes those it finds set that the service does not get
+the same value of, with the drop-in lines that give the service the same
+(see below). It also notes when the service's environment otherwise puts
+the data directory or socket elsewhere than your shell does (say, the
+manager's `XDG_RUNTIME_DIR`, or an `AGENTMAIL_DATA_DIR` a drop-in sets and
+your shell does not), naming the variables that differ.
 Uninstall leaves the service's drop-ins in place (and says so), so a later
 install uses them again. When a command fails after
 the unit is written (or, on uninstall, before or after it is removed), the

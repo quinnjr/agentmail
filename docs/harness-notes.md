@@ -1200,7 +1200,7 @@ Deviations from the plan, and why:
   one `enable --now` starts on it, so restarting that would only drop the
   clients of the daemon it just started), and runs
   `daemon stop` last, only when a daemon started on demand holds the lock
-  at the default location (its lock record does not say it is
+  where the service runs (its lock record does not say it is
   supervised). The service's daemon runs with `--wait-for-lock`, so it is
   already waiting when the on-demand daemon exits and takes over at once:
   stopping first would leave a gap in which a client starts another
@@ -1210,10 +1210,19 @@ Deviations from the plan, and why:
   on-demand daemon again once the service is started and stops one found
   only then: a client may start one between the first check and the
   service's daemon taking the lock, and the service's would wait behind it
-  for as long as it runs. A daemon records itself in the lock file a
-  moment after taking the lock, so a record whose process is gone is read
-  again (up to a second) before it is believed; otherwise a service daemon
-  that just took over from an on-demand one could be taken for it.
+  for as long as it runs. Both looks, and the `daemon stop`, use the
+  service's own location, not the default one: the manager's
+  `show-environment` with the unit's `Environment=` (drop-ins included,
+  `systemctl --user show -p Environment agentmail`) and
+  `EnvironmentFile=`s over it, read again once the second look runs
+  (systemd has then loaded the unit and its drop-ins). Otherwise a
+  service given a data directory by a drop-in, the README's way, would
+  wait behind an on-demand daemon there that install never stopped. A
+  daemon records itself in the lock file a moment after taking the lock,
+  so a record whose process is gone, a lock file still empty, or a record
+  caught mid-rewrite (read as clients read it) is read again (up to a
+  second) before it is believed; otherwise a service daemon that just
+  took the lock could be taken for one on demand and stopped.
 - **Manager states.** The plan says install errors out when `systemctl
   --user is-system-running` fails. That command exits 1 for `degraded`
   (some other unit failed) and for `starting`/`initializing` (still
@@ -1229,9 +1238,12 @@ Deviations from the plan, and why:
   `import-environment` and `set-environment` change), not the
   `XDG_CONFIG_HOME`/`HOME` of the manager process that builds the search
   path, so it gave false refusals and `set-environment` cannot fix a real
-  one. `show-environment` is still what install reads to note a service
-  data directory or socket that differs from the shell's defaults, since
-  those come from the environment the service's daemon gets. Only the
+  one. `show-environment` (with the unit's environment over it, as
+  above) is still what install reads to note a service data directory or
+  socket that differs from the shell's, since those come from the
+  environment the service's daemon gets; the note names the variables
+  that differ, and `AGENTMAIL_DATA_DIR`/`AGENTMAIL_SOCKET` set in the
+  shell are noted only when the service does not already get the same. Only the
   variables the location depends on (`HOME`, `XDG_RUNTIME_DIR`,
   `XDG_DATA_HOME`, `AGENTMAIL_DATA_DIR`, `AGENTMAIL_SOCKET`) are read
   from it: a quoted (`$'...'`) value of one of those skips the note, one

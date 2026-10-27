@@ -12,6 +12,7 @@
 //! reachable, and otherwise give the steps to do
 //! by hand. `AGENTMAIL_SYSTEMCTL` names the `systemctl` to run (tests).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -43,7 +44,7 @@ WantedBy=default.target
 ";
 
 /// The variables that move the daemon's data directory and socket away
-/// from their defaults, which the service does not see.
+/// from their defaults.
 pub const LOCATION_VARS: [&str; 2] = ["AGENTMAIL_DATA_DIR", "AGENTMAIL_SOCKET"];
 
 /// The variables the daemon's data directory and socket depend on (see
@@ -56,6 +57,10 @@ const PATH_VARS: [&str; 5] = [
     "HOME",
 ];
 
+/// The service's environment, as far as the daemon's location goes: the
+/// values of [`PATH_VARS`] its daemon gets (see [`service_env`]).
+pub type ServiceEnv = HashMap<String, String>;
+
 /// Of [`LOCATION_VARS`], those set in `env`.
 pub fn location_overrides(env: &Env) -> Vec<&'static str> {
     LOCATION_VARS
@@ -64,22 +69,41 @@ pub fn location_overrides(env: &Env) -> Vec<&'static str> {
         .collect()
 }
 
+/// Whether two values of a variable the daemon's location depends on name
+/// the same location: both unset (or empty), or the same path.
+fn same_value(a: Option<&str>, b: Option<&str>) -> bool {
+    fn path(v: Option<&str>) -> Option<&Path> {
+        v.filter(|v| !v.is_empty()).map(Path::new)
+    }
+    path(a) == path(b)
+}
+
+/// `env`'s value of the variable `k` ([`Env::home`] for `HOME`).
+fn here_value<'a>(env: &'a Env, k: &str) -> Option<&'a str> {
+    if k == "HOME" {
+        env.home.to_str()
+    } else {
+        env.var(k)
+    }
+}
+
 /// The environment the systemd user manager passes to the units it starts,
-/// the service's daemon among them (`systemctl --user show-environment`),
-/// with `HOME` defaulting to `env`'s. Nothing when the
+/// the service's daemon among them (`systemctl --user show-environment`,
+/// which `import-environment` and `set-environment` change), with `HOME`
+/// defaulting to `env`'s. Nothing when the
 /// manager cannot be asked, or the value of a variable the daemon's
 /// location depends on ([`PATH_VARS`]) cannot be read (one with special
 /// characters is shown quoted, `$'...'`). Other variables' quoted values
 /// (say, a multi-line one a desktop session imported) are left out: they
 /// matter to nothing here, and a line of one may not even be a variable.
-fn manager_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
+fn manager_env(env: &Env) -> Option<ServiceEnv> {
     let out = Command::new(systemctl(env))
         .args(["--user", "show-environment"])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
     let text = String::from_utf8(out.stdout).ok()?;
-    let mut manager = std::collections::HashMap::new();
+    let mut manager = HashMap::new();
     for (k, v) in text.lines().filter_map(|l| l.split_once('=')) {
         if !PATH_VARS.contains(&k) {
             continue;
@@ -95,89 +119,327 @@ fn manager_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
     Some(manager)
 }
 
-/// The default daemon location here: `env`'s, but for [`LOCATION_VARS`],
-/// which the service does not see. `daemon stop` run by install uses it.
+/// The words of a list property `systemctl show` prints (say,
+/// `Environment="A=a b" C=d`): separated by spaces, each bare or
+/// double-quoted with `\` escapes. Nothing when it holds anything else
+/// (say, a `$'...'` word).
+fn show_words(s: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        while chars.next_if_eq(&' ').is_some() {}
+        let Some(first) = chars.next() else {
+            return Some(words);
+        };
+        let mut word = String::new();
+        if first == '"' {
+            loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => word.push(chars.next()?),
+                    ch => word.push(ch),
+                }
+            }
+            if chars.peek().is_some_and(|&c| c != ' ') {
+                return None;
+            }
+        } else {
+            word.push(first);
+            while let Some(ch) = chars.next_if(|&c| c != ' ') {
+                word.push(ch);
+            }
+            if word.contains(['"', '\'', '\\']) {
+                return None;
+            }
+        }
+        words.push(word);
+    }
+}
+
+/// The variables an environment file (`EnvironmentFile=`) sets, of those
+/// in [`PATH_VARS`]: `KEY=VALUE` lines, the value bare or in matching
+/// quotes, `#` and `;` lines comments. Nothing when one of those variables
+/// is set in a way read differently by systemd (escapes, a value spanning
+/// lines), or a line continues the next.
+fn env_file_vars(text: &str) -> Option<Vec<(String, String)>> {
+    let mut vars = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.ends_with('\\') {
+            return None;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        let quoted = v.starts_with(['"', '\'']);
+        let closed = quoted && v.len() >= 2 && v.ends_with(&v[..1]);
+        if quoted && !closed {
+            // A value spanning lines: what follows is not a variable.
+            return None;
+        }
+        if !PATH_VARS.contains(&k) {
+            continue;
+        }
+        let single = closed && v.starts_with('\'');
+        let v = if closed { &v[1..v.len() - 1] } else { v };
+        let special: &[char] = if single {
+            &['\'']
+        } else {
+            &['"', '\'', '\\', '$']
+        };
+        if v.contains(special) {
+            return None;
+        }
+        vars.push((k.to_string(), v.to_string()));
+    }
+    Some(vars)
+}
+
+/// The variables of [`PATH_VARS`] the service's unit sets: its
+/// `Environment=` lines, drop-ins included (`systemctl --user show -p
+/// Environment`, specifiers expanded), then its `EnvironmentFile=`s, which
+/// override them (a missing file is skipped: systemd then starts the
+/// service without it, if at all). Nothing when systemd cannot be asked or
+/// a value cannot be read. For a unit systemd has not loaded, none.
+fn unit_env(env: &Env) -> Option<Vec<(String, String)>> {
+    let out = Command::new(systemctl(env))
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "Environment",
+            "-p",
+            "EnvironmentFiles",
+            NAME,
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut vars = Vec::new();
+    for words in text.lines().filter_map(|l| l.strip_prefix("Environment=")) {
+        for w in show_words(words)? {
+            if let Some((k, v)) = w.split_once('=')
+                && PATH_VARS.contains(&k)
+            {
+                vars.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    for file in text
+        .lines()
+        .filter_map(|l| l.strip_prefix("EnvironmentFiles="))
+    {
+        let file = file
+            .rsplit_once(" (ignore_errors=")
+            .map_or(file, |(f, _)| f);
+        match std::fs::read_to_string(file) {
+            Ok(t) => vars.extend(env_file_vars(&t)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(vars)
+}
+
+/// The environment the service's daemon gets, as far as its location goes
+/// ([`PATH_VARS`]): the systemd user manager's (see [`manager_env`]), with
+/// what the unit and its drop-ins set over it (see [`unit_env`]). Nothing
+/// when either cannot be told.
+pub fn service_env(env: &Env) -> Option<ServiceEnv> {
+    let mut vars = manager_env(env)?;
+    vars.extend(unit_env(env)?);
+    Some(vars)
+}
+
+/// The daemon location here: `env`'s, with its [`LOCATION_VARS`].
+fn here_paths(env: &Env) -> Option<crate::paths::Paths> {
+    crate::paths::Paths::from_vars(|k| here_value(env, k).map(std::ffi::OsString::from)).ok()
+}
+
+/// The default daemon location here: `env`'s, but for [`LOCATION_VARS`].
 pub fn default_paths(env: &Env) -> Option<crate::paths::Paths> {
     crate::paths::Paths::from_vars(|k| {
         if LOCATION_VARS.contains(&k) {
             None
-        } else if k == "HOME" {
-            Some(env.home.clone().into_os_string())
         } else {
-            env.var(k).map(std::ffi::OsString::from)
+            here_value(env, k).map(std::ffi::OsString::from)
         }
     })
     .ok()
 }
 
-/// Whether a daemon started on demand runs at the default location (see
-/// [`default_paths`]): one holds the lock there, and its lock record does
-/// not say it is supervised (a daemon from before lock records, which
+/// Where the service's daemon runs: from its environment `service` (see
+/// [`service_env`]), or, when that cannot be told, the default location
+/// here (see [`default_paths`]). Nothing when it cannot be resolved (say,
+/// a relative `AGENTMAIL_DATA_DIR`, which the daemon refuses).
+pub fn service_paths(env: &Env, service: Option<&ServiceEnv>) -> Option<crate::paths::Paths> {
+    match service {
+        Some(s) => crate::paths::Paths::from_vars(|k| s.get(k).map(std::ffi::OsString::from)).ok(),
+        None => default_paths(env),
+    }
+}
+
+/// How `daemon stop`, run by install, is told the location `service` (see
+/// [`service_paths`]): variables to unset (`None`) or set. Nothing when the
+/// location here is that one; [`LOCATION_VARS`] set here unset when the
+/// default location here is; else both set to it.
+pub type StopEnv = Vec<(&'static str, Option<PathBuf>)>;
+
+/// The [`StopEnv`] for the service's location `service`.
+pub fn stop_env(env: &Env, service: &crate::paths::Paths) -> StopEnv {
+    if here_paths(env).as_ref() == Some(service) {
+        Vec::new()
+    } else if default_paths(env).as_ref() == Some(service) {
+        unset_env(&location_overrides(env))
+    } else {
+        vec![
+            ("AGENTMAIL_DATA_DIR", Some(service.data_dir.clone())),
+            ("AGENTMAIL_SOCKET", Some(service.socket.clone())),
+        ]
+    }
+}
+
+/// The [`StopEnv`] that unsets `vars`.
+pub fn unset_env(vars: &[&'static str]) -> StopEnv {
+    vars.iter().map(|&k| (k, None)).collect()
+}
+
+/// `bin daemon stop` with `stop` (see [`StopEnv`]), as the user would type
+/// it.
+pub fn stop_command(bin: &Path, stop: &StopEnv) -> String {
+    let mut env_part = String::new();
+    for (k, v) in stop {
+        let arg = match v {
+            None => format!("-u {k}"),
+            Some(v) => shell_quote(&format!("{k}={}", v.to_string_lossy())),
+        };
+        env_part.push_str(&arg);
+        env_part.push(' ');
+    }
+    let env_part = if env_part.is_empty() {
+        env_part
+    } else {
+        format!("env {env_part}")
+    };
+    format!(
+        "{env_part}{} daemon stop",
+        shell_quote(&bin.to_string_lossy())
+    )
+}
+
+/// Whether a daemon started on demand runs at `p` (the service's location,
+/// see [`service_paths`]): one holds the lock there, and its lock record
+/// does not say it is supervised (a daemon from before lock records, which
 /// writes none, is taken as on demand). Install stops only such a daemon:
 /// a supervised one is the service's own (or another supervisor's), and
 /// stopping it would only drop its clients while it is restarted.
 ///
 /// A daemon that has just taken the lock records itself a moment later:
-/// until then the record is its predecessor's, whose process is gone. Such
-/// a record is read again for up to a second before it is believed.
-pub fn on_demand_daemon(env: &Env) -> bool {
-    let Some(p) = default_paths(env) else {
-        return false;
-    };
+/// until then the lock file holds its predecessor's record, whose process
+/// is gone, or nothing (a lock file just created), or, while the record is
+/// rewritten, one that does not decode. The record is read as clients read
+/// it (see [`crate::client::settled_lock_record`]), and any of those is
+/// read again for up to a second before it is believed.
+pub fn on_demand_daemon(p: &crate::paths::Paths) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
     loop {
         if !p.lock_held() {
             return false;
         }
-        match p.lock_record() {
+        let waiting = std::time::Instant::now() < deadline;
+        match crate::client::settled_lock_record_blocking(p) {
+            None if waiting => pause(),
             None => return true,
-            Some(r)
-                if crate::procinfo::proc_id(r.pid).is_none()
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            Some(r) if crate::procinfo::proc_id(r.pid).is_none() && waiting => pause(),
             Some(r) => return !r.supervised,
         }
     }
 }
 
-/// The data directory and socket the service's daemon uses, from the
-/// systemd user manager's environment (see [`manager_env`]), when they
-/// differ from the defaults here, which `daemon stop` (and every client
-/// here not told otherwise) uses: then a note saying so. The defaults
-/// depend on `XDG_DATA_HOME` and `XDG_RUNTIME_DIR`, which a shell (say, an
-/// ssh session without pam_systemd) may set differently from the manager.
-/// Nothing when the manager cannot be asked, or a value cannot be read.
-pub fn location_mismatch(env: &Env) -> Option<String> {
-    let manager = manager_env(env)?;
-    let service =
-        crate::paths::Paths::from_vars(|k| manager.get(k).map(std::ffi::OsString::from)).ok()?;
-    let here = default_paths(env)?;
+/// Of [`LOCATION_VARS`] set here, those the service does not get the same
+/// value of (see [`service_env`]; all of them when that is not known).
+pub fn overrides_unlike_service(env: &Env, service: Option<&ServiceEnv>) -> Vec<&'static str> {
+    location_overrides(env)
+        .into_iter()
+        .filter(|k| service.is_none_or(|s| !same_value(s.get(*k).map(String::as_str), env.var(k))))
+        .collect()
+}
+
+/// When the service's daemon runs elsewhere than the daemon clients here
+/// use, beyond what the variables `noted` (see
+/// [`overrides_unlike_service`], noted on their own) explain: a note
+/// saying where, and which variables the service gets differently from
+/// this shell. Say, the manager's `XDG_RUNTIME_DIR` (which an ssh session
+/// without pam_systemd may not share), or an `AGENTMAIL_DATA_DIR` a
+/// drop-in sets and this shell does not. Nothing when the service's
+/// environment cannot be told (see [`service_env`]).
+pub fn location_mismatch(
+    env: &Env,
+    service: Option<&ServiceEnv>,
+    noted: &[&str],
+) -> Option<String> {
+    let mut vars = service?.clone();
+    // As if the service got the noted variables as set here.
+    for k in noted {
+        match env.var(k) {
+            Some(v) => vars.insert(k.to_string(), v.to_string()),
+            None => vars.remove(*k),
+        };
+    }
+    let paths = |vars: &ServiceEnv| {
+        crate::paths::Paths::from_vars(|k| vars.get(k).map(std::ffi::OsString::from)).ok()
+    };
+    let theirs = paths(&vars)?;
+    let here = here_paths(env)?;
     let mut diff = Vec::new();
-    if service.socket != here.socket {
+    if theirs.socket != here.socket {
         diff.push(format!(
-            "socket {} (default here: {})",
-            service.socket.display(),
+            "socket {} (here: {})",
+            theirs.socket.display(),
             here.socket.display()
         ));
     }
-    if service.data_dir != here.data_dir {
+    if theirs.data_dir != here.data_dir {
         diff.push(format!(
-            "data directory {} (default here: {})",
-            service.data_dir.display(),
+            "data directory {} (here: {})",
+            theirs.data_dir.display(),
             here.data_dir.display()
         ));
     }
     if diff.is_empty() {
         return None;
     }
+    let differing: Vec<&str> = PATH_VARS
+        .into_iter()
+        .filter(|k| !same_value(vars.get(*k).map(String::as_str), here_value(env, k)))
+        .collect();
+    // Those that move the location on their own, if any do.
+    let moving: Vec<&str> = differing
+        .iter()
+        .copied()
+        .filter(|k| {
+            let mut v = vars.clone();
+            match here_value(env, k) {
+                Some(x) => v.insert(k.to_string(), x.to_string()),
+                None => v.remove(*k),
+            };
+            paths(&v).as_ref() != Some(&theirs)
+        })
+        .collect();
+    let named = if moving.is_empty() { differing } else { moving };
     Some(format!(
-        "the service gets the {} from the systemd user manager's environment, which sets \
-         XDG_RUNTIME_DIR, XDG_DATA_HOME or HOME differently: `daemon stop` and clients run \
-         here use a daemon of their own, not the service's. Set the same values here, or in \
-         the manager with `systemctl --user set-environment`.",
-        diff.join(" and the ")
+        "the service's daemon uses the {}: the service gets {} differently from this shell (from \
+         the systemd user manager's environment, or its unit and drop-ins), so `daemon stop` and \
+         clients run here use a daemon of their own, not the service's. Set the same values \
+         here, or give the service this shell's, in a drop-in (`systemctl --user edit {NAME}`) \
+         or with `systemctl --user set-environment`.",
+        diff.join(" and the "),
+        named.join(", ")
     ))
 }
 
@@ -547,9 +809,9 @@ fn removal_steps(path: &Path) -> String {
 
 /// The commands install (`install`) or uninstall runs after (install) or
 /// around (uninstall) changing the unit, as the user would type them, for
-/// `bin` and the daemon location overrides `unset` (see
-/// [`location_overrides`]), which `daemon stop` leaves out so that it stops
-/// the daemon at the default location, the one the service replaces. With
+/// `bin`, with `daemon stop` told the service's location by `stop` (see
+/// [`stop_env`]), so that it stops the daemon there, the one the service
+/// replaces. With
 /// `restart` (install, changing the unit while the service runs, on the
 /// unit replaced or on one removed by hand), the service is restarted so
 /// that it runs the new unit: enabling a running service does not (a
@@ -560,7 +822,7 @@ fn removal_steps(path: &Path) -> String {
 /// runs; see [`on_demand_daemon`].)
 pub fn steps(
     bin: &Path,
-    unset: &[&str],
+    stop: &StopEnv,
     install: bool,
     stop_daemon: bool,
     restart: bool,
@@ -574,16 +836,7 @@ pub fn steps(
             s.push(format!("systemctl --user try-restart {NAME}"));
         }
         if stop_daemon {
-            let env_u: String = unset.iter().map(|k| format!("-u {k} ")).collect();
-            let env_u = if env_u.is_empty() {
-                env_u
-            } else {
-                format!("env {env_u}")
-            };
-            s.push(format!(
-                "{env_u}{} daemon stop",
-                shell_quote(&bin.to_string_lossy())
-            ));
+            s.push(stop_command(bin, stop));
         }
         s
     } else {
@@ -815,10 +1068,16 @@ pub fn unavailable(env: &Env) -> Option<String> {
 /// systemd user manager is not available to agentmail.
 pub fn manual(bin: &Path, env: &Env, install: bool) -> String {
     let path = unit_path(env);
-    let steps = steps(bin, &location_overrides(env), install, true, false)
-        .iter()
-        .map(|s| format!("  {s}\n"))
-        .collect::<String>();
+    let steps = steps(
+        bin,
+        &unset_env(&location_overrides(env)),
+        install,
+        true,
+        false,
+    )
+    .iter()
+    .map(|s| format!("  {s}\n"))
+    .collect::<String>();
     if install {
         let unit = unit(bin).unwrap_or_else(|e| format!("({e:#})\n"));
         format!(
@@ -853,16 +1112,19 @@ pub fn start(env: &Env, restart: bool) -> Result<()> {
 }
 
 /// Install, once the service is started: stop the daemon running on
-/// demand at the default location (with `bin daemon stop`,
-/// [`LOCATION_VARS`] left out), so that the service's, waiting for the
-/// lock, takes over (see [`steps`] and [`on_demand_daemon`]).
-pub fn stop_on_demand(bin: &Path) -> Result<()> {
+/// demand at the service's location (with `bin daemon stop`, told that
+/// location by `stop`; see [`stop_env`]), so that the service's, waiting
+/// for the lock, takes over (see [`steps`] and [`on_demand_daemon`]).
+pub fn stop_on_demand(bin: &Path, stop: &StopEnv) -> Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(["daemon", "stop"]);
-    for k in LOCATION_VARS {
-        cmd.env_remove(k);
+    for (k, v) in stop {
+        match v {
+            None => cmd.env_remove(k),
+            Some(v) => cmd.env(k, v),
+        };
     }
-    run_cmd(cmd, &format!("{} daemon stop", bin.display()))
+    run_cmd(cmd, &stop_command(bin, stop))
 }
 
 /// Uninstall, before the unit file is removed: disable and stop the
@@ -972,5 +1234,107 @@ mod tests {
         ] {
             assert!(!written_exec(e), "{e}");
         }
+    }
+
+    #[test]
+    fn show_words_unquotes_what_systemctl_prints() {
+        assert_eq!(show_words(""), Some(vec![]));
+        assert_eq!(
+            show_words(r#""A=a b" "C=x\"y" D=plain "F=\$HOME""#),
+            Some(vec![
+                "A=a b".to_string(),
+                "C=x\"y".to_string(),
+                "D=plain".to_string(),
+                "F=$HOME".to_string()
+            ])
+        );
+        assert_eq!(show_words("$'A=\\n'"), None);
+        assert_eq!(show_words(r#""A=b"c"#), None);
+        assert_eq!(show_words(r#""A=b"#), None);
+    }
+
+    #[test]
+    fn env_file_vars_reads_only_what_it_can() {
+        let text = "# c\n; c\n\nOTHER=\"a\\b\"\nHOME=/h\n AGENTMAIL_DATA_DIR = \"/a b\"\n\
+                    XDG_RUNTIME_DIR='/r$x'\n";
+        assert_eq!(
+            env_file_vars(text),
+            Some(vec![
+                ("HOME".to_string(), "/h".to_string()),
+                ("AGENTMAIL_DATA_DIR".to_string(), "/a b".to_string()),
+                ("XDG_RUNTIME_DIR".to_string(), "/r$x".to_string()),
+            ])
+        );
+        assert_eq!(env_file_vars("HOME=/a\\ b\n"), None);
+        assert_eq!(env_file_vars("HOME=\"/a\\\"b\"\n"), None);
+        assert_eq!(env_file_vars("OTHER=\"a\nHOME=/x\"\n"), None);
+        assert_eq!(env_file_vars("OTHER=a \\\nHOME=/x\n"), None);
+    }
+
+    /// A lock held with no record yet (a lock file just created), or with
+    /// one caught mid-rewrite, is read again until the record is written,
+    /// so a supervised daemon that has just taken the lock is not taken for
+    /// one on demand.
+    #[test]
+    fn on_demand_daemon_waits_for_the_record() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::Paths::in_dir(dir.path());
+        let rec = |supervised| crate::paths::LockRecord {
+            supervised,
+            pid: std::process::id(),
+            socket: paths.socket.clone(),
+        };
+        let mut torn = rec(false).encode();
+        torn.extend_from_slice(b"tail\n");
+        for before in [Vec::new(), torn] {
+            std::fs::write(&paths.lock, &before).unwrap();
+            let lock = std::fs::File::open(&paths.lock).unwrap();
+            lock.try_lock().unwrap();
+            let writer = std::thread::spawn({
+                let path = paths.lock.clone();
+                let bytes = rec(true).encode();
+                move || {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                    file.write_all_at(&bytes, 0).unwrap();
+                    file.set_len(bytes.len() as u64).unwrap();
+                }
+            });
+            assert!(!on_demand_daemon(&paths), "{before:?}");
+            writer.join().unwrap();
+            drop(lock);
+        }
+        // A record that never comes (a daemon from before lock records) is
+        // taken as on demand, as is a record saying so.
+        std::fs::write(&paths.lock, b"").unwrap();
+        let lock = std::fs::File::open(&paths.lock).unwrap();
+        lock.try_lock().unwrap();
+        assert!(on_demand_daemon(&paths));
+        std::fs::write(&paths.lock, rec(false).encode()).unwrap();
+        assert!(on_demand_daemon(&paths));
+        drop(lock);
+        // No lock held: none.
+        assert!(!on_demand_daemon(&paths));
+    }
+
+    #[test]
+    fn stop_command_shows_the_location_given() {
+        let bin = Path::new("/b/agentmail");
+        assert_eq!(stop_command(bin, &Vec::new()), "/b/agentmail daemon stop");
+        assert_eq!(
+            stop_command(bin, &unset_env(&LOCATION_VARS)),
+            "env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET /b/agentmail daemon stop"
+        );
+        assert_eq!(
+            stop_command(
+                bin,
+                &vec![
+                    ("AGENTMAIL_DATA_DIR", Some(PathBuf::from("/a b"))),
+                    ("AGENTMAIL_SOCKET", Some(PathBuf::from("/s"))),
+                ]
+            ),
+            "env 'AGENTMAIL_DATA_DIR=/a b' AGENTMAIL_SOCKET=/s /b/agentmail daemon stop"
+        );
     }
 }
