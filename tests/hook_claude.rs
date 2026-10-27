@@ -281,6 +281,93 @@ async fn post_tool_urgent_once() {
 }
 
 #[tokio::test]
+async fn subagent_post_tool_leaves_urgent_mail_to_the_main_agent() {
+    // Claude Code runs PostToolUse for a subagent's tool calls too, with
+    // `agent_id` set. Urgent mail is the main agent's to see: a subagent
+    // must neither use up its one push nor be told who the agent is.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "STOP", "the schema changed: do not migrate", true).await;
+
+    let out = run(&env, HookEvent::PostTool, "post-tool-subagent").await;
+    assert!(silent(&out), "{out:?}");
+
+    let main = context(
+        &run(&env, HookEvent::PostTool, "post-tool").await,
+        "PostToolUse",
+    );
+    assert!(main.contains("do not migrate"), "{main}");
+}
+
+#[tokio::test]
+async fn subagent_hooks_say_nothing() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "schema", "see the PR", false).await;
+    ask(&d, &a, "POST /orders body?").await;
+    let payload = |event: &str| {
+        let mut v: Value = serde_json::from_slice(&fixture(event)).unwrap();
+        v["agent_id"] = "aeb4c58b205863493".into();
+        serde_json::to_vec(&v).unwrap()
+    };
+    for (event, name) in ALL_EVENTS {
+        let stdin = payload(name);
+        let out = hook::run(Harness::ClaudeCode, event, &stdin, &|k| env.get(k)).await;
+        assert!(silent(&out), "{event:?}: {out:?}");
+    }
+}
+
+#[tokio::test]
+async fn subagent_tool_call_marks_the_session_busy() {
+    // A subagent runs inside the main agent's turn: the session is busy.
+    let d = TestDaemon::start().await;
+    register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    run(&env, HookEvent::PostTool, "post-tool-subagent").await;
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
+}
+
+#[tokio::test]
+async fn post_tool_failure_names_its_event() {
+    // Failed tool calls run PostToolUseFailure instead of PostToolUse; the
+    // output must name the event it answers.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "STOP", "the schema changed: do not migrate", true).await;
+    let ctx = context(
+        &run(&env, HookEvent::PostTool, "post-tool-failure").await,
+        "PostToolUseFailure",
+    );
+    assert!(ctx.contains("do not migrate"), "{ctx}");
+    let ctx = context(
+        &run(&env, HookEvent::PostTool, "post-tool-failure").await,
+        "PostToolUseFailure",
+    );
+    assert!(ctx.contains("1 unread"), "{ctx}");
+}
+
+#[tokio::test]
+async fn address_variable_does_not_name_the_hook_agent() {
+    // A hook resolves only by its harness process (or `--session`): an
+    // `AGENTMAIL_ADDRESS` inherited from an outer agent's shell must not
+    // make an inner Claude Code's hooks act as that agent.
+    let d = TestDaemon::start().await;
+    let outer = common::register(&mut d.client().await, "outer", d.dir.path()).await;
+    send(&d, &outer, "STOP", "not yours", true).await;
+    let env = Env::of(&d.paths).with("AGENTMAIL_ADDRESS", &outer);
+    for (event, payload) in ALL_EVENTS {
+        let out = run(&env, event, payload).await;
+        assert!(silent(&out), "{event:?}: {out:?}");
+    }
+}
+
+#[tokio::test]
 async fn urgent_body_is_capped() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
@@ -536,6 +623,66 @@ async fn busy_session_mail_is_not_a_wake() {
     assert!(silent(&out), "{out:?}");
 }
 
+/// The files under the daemon's `hook-wait/` directory.
+fn wait_files(paths: &Paths) -> Vec<String> {
+    match std::fs::read_dir(paths.data_dir.join("hook-wait")) {
+        Ok(dir) => dir
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn hooks_without_a_wait_leave_no_files() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", false).await;
+    let env = Env::of(&d.paths);
+    send(&d, &a, "schema", "see the PR", false).await;
+    for (event, payload) in ALL_EVENTS {
+        run(&env, event, payload).await;
+    }
+    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn signoff_during_a_wait_leaves_no_files() {
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    assert!(!wait_files(&d.paths).is_empty(), "the wait wrote nothing");
+    d.client()
+        .await
+        .call(&agent(&a), Request::Signoff)
+        .await
+        .unwrap();
+    let out = finish(h).await;
+    assert!(silent(&out), "{out:?}");
+    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn signoff_after_a_wait_leaves_no_files() {
+    // The wait ended (the session got busy) and left its files for the
+    // next one; signing off removes them.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let h = spawn(&env, HookEvent::Wait, "stop");
+    assert!(still_waiting(&h, 0.5).await);
+    run(&env, HookEvent::Prompt, "prompt").await;
+    assert!(silent(&finish(h).await));
+    assert!(!wait_files(&d.paths).is_empty());
+    d.client()
+        .await
+        .call(&agent(&a), Request::Signoff)
+        .await
+        .unwrap();
+    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn hook_latency_under_20ms() {
     let d = TestDaemon::start().await;
@@ -703,4 +850,6 @@ async fn wait_exits_when_its_harness_exits() {
         .expect("the hook outlived its harness")
         .unwrap();
     assert!(ended.duration_since(killed) < Duration::from_secs(5));
+    // A wait whose harness is gone cleans up after itself.
+    assert_eq!(wait_files(&d.paths), Vec::<String>::new());
 }

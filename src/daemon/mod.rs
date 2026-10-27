@@ -456,7 +456,7 @@ pub async fn serve_until(cfg: DaemonConfig, stop: impl Future<Output = ()>) -> R
     let _ = std::fs::remove_file(paths.startup_error());
 
     let store_ref = Arc::downgrade(&store);
-    let handler = Arc::new(Handler::new(store, Hub::new()));
+    let handler = Arc::new(Handler::new(store, Hub::new()).with_data_dir(&paths.data_dir));
     let data_dir: Arc<Path> = Arc::from(paths.data_dir.as_path());
 
     // Connections that were asked to `Shutdown` hand over the writer for

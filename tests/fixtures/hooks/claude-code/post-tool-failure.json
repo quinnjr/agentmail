@@ -1,0 +1,20 @@
+{
+  "session_id": "02a74402-679b-4f52-84f0-5914e8a54482",
+  "transcript_path": "/home/user/.claude/projects/-home-user-project/02a74402-679b-4f52-84f0-5914e8a54482.jsonl",
+  "cwd": "/home/user/project",
+  "prompt_id": "ec919db9-0d6a-4adb-9f5f-616d58448bd9",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "false",
+    "description": "Run the false command"
+  },
+  "tool_use_id": "toolu_01PoQvcwicarcySeYZs7LC2M",
+  "error": "Exit code 1",
+  "is_interrupt": false,
+  "duration_ms": 50
+}

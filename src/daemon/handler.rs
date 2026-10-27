@@ -31,6 +31,9 @@ pub const TOUCH_INTERVAL_MS: i64 = 1000;
 pub struct Handler {
     store: Arc<Store>,
     hub: Hub,
+    /// The daemon's data directory, for the files waiting hooks keep
+    /// there; `None` in tests that serve no hooks.
+    data_dir: Option<std::path::PathBuf>,
 }
 
 /// Map a store error to the code clients see.
@@ -539,7 +542,18 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 
 impl Handler {
     pub fn new(store: Arc<Store>, hub: Hub) -> Handler {
-        Handler { store, hub }
+        Handler {
+            store,
+            hub,
+            data_dir: None,
+        }
+    }
+
+    /// Serve hooks whose files live under `data_dir`: an agent's are
+    /// removed when it signs off.
+    pub fn with_data_dir(mut self, data_dir: &std::path::Path) -> Handler {
+        self.data_dir = Some(data_dir.to_path_buf());
+        self
     }
 
     pub fn hub(&self) -> &Hub {
@@ -1204,6 +1218,9 @@ impl Handler {
                     return Err(human_has_no("session to sign off"));
                 }
                 self.store.signoff(&me).map_err(store_err)?;
+                if let Some(dir) = &self.data_dir {
+                    crate::hook::clear_wait_state(dir, &me);
+                }
                 let view = self.agent_view(&me)?;
                 self.publish_presence(&view);
                 to_json(&view)

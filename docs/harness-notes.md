@@ -180,7 +180,7 @@ model credentials that an isolated config does not have).
   registration. Only a process outside that opencode gets past it.
 - **Resolution order** in the CLI: `--as human`, `AGENTMAIL_ADDRESS`,
   `AGENTMAIL_HUMAN=1`, `OPENCODE_SESSION_ID` (checked as above), then
-  process ancestry.
+  process ancestry. Hooks differ: see "Hook identity" below.
 
 ## Claude Code hooks (Task 4)
 
@@ -209,11 +209,32 @@ come from the binary's bundled settings schema.
   2. So `agentmail hook wait` does nothing unless `CLAUDE_CODE_ENTRYPOINT`
   is unset or `cli` (the interactive UI; `-p` sets `sdk-cli`): waiting
   would hold every headless run open until mail came.
+- **Limitation: idle wake works only in the terminal UI.** The binary
+  knows other entry points (`claude-vscode`, `claude-desktop`,
+  `claude-desktop-3p`, `local-agent`, `remote*`, `sdk-ts`, `sdk-py`, the
+  GitHub action), and an `asyncRewake` hook is backgrounded when the
+  session is interactive or has streaming input
+  (`async || asyncRewake && (!nonInteractive || hasStreamingInput)`), so
+  the IDE and desktop hosts probably background it. That was not checked
+  live (it needs those hosts), and a wrong guess would hold a turn open
+  for up to a day, so the wait hook stays silent under every entry point
+  but `cli`. Under the IDE and desktop integrations the other hooks work
+  (reminders, urgent mail, the Stop block for open questions), but an
+  idle session is not woken for new mail. The README's support table
+  (Task 11) must say so.
 - **Timeouts.** `timeout` is in seconds, any positive number; the schema
   sets no maximum. It applies to `asyncRewake` hooks too: with `timeout: 5`
-  a rewake hook sleeping 15 s was killed and never woke the session. A hook
-  with no `timeout` on `UserPromptSubmit` was killed after about 30 s
-  (both interactive and `-p`), and the prompt went ahead. agentmail sets
+  a rewake hook sleeping 15 s was killed and never woke the session.
+  Defaults when `timeout` is unset, read from the 2.1.311 binary: a
+  command hook gets 600 s (`e.timeout ? e.timeout*1000 : 600000`, the same
+  constant for synchronous runs and for the `asyncTimeout` of `async` /
+  `asyncRewake` hooks). The event runners pass the same 600 s for
+  `SessionStart`, `PostToolUse`, `PostToolUseFailure` and `Stop`.
+  `UserPromptSubmit` alone runs under a 30 s limit (constant `30000`),
+  which matches what was observed: a hook with no `timeout` there was
+  killed after about 30 s (both interactive and `-p`), and the prompt went
+  ahead. So for the events agentmail uses: 600 s for all but
+  `UserPromptSubmit` (30 s), whatever the hook's own `timeout`. agentmail sets
   `timeout` on every hook: 10 for the quick ones, 86400 (a day) for the
   wait hook, observed to be accepted and to stay alive past the shorter
   waits. Node timers overflow above 2^31-1 ms (about 24.8 days), so
@@ -236,9 +257,40 @@ come from the binary's bundled settings schema.
 - **Payloads** (stdin) are recorded in `tests/fixtures/hooks/claude-code/`
   (paths anonymised): `session-start.json` (`source`, `model`),
   `prompt.json` (`prompt`), `post-tool.json` (`tool_name`, `tool_input`,
-  `tool_response`, `tool_use_id`, `duration_ms`), `stop.json` and
-  `stop-active.json` (`stop_hook_active`, `last_assistant_message`). All
-  carry `session_id`, `transcript_path`, `cwd` and `hook_event_name`.
+  `tool_response`, `tool_use_id`, `duration_ms`),
+  `post-tool-failure.json` (`PostToolUseFailure`: `tool_name`,
+  `tool_input`, `tool_use_id`, `error`, `is_interrupt`, `duration_ms`),
+  `post-tool-subagent.json` (a subagent's `PostToolUse`, with `agent_id`
+  and `agent_type`), `stop.json` and `stop-active.json`
+  (`stop_hook_active`, `last_assistant_message`). All carry `session_id`,
+  `transcript_path`, `cwd` and `hook_event_name`. Claude Code writes its
+  base fields (`session_id` ... `agent_id`, `agent_type`, `effort`) before
+  `hook_event_name` and the event's own fields.
+- **Failed tool calls run `PostToolUseFailure`, not `PostToolUse`.**
+  Checked live with `-p` (a `false` Bash call): only `PostToolUseFailure`
+  fired for it. Its hook output takes `hookSpecificOutput.hookEventName:
+  "PostToolUseFailure"` with `additionalContext` (bundled schema). Without
+  it, a run of failing tool calls would get no reminder and no urgent
+  push, and would not mark the session busy. agentmail runs the same
+  `hook post-tool` for both events and names the event in its output after
+  the payload's `hook_event_name`.
+- **Subagents.** Checked live with `-p` (the main agent started one
+  general-purpose subagent that ran a Bash call): the subagent's tool call
+  ran `PostToolUse` in the same session (`session_id` is the parent's,
+  under the same `claude` process) with `"agent_id"` and `"agent_type"`
+  added; the main agent's own `PostToolUse` for the `Agent` tool call had
+  neither. The subagent fired no `UserPromptSubmit` or `Stop`; its end
+  runs `SubagentStop` (with `agent_id`), which agentmail does not hook.
+  The binary adds `agent_id` to every hook's base input when the hook runs
+  in a subagent's context. So by ancestry alone a subagent's hooks act as
+  the agent. agentmail's hooks check `agent_id`: when it is non-empty,
+  `session-start`, `prompt` and `post-tool` only mark the session busy
+  (a subagent runs inside the agent's turn) and print nothing, and
+  `stop`/`wait` print nothing. Urgent mail is then not marked surfaced, so
+  the main agent's next tool call still gets it in full, and the subagent
+  is never told "you are <address>". If a payload was cut short (over the
+  CLI's 16 MiB read limit) and is not JSON, `agent_id` is still read from
+  the base fields before `hook_event_name`.
 - **End to end with agentmail itself** (debug build, private data dir):
   hooks installed as below, the agent registered with `register --pid
   <claude pid>`, the session left idle; `agentmail --as human send` woke it
@@ -278,6 +330,7 @@ Hook configuration (`settings.json`), as Task 5 installs it:
   "SessionStart":     [{"hooks": [{"type": "command", "command": "<bin> hook session-start --harness claude-code", "timeout": 10}]}],
   "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<bin> hook prompt --harness claude-code", "timeout": 10}]}],
   "PostToolUse":      [{"matcher": "*", "hooks": [{"type": "command", "command": "<bin> hook post-tool --harness claude-code", "timeout": 10}]}],
+  "PostToolUseFailure": [{"matcher": "*", "hooks": [{"type": "command", "command": "<bin> hook post-tool --harness claude-code", "timeout": 10}]}],
   "Stop":             [{"hooks": [
     {"type": "command", "command": "<bin> hook stop --harness claude-code", "timeout": 10},
     {"type": "command", "command": "<bin> hook wait --harness claude-code", "asyncRewake": true, "timeout": 86400}
@@ -313,3 +366,45 @@ How `agentmail hook wait` behaves under it:
   stream (no polling of mail).
 - A `hook` command line this binary cannot parse (a newer config, an older
   binary) prints the usage error and exits 0, so it never blocks a stop.
+- Its files under `<data dir>/hook-wait/` (`<address>.turn`,
+  `<address>.lock`) exist only for agents that have had a wait (a busy
+  mark rewrites an existing turn file and never creates one). They are
+  removed when the agent signs off (by the daemon, and by a running wait)
+  and when a wait ends because its harness exited. A wait still holding a
+  lock whose file was removed does not block a new wait: a lock counts
+  only while the file at the path is the one locked.
+
+### Hook identity
+
+Hooks resolve their agent by `--session <id>` (opencode's plugin) or else
+by the hook's process ancestry, cut at the harness process (`CLAUDE_PID`
+for Claude Code, else the nearest harness ancestor). Unlike the CLI they
+never use `AGENTMAIL_ADDRESS`: a registered agent's shell may export it,
+and a `claude` started from that shell would inherit it, so its hooks
+would wake for and surface the outer agent's mail, the very case the
+`CLAUDE_PID` cut exists for. On opencode the variable on the server
+process would override `--session` for every session. `AGENTMAIL_HUMAN=1`
+still silences a hook. Tests bind their agent to the test process's parent
+(in the hook's ancestry) instead.
+
+### Interfaces for later hook tasks (Tasks 6 and 8)
+
+The code differs from the plan's sketch; build on the code:
+
+- `hook::run(harness, event, stdin, env)` and `hook::run_as(harness,
+  event, session: Option<&str>, stdin, env)`, where `env: &(dyn Fn(&str)
+  -> Option<OsString> + Sync)` (the `Sync` lets a waiting hook run on a
+  spawned task). `run_as` dispatches on the harness; opencode and kiro
+  currently return empty output there.
+- `HookInput` also carries `agent_id` (Claude Code subagents) and
+  `hook_event_name`.
+- `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(address)`,
+  `wait(wake_for_unread) -> WaitOutcome { Mail(HookStatus), Gone, Busy,
+  Skip }`). The wait is not a loop over `WaitForMail { timeout_secs: 300
+  }`: it subscribes with `Request::Watch { agent }` and wakes on
+  `Delivered` events (re-reading `HookStatus` to decide per message id
+  whether the mail is new), ends on the agent's sign-off `Presence` event,
+  a lost connection, a dead harness process (checked every 0.5 s) or a
+  busy mark, and keeps one waiter per agent with the turn file and lock
+  above. It has no timeout of its own; the harness's hook `timeout` bounds
+  it. kiro's Stop (Task 8) maps `Mail` to its exit code and the rest to 0.

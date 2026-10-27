@@ -10,10 +10,28 @@
 //! - Every daemon call is bounded by [`CALL_LIMIT`]; a hook that cannot get
 //!   an answer in time also stays silent.
 //!
-//! Identity: `AGENTMAIL_ADDRESS` when set (as for the CLI), then the
-//! harness session given with `--session` (opencode), then the hook's
-//! process ancestry up to its harness process (Claude Code, kiro). A hook
-//! run as the human (`AGENTMAIL_HUMAN=1`) has nothing to say.
+//! Identity: the harness session given with `--session` (opencode), else
+//! the hook's process ancestry up to its harness process (Claude Code,
+//! kiro). Unlike the CLI, a hook never acts as `AGENTMAIL_ADDRESS`: that
+//! variable is inherited, so a harness started from a registered agent's
+//! shell would otherwise act as the outer agent. A hook run as the human
+//! (`AGENTMAIL_HUMAN=1`) has nothing to say.
+//!
+//! Entry points for the per-harness modules (Tasks 6 and 8 build on these,
+//! not on the plan's sketch):
+//!
+//! - [`run`]`(harness, event, stdin, env)` and [`run_as`]`(.., session, ..)`,
+//!   with `env: &(dyn Fn(&str) -> Option<OsString> + Sync)` (the `Sync`
+//!   lets a waiting hook run on a spawned task).
+//! - [`Daemon::status`], [`Daemon::mark_busy`] and [`Daemon::wait`]. The
+//!   wait is not a `WaitForMail { timeout_secs }` loop: it watches the
+//!   daemon's event stream ([`Request::Watch`]) for deliveries and the
+//!   agent's sign-off, and coordinates with other hooks of the same agent
+//!   through a turn file and a lock under `<data dir>/hook-wait/` (see
+//!   [`Daemon::wait`]). It ends with a [`WaitOutcome`], which the harness
+//!   module maps to its exit code.
+//! - [`clear_wait_state`]: the daemon removes an agent's files there when
+//!   it signs off.
 
 pub mod claude;
 pub mod text;
@@ -21,7 +39,7 @@ pub mod text;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -29,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::Client;
-use crate::identity::{ENV_ADDRESS, ENV_HUMAN};
+use crate::identity::ENV_HUMAN;
 use crate::model::{Harness, Message, ProcId, SessionKey};
 use crate::paths::Paths;
 use crate::procinfo;
@@ -78,18 +96,62 @@ pub struct HookInput {
     /// Claude Code's `stop_hook_active`: this stop follows a continuation a
     /// hook caused (a Stop block, or a wake).
     pub stop_hook_active: bool,
+    /// Claude Code's `agent_id`: set (non-empty) when the hook runs for a
+    /// subagent's tool call, not the main agent's.
+    pub agent_id: Option<String>,
+    /// Claude Code's `hook_event_name` (`PostToolUse` or
+    /// `PostToolUseFailure` for `post-tool`).
+    pub hook_event_name: Option<String>,
 }
 
 impl HookInput {
     /// Parse a payload. Anything unreadable counts as an empty one.
+    ///
+    /// A payload cut short (the CLI reads at most 16 MiB) is not JSON, but
+    /// its `agent_id` is still looked for among the leading fields Claude
+    /// Code writes before the event's own (see [`agent_id_prefix`]), so a
+    /// subagent's huge tool result never passes for the main agent's.
     pub fn parse(stdin: &[u8]) -> HookInput {
         let raw: Value = serde_json::from_slice(stdin).unwrap_or(Value::Null);
+        let str_field = |k: &str| {
+            raw[k]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let agent_id = if raw.is_null() {
+            agent_id_prefix(stdin)
+        } else {
+            str_field("agent_id")
+        };
         HookInput {
-            session_id: raw["session_id"].as_str().map(str::to_string),
+            session_id: str_field("session_id"),
             stop_hook_active: raw["stop_hook_active"].as_bool().unwrap_or(false),
+            agent_id,
+            hook_event_name: str_field("hook_event_name"),
             raw,
         }
     }
+
+    /// Whether the hook runs for a subagent rather than the agent itself.
+    pub fn is_subagent(&self) -> bool {
+        self.agent_id.is_some()
+    }
+}
+
+/// `agent_id` from a payload that is not valid JSON (cut short), read from
+/// the part before `"hook_event_name"`: Claude Code writes its base fields
+/// (`session_id` .. `agent_id`, `agent_type`) first, then the event name,
+/// then the event's own fields (tool input and output), so text there
+/// cannot come from a tool.
+fn agent_id_prefix(stdin: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(&stdin[..stdin.len().min(64 * 1024)]);
+    let head = &text[..text.find("\"hook_event_name\"")?];
+    let rest = head.split("\"agent_id\"").nth(1)?;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let id = &rest[..rest.find('"')?];
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// What the hook process prints and its exit code.
@@ -217,8 +279,13 @@ impl Daemon {
     /// tool ran. A wait started by an earlier stop then ends (see
     /// [`Daemon::wait`]). Best effort: a marker that cannot be written
     /// leaves the wait running.
+    ///
+    /// Only an agent that has had a wait has a turn file to mark: with none
+    /// there is no wait to end, and nothing is written.
     pub fn mark_busy(&self, address: &str) {
-        let _ = write_turn(&self.paths, address, &format!("busy {}", unique()));
+        if turn_path(&self.paths, address).exists() {
+            let _ = write_turn(&self.paths, address, &format!("busy {}", unique()));
+        }
     }
 
     /// Block until the idle agent has mail to be woken for.
@@ -241,6 +308,9 @@ impl Daemon {
     /// Ends with [`WaitOutcome::Gone`] when the agent signs off, the daemon
     /// goes away, or a process the hook runs under (its harness) exits; and
     /// with [`WaitOutcome::Skip`] at once when the agent has `wake` off.
+    /// On sign-off and harness exit the wait removes the agent's turn and
+    /// lock files ([`clear_wait_state`]); they are kept while the agent
+    /// lives, for the next wait.
     pub async fn wait(&mut self, wake_for_unread: bool) -> WaitOutcome {
         let Some(status) = self.status(false).await else {
             return WaitOutcome::Gone;
@@ -314,6 +384,7 @@ impl Daemon {
                         Some(Ok(Event::Presence { agent }))
                             if agent.agent.address == address && agent.agent.signed_off =>
                         {
+                            clear_wait_state(&self.paths.data_dir, &address);
                             return WaitOutcome::Gone;
                         }
                         Some(Ok(_)) => {}
@@ -324,6 +395,7 @@ impl Daemon {
                     },
                     _ = tick.tick() => {
                         if !self.procs.iter().all(procinfo::is_alive) {
+                            clear_wait_state(&self.paths.data_dir, &address);
                             return WaitOutcome::Gone;
                         }
                         if busy(&self.paths) {
@@ -375,13 +447,29 @@ fn unique() -> String {
     format!("{} {nanos}", std::process::id())
 }
 
+/// Where waiting hooks keep their per-agent files.
+fn wait_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("hook-wait")
+}
+
 /// The file that says who last claimed the agent's turn: the newest wait,
 /// or a busy mark. A wait whose token is no longer there ends.
 fn turn_path(paths: &Paths, address: &str) -> PathBuf {
-    paths
-        .data_dir
-        .join("hook-wait")
-        .join(format!("{address}.turn"))
+    wait_dir(&paths.data_dir).join(format!("{address}.turn"))
+}
+
+fn lock_path(data_dir: &Path, address: &str) -> PathBuf {
+    wait_dir(data_dir).join(format!("{address}.lock"))
+}
+
+/// Remove `address`'s turn and lock files under `data_dir`, for an agent
+/// that signed off or whose harness exited. Best effort. A wait still
+/// holding the removed lock keeps it; one that opens the path afterwards
+/// gets a new file, and [`waiter_lock`] makes sure the two never both
+/// count as held.
+pub fn clear_wait_state(data_dir: &Path, address: &str) {
+    let _ = std::fs::remove_file(wait_dir(data_dir).join(format!("{address}.turn")));
+    let _ = std::fs::remove_file(lock_path(data_dir, address));
 }
 
 fn write_turn(paths: &Paths, address: &str, token: &str) -> std::io::Result<()> {
@@ -403,10 +491,13 @@ fn read_turn(paths: &Paths, address: &str) -> Option<String> {
 
 /// Take the lock only one waiting hook per agent may hold: `None` when
 /// another holds it. A lock file that cannot be opened does not stop the
-/// wait.
+/// wait. A lock taken on a file that was removed meanwhile
+/// ([`clear_wait_state`]) does not count: another wait may already hold
+/// the new file at that path, so this one tries again.
 fn waiter_lock(paths: &Paths, address: &str) -> Option<Option<File>> {
-    let dir = paths.data_dir.join("hook-wait");
-    let path: PathBuf = dir.join(format!("{address}.lock"));
+    use std::os::unix::fs::MetadataExt;
+    let dir = wait_dir(&paths.data_dir);
+    let path = lock_path(&paths.data_dir, address);
     let file = std::fs::create_dir_all(&dir).and_then(|()| {
         OpenOptions::new()
             .create(true)
@@ -418,24 +509,29 @@ fn waiter_lock(paths: &Paths, address: &str) -> Option<Option<File>> {
         return Some(None);
     };
     match file.try_lock() {
-        Ok(()) => Some(Some(file)),
+        Ok(()) => {
+            let same = |a: &std::fs::Metadata, b: &std::fs::Metadata| {
+                a.dev() == b.dev() && a.ino() == b.ino()
+            };
+            match (file.metadata(), std::fs::metadata(&path)) {
+                (Ok(held), Ok(now)) if same(&held, &now) => Some(Some(file)),
+                (Ok(_), _) => None,
+                (Err(_), _) => Some(Some(file)),
+            }
+        }
         Err(std::fs::TryLockError::WouldBlock) => None,
         Err(std::fs::TryLockError::Error(_)) => Some(None),
     }
 }
 
 /// Who the hook acts as; `None` for the human, who has no hook output.
+/// `AGENTMAIL_ADDRESS` is deliberately not read (see the module docs).
 fn hook_caller(
     harness: Harness,
     session: Option<&str>,
     env: &(dyn Fn(&str) -> Option<OsString> + Sync),
     procs: &[ProcId],
 ) -> Option<Caller> {
-    if let Some(address) = env(ENV_ADDRESS).filter(|a| !a.is_empty()) {
-        return Some(Caller::Address {
-            address: address.to_string_lossy().into_owned(),
-        });
-    }
     if env(ENV_HUMAN).is_some_and(|v| v == "1") {
         return None;
     }
@@ -491,16 +587,79 @@ mod tests {
         let input = HookInput::parse(br#"{"session_id":"s-1","stop_hook_active":true}"#);
         assert_eq!(input.session_id.as_deref(), Some("s-1"));
         assert!(input.stop_hook_active);
+        assert_eq!(input.agent_id, None);
+        assert!(!input.is_subagent());
         for junk in [
             &b""[..],
             b"not json",
             b"[1,2]",
-            b"{\"stop_hook_active\":\"yes\"}",
+            b"{\"stop_hook_active\":\"yes\",\"agent_id\":\"\"}",
         ] {
             let input = HookInput::parse(junk);
             assert_eq!(input.session_id, None);
             assert!(!input.stop_hook_active);
+            assert_eq!(input.agent_id, None);
+            assert_eq!(input.hook_event_name, None);
         }
+    }
+
+    #[test]
+    fn hook_input_reads_subagent_and_event() {
+        let input = HookInput::parse(
+            br#"{"session_id":"s","agent_id":"a7","hook_event_name":"PostToolUseFailure"}"#,
+        );
+        assert_eq!(input.agent_id.as_deref(), Some("a7"));
+        assert!(input.is_subagent());
+        assert_eq!(input.hook_event_name.as_deref(), Some("PostToolUseFailure"));
+    }
+
+    #[test]
+    fn hook_input_cut_short_keeps_agent_id() {
+        // A payload cut off inside a huge tool result is not JSON; the
+        // subagent's id comes before the tool fields.
+        let cut = br#"{"session_id":"s","agent_id": "a7","agent_type":"x","hook_event_name":"PostToolUse","tool_response":{"stdout":"aaa"#;
+        assert_eq!(HookInput::parse(cut).agent_id.as_deref(), Some("a7"));
+        // An `agent_id` inside the tool fields is the tool's, not Claude
+        // Code's.
+        let main = br#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":{"command":"echo '\"agent_id\":\"z\"'"#;
+        assert_eq!(HookInput::parse(main).agent_id, None);
+        assert_eq!(HookInput::parse(br#"{"agent_id":"#).agent_id, None);
+    }
+
+    #[test]
+    fn clear_wait_state_removes_the_agent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(&dir.path().join("data"));
+        write_turn(&paths, "a-1", "wait 1").unwrap();
+        write_turn(&paths, "b-2", "wait 1").unwrap();
+        let lock = waiter_lock(&paths, "a-1").unwrap().unwrap();
+        clear_wait_state(&paths.data_dir, "a-1");
+        let names: Vec<_> = std::fs::read_dir(wait_dir(&paths.data_dir))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![OsString::from("b-2.turn")]);
+        // The old holder's lock does not block a new wait, and the new
+        // wait's file is a fresh one.
+        let again = waiter_lock(&paths, "a-1").unwrap().unwrap();
+        drop(lock);
+        assert!(waiter_lock(&paths, "a-1").is_none(), "{again:?}");
+    }
+
+    #[test]
+    fn stale_lock_on_a_removed_file_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(&dir.path().join("data"));
+        // Opened before the removal, locked after: that lock is stale.
+        let path = lock_path(&paths.data_dir, "a-1");
+        std::fs::create_dir_all(wait_dir(&paths.data_dir)).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let stale = OpenOptions::new().write(true).open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        stale.try_lock().unwrap();
+        let held = waiter_lock(&paths, "a-1").unwrap().unwrap();
+        assert!(waiter_lock(&paths, "a-1").is_none());
+        drop(held);
     }
 
     #[test]
@@ -555,14 +714,25 @@ mod tests {
                     .map(|(_, v)| OsString::from(v))
             }
         };
-        let addr = env(&[("AGENTMAIL_ADDRESS", "a-1"), ("AGENTMAIL_HUMAN", "1")]);
+        // `AGENTMAIL_ADDRESS` never names the hook's agent: not over
+        // `--session`, and not over the cut ancestry.
+        let addr = env(&[("AGENTMAIL_ADDRESS", "a-1")]);
         assert_eq!(
             hook_caller(Harness::Opencode, Some("s"), &addr, &procs),
-            Some(Caller::Address {
-                address: "a-1".into()
+            Some(Caller::Session {
+                session: SessionKey {
+                    harness: Harness::Opencode,
+                    id: "s".into()
+                }
             })
         );
-        let human = env(&[("AGENTMAIL_ADDRESS", ""), ("AGENTMAIL_HUMAN", "1")]);
+        assert_eq!(
+            hook_caller(Harness::ClaudeCode, None, &addr, &procs),
+            Some(Caller::Procs {
+                procs: procs.clone()
+            })
+        );
+        let human = env(&[("AGENTMAIL_ADDRESS", "a-1"), ("AGENTMAIL_HUMAN", "1")]);
         assert_eq!(
             hook_caller(Harness::Opencode, Some("s"), &human, &procs),
             None
