@@ -380,14 +380,28 @@ How `agentmail hook wait` behaves under it:
   wait.
 - The Stop hook and the wait hook of one stop run side by side, and they
   decide together: the Stop hook writes its decision (block or not) with
-  the stop's `prompt_id` and the time to `<address>.stop` before it
-  prints, and the wait with the same `prompt_id` goes by that record
-  (looking for it up to 6 s) instead of reading the agent's questions for
-  itself, so a question opened or answered between two reads cannot make
-  them disagree. Only with no record (no `prompt_id`, or no Stop hook
-  answer in time) does the wait decide alone from the open questions. A
-  record for another `prompt_id` written after the wait started means a
-  later stop: the wait exits 0.
+  the stop's key and the time to `<address>.stop` before it prints, and
+  the wait with the same key goes by that record (looking for it up to
+  6 s) instead of reading the agent's questions for itself, so a question
+  opened or answered between two reads cannot make them disagree. The key
+  is the payload's `prompt_id` with its `stop_hook_active`
+  (`<prompt_id>:plain` or `<prompt_id>:active`): Claude Code 2.1.311's
+  schema describes `prompt_id` as correlating a user prompt with all
+  later events until the next prompt, so a stop the Stop hook blocks and
+  the continuation's stop share it, and the continuation runs no
+  UserPromptSubmit to change it. Keyed by `prompt_id` alone, the
+  continuation's wait could read the blocked stop's record before its own
+  Stop hook rewrote it, date the stop from it, count the continuation's
+  own busy marks (the `answer` tool call) as later and exit 0, leaving
+  the idle agent unwoken. Stops that share the whole key too (a wake's
+  continuation and the next continuation of the same prompt) are told
+  apart by time: a record with the wait's key dated more than 0.5 s
+  before the wait hook started is an earlier stop's, and the wait keeps
+  looking for its own (a continuation makes a model call first, so it
+  stops well after its predecessor's record). Only with no record (no
+  `prompt_id`, or no Stop hook answer in time) does the wait decide alone
+  from the open questions. A record with another key written after the
+  wait started means a later stop: the wait exits 0.
 - On a plain stop with open questions, the Stop hook's `decision: block`
   continues the turn, so the session is not idle: the wait that stop
   started exits 0 at once and claims nothing (were it to wait, mail coming
@@ -468,7 +482,8 @@ The code differs from the plan's sketch; build on the code:
 - `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(&status)`,
   `record_stop(&status, key, block)`, `wait(wake_for_unread, stop_key) ->
   WaitOutcome { Mail(HookStatus), Gone, Busy, Skip }`; `stop_key` is the
-  stop's `prompt_id`, `None` where a harness has none, and then the wait
+  stop's key (Claude Code: `<prompt_id>:plain|active`), `None` where a
+  harness has none, and then the wait
   decides alone). The wait is not a loop over `WaitForMail { timeout_secs: 300
   }`: it subscribes with `Request::Watch { agent }` and wakes on
   `Delivered` events (re-reading `HookStatus` to decide per message id

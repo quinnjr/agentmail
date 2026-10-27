@@ -80,7 +80,11 @@ fn spawn_raw(env: &Env, event: HookEvent, stdin: Vec<u8>) -> tokio::task::JoinHa
 /// run the Stop hook, both with the stop's payload (`stop` or
 /// `stop-active`). The wait goes by the Stop hook's decision.
 async fn stop_and_wait(env: &Env, name: &str) -> tokio::task::JoinHandle<HookOutput> {
-    let payload = stop_payload(name);
+    stop_and_wait_payload(env, stop_payload(name)).await
+}
+
+/// [`stop_and_wait`] with the stop's whole payload.
+async fn stop_and_wait_payload(env: &Env, payload: Vec<u8>) -> tokio::task::JoinHandle<HookOutput> {
     let wait = spawn_raw(env, HookEvent::Wait, payload.clone());
     spawn_raw(env, HookEvent::Stop, payload).await.unwrap();
     wait
@@ -566,6 +570,93 @@ async fn wait_goes_by_the_stop_hooks_decision() {
     let out = finish(spawn_raw(&env, HookEvent::Wait, payload)).await;
     assert!(silent(&out), "{out:?}");
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// `name`'s Stop payload with the given `prompt_id`.
+fn stop_payload_with(name: &str, prompt_id: &str) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&fixture(name)).unwrap();
+    v["prompt_id"] = Value::from(prompt_id);
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// Start the wait hook for `payload`, and run its Stop hook `lag` later,
+/// so the wait looks for the stop's record before it is written.
+async fn wait_then_stop(
+    env: &Env,
+    payload: Vec<u8>,
+    lag: Duration,
+) -> tokio::task::JoinHandle<HookOutput> {
+    let wait = spawn_raw(env, HookEvent::Wait, payload.clone());
+    tokio::time::sleep(lag).await;
+    spawn_raw(env, HookEvent::Stop, payload).await.unwrap();
+    wait
+}
+
+#[tokio::test]
+async fn continuation_wait_ignores_the_blocked_stops_record() {
+    // Claude Code keeps one `prompt_id` until the next human prompt, so a
+    // Stop the Stop hook blocks and the continuation's Stop
+    // (`stop_hook_active`) share it. The continuation's wait, started
+    // before its Stop hook writes, must not take the blocked stop's record
+    // for its own: dated before the continuation's busy marks, it would
+    // end the wait at once and the idle agent would never be woken.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let prompt_id = format!("prompt-shared-{}", std::process::id());
+    let out =
+        finish(stop_and_wait_payload(&env, stop_payload_with("stop", &prompt_id)).await).await;
+    assert!(silent(&out), "{out:?}");
+    // The continuation answers the question with a tool call.
+    let reply = Request::Reply {
+        message_id: q,
+        body: "id and qty".into(),
+        urgent: false,
+        refs: Vec::new(),
+        answer: true,
+    };
+    d.client().await.call(&agent(&a), reply).await.unwrap();
+    run(&env, HookEvent::PostTool, "post-tool").await;
+    let h = wait_then_stop(
+        &env,
+        stop_payload_with("stop-active", &prompt_id),
+        Duration::from_millis(150),
+    )
+    .await;
+    assert!(still_waiting(&h, 0.5).await, "the wait ended at once");
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
+async fn wait_after_a_wake_ignores_the_earlier_stops_record() {
+    // A wake's continuation stops with `stop_hook_active` and the same
+    // `prompt_id` as the stop whose wait woke it, so both stops' records
+    // carry one key. The later wait, started before its Stop hook writes,
+    // must not go by the earlier record.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let prompt_id = format!("prompt-woken-{}", std::process::id());
+    let h = stop_and_wait_payload(&env, stop_payload_with("stop-active", &prompt_id)).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
+    // The woken turn reads its mail with a tool call, then stops again.
+    run(&env, HookEvent::PostTool, "post-tool").await;
+    let h = wait_then_stop(
+        &env,
+        stop_payload_with("stop-active", &prompt_id),
+        Duration::from_millis(150),
+    )
+    .await;
+    assert!(still_waiting(&h, 0.5).await, "the wait ended at once");
+    send(&d, &a, "deploy", "tomorrow", false).await;
+    let out = finish(h).await;
+    assert_eq!(out.exit, 2, "{out:?}");
 }
 
 #[tokio::test]

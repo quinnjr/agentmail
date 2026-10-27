@@ -72,6 +72,14 @@ const TAKEOVER_LIMIT: Duration = Duration::from_secs(5);
 /// alongside it and may take a status call ([`CALL_LIMIT`]) to write it.
 const STOP_LIMIT: Duration = Duration::from_secs(6);
 
+/// How long before a waiting hook started its stop's record may be dated
+/// and still be its own: the Stop hook and the wait hook are started side
+/// by side, and the Stop hook may write before the wait hook has started.
+/// A record with the same key dated earlier is an earlier stop's (one that
+/// shared the key: see [`Daemon::wait`]); a continuation runs a model call
+/// first, so it stops well after this.
+const STOP_SLACK: Duration = Duration::from_millis(500);
+
 /// How often a waiting hook looks for its stop's decision.
 const STOP_POLL: Duration = Duration::from_millis(20);
 
@@ -117,7 +125,9 @@ pub struct HookInput {
     /// `PostToolUseFailure` for `post-tool`).
     pub hook_event_name: Option<String>,
     /// Claude Code's `prompt_id`: the Stop and the wait hook it starts get
-    /// the same one, which ties the wait to the Stop hook's decision.
+    /// the same one, which (with `stop_hook_active`) ties the wait to the
+    /// Stop hook's decision. It is the same for every stop until the next
+    /// human prompt, a blocked stop's continuation included.
     pub prompt_id: Option<String>,
 }
 
@@ -318,8 +328,9 @@ impl Daemon {
         }
     }
 
-    /// Record the Stop hook's decision for the stop `key` (the payload's
-    /// `prompt_id`): whether it blocks the stop. The wait hook started by
+    /// Record the Stop hook's decision for the stop `key` (for Claude
+    /// Code, the payload's `prompt_id` with its `stop_hook_active`): whether
+    /// it blocks the stop. The wait hook started by
     /// the same stop reads it ([`Daemon::wait`]), so the two never decide
     /// apart from different status reads. The record also dates the stop:
     /// a busy mark newer than it came after the stop. Written before the
@@ -341,8 +352,13 @@ impl Daemon {
     }
 
     /// Block until the idle agent has mail to be woken for. `stop_key` is
-    /// the stop's key (Claude Code's `prompt_id`), shared with the Stop
-    /// hook of the same stop.
+    /// the stop's key (for Claude Code, its `prompt_id` with its
+    /// `stop_hook_active`), shared with the Stop hook of the same stop. A
+    /// key can repeat: Claude Code keeps one `prompt_id` until the next
+    /// human prompt, so a wake's continuation stops with the key of the
+    /// stop whose wait woke it. A record with this key dated more than
+    /// [`STOP_SLACK`] before this hook started is that earlier stop's, and
+    /// the wait goes on looking for its own.
     ///
     /// With `wake_for_unread` (a plain stop), the wait ends at once with
     /// [`WaitOutcome::Busy`] when the Stop hook blocked this stop (for open
@@ -553,7 +569,9 @@ impl Daemon {
     }
 
     /// The Stop hook's record for the stop `key`, looked for up to
-    /// [`STOP_LIMIT`] (the Stop hook runs alongside this one). `Ok(None)`
+    /// [`STOP_LIMIT`] (the Stop hook runs alongside this one). A record
+    /// with the key dated more than [`STOP_SLACK`] before this hook started
+    /// is an earlier stop's and is passed over. `Ok(None)`
     /// without a key, or when no record came in time. Fails with
     /// [`NoLock::Busy`] when the record is a later stop's, or the
     /// session was marked busy since this hook started, and with
@@ -568,9 +586,11 @@ impl Daemon {
         };
         let path = state_path(&self.paths.data_dir, address, "stop");
         let deadline = Instant::now() + STOP_LIMIT;
+        let oldest = self.started.saturating_sub(STOP_SLACK.as_nanos());
         loop {
             match read_state(&path).and_then(|s| s.parse::<StopRecord>().ok()) {
-                Some(r) if r.key == key => return Ok(Some(r)),
+                Some(r) if r.key == key && r.at >= oldest => return Ok(Some(r)),
+                Some(r) if r.key == key => {}
                 Some(r) if r.at > self.started => return Err(NoLock::Busy),
                 _ => {}
             }
@@ -667,7 +687,8 @@ struct StopRecord {
     at: u128,
     /// Whether it blocked the stop.
     block: bool,
-    /// The stop's key (Claude Code's `prompt_id`).
+    /// The stop's key (for Claude Code, its `prompt_id` with its
+    /// `stop_hook_active`).
     key: String,
 }
 

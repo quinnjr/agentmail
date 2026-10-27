@@ -11,8 +11,9 @@
 //! - `stop`: `decision: block` while questions to the agent are open,
 //!   unless this stop already follows a hook continuation
 //!   (`stop_hook_active`), so a model that cannot answer is not held. It
-//!   records its decision under the stop's `prompt_id` before printing,
-//!   and the `wait` hook of the same stop goes by that record.
+//!   records its decision under the stop's key ([`stop_key`]: its
+//!   `prompt_id` and `stop_hook_active`) before printing, and the `wait`
+//!   hook of the same stop goes by that record.
 //! - `wait` (an `asyncRewake` Stop hook): block until mail comes while the
 //!   session stays idle, then exit 2 with the reminder on stderr, which
 //!   wakes it.
@@ -112,7 +113,7 @@ async fn stop(d: &mut Daemon, input: &HookInput) -> HookOutput {
         false => text::open_questions(&status),
     };
     // The wait hook of this stop goes by this decision, not its own read.
-    d.record_stop(&status, input.prompt_id.as_deref(), reason.is_some());
+    d.record_stop(&status, stop_key(input).as_deref(), reason.is_some());
     match reason {
         Some(reason) => HookOutput {
             stdout: json!({ "decision": "block", "reason": reason }).to_string(),
@@ -120,6 +121,22 @@ async fn stop(d: &mut Daemon, input: &HookInput) -> HookOutput {
         },
         None => HookOutput::default(),
     }
+}
+
+/// The key the Stop hook records its decision under and the wait hook of
+/// the same stop looks for: the payload's `prompt_id` with its
+/// `stop_hook_active`. Claude Code keeps one `prompt_id` until the next
+/// human prompt, so a stop the Stop hook blocks and the continuation's
+/// stop share it; `stop_hook_active` tells them apart. Stops that share
+/// both (a wake's continuation and the one after) are told apart by the
+/// record's time ([`Daemon::wait`]).
+fn stop_key(input: &HookInput) -> Option<String> {
+    let kind = if input.stop_hook_active {
+        "active"
+    } else {
+        "plain"
+    };
+    input.prompt_id.as_ref().map(|p| format!("{p}:{kind}"))
 }
 
 /// Wait for mail, then wake the session. Only in the interactive terminal
@@ -138,7 +155,7 @@ async fn wait(
         return HookOutput::default();
     }
     match d
-        .wait(!input.stop_hook_active, input.prompt_id.as_deref())
+        .wait(!input.stop_hook_active, stop_key(input).as_deref())
         .await
     {
         WaitOutcome::Mail(status) => match text::reminder(&status) {
@@ -150,5 +167,19 @@ async fn wait(
             None => HookOutput::default(),
         },
         WaitOutcome::Gone | WaitOutcome::Busy | WaitOutcome::Skip => HookOutput::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_key_tells_a_continuation_from_its_stop() {
+        let plain = HookInput::parse(br#"{"prompt_id":"p-1","stop_hook_active":false}"#);
+        let active = HookInput::parse(br#"{"prompt_id":"p-1","stop_hook_active":true}"#);
+        assert_eq!(stop_key(&plain).as_deref(), Some("p-1:plain"));
+        assert_eq!(stop_key(&active).as_deref(), Some("p-1:active"));
+        assert_eq!(stop_key(&HookInput::parse(b"{}")), None);
     }
 }
