@@ -28,7 +28,9 @@
 //! opencode loads the user scope's `plugin/` and `plugins/`, then the
 //! project's, but runs only the first plugin of each `id`: an agentmail
 //! plugin left in `plugin/` would shadow the installed one, which would
-//! never run, so install and uninstall alike remove it. Likewise the user
+//! never run, so install and uninstall alike remove it, except that
+//! install refuses a symlink there (the user's setup), as in `plugins/`,
+//! and of one uninstall removes only the link. Likewise the user
 //! scope's plugin shadows the project's; [`notes`] says when the one that
 //! runs is for another binary (see `docs/harness-notes.md`).
 
@@ -506,8 +508,17 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
     let plugin = plan_plugin(plugin, install, bin)?;
     // opencode also loads `plugin/`, before `plugins/`, and runs only the
     // first plugin of each id: an agentmail plugin there would shadow the
-    // installed one, so both install and uninstall remove it.
+    // installed one, so both install and uninstall remove it. A link
+    // there is the user's setup (a dev or dotfiles copy), as in
+    // `plugins/`: install refuses it rather than removing it.
     let legacy = plan_plugin(legacy, false, bin)?;
+    if install && let Some(c) = legacy.as_ref().filter(|c| c.unlink) {
+        bail!(
+            "{} is a symbolic link to an agentmail plugin, which shadows the installed one; \
+             agentmail left it unchanged. Remove the link and run the install again.",
+            c.path.display()
+        );
+    }
     let mut changes = Vec::new();
     for path in targets {
         changes.extend(plan_config(path, install, bin)?);

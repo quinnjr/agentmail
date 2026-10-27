@@ -1828,6 +1828,49 @@ fn opencode_symlinked_plugin_is_never_written_through() {
 }
 
 #[test]
+fn opencode_symlinked_plugin_in_singular_dir_is_refused() {
+    // A dev link at plugin/agentmail.js shadows the installed plugin, but
+    // it is the user's setup: install refuses rather than removing it.
+    let h = Home::new();
+    let env = h.env(&[]);
+    let src = h.dir.path().join("src/agentmail.js");
+    let text = oc_plugin_text("/home/dev/agentmail");
+    write(&src, &text);
+    let legacy = h.oc_dir().join("plugin/agentmail.js");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&src, &legacy).unwrap();
+
+    let err = install::plan_install(&oc_opts(false, BIN), &env).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("symbolic link"), "{msg}");
+    assert!(msg.contains("shadows"), "{msg}");
+    assert!(msg.contains("Remove the link"), "{msg}");
+    assert!(msg.contains("plugin/agentmail.js"), "{msg}");
+    assert!(
+        std::fs::symlink_metadata(&legacy)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!h.oc_config().exists());
+    assert!(!h.oc_plugin().exists());
+    assert_eq!(read(&src), text);
+
+    // Uninstall still removes only the link, never its target.
+    let changes = uninstall(&oc_opts(false, BIN), &env);
+    assert!(paths(&changes).contains(&legacy.as_path()));
+    assert!(std::fs::symlink_metadata(&legacy).is_err());
+    assert_eq!(read(&src), text);
+
+    // A link to a file that is not agentmail's plugin is left alone.
+    let other = h.dir.path().join("src/other.js");
+    write(&other, "export default {}\n");
+    std::os::unix::fs::symlink(&other, &legacy).unwrap();
+    install(&oc_opts(false, BIN), &env);
+    assert!(std::fs::symlink_metadata(&legacy).is_ok());
+}
+
+#[test]
 fn opencode_plugin_agentmail_created_then_symlinked_keeps_link_target() {
     // agentmail created the plugin (its marker says so), then the user
     // swapped it for a link to their own copy: uninstall removes only the

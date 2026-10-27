@@ -956,7 +956,11 @@ them all.
   it shadows the installed `plugins/agentmail.js`, which never runs, and
   the install would silently do nothing. Install and uninstall therefore
   both remove it from the scope they work on (a file there that is not
-  agentmail's is left alone). Likewise the user scope's plugin shadows
+  agentmail's is left alone). A symlink there to an agentmail plugin is
+  treated as at `plugins/`: it is the user's setup, so install refuses it
+  (saying it shadows the installed plugin, and to remove the link and run
+  the install again) rather than removing it, while uninstall removes
+  only the link, never the file it points to. Likewise the user scope's plugin shadows
   the project's: with both installed, only the user one runs in that
   project. The command says so in a one-line `note:` (also listed in
   `--json` as `notes`): `install --project` when the user scope's plugin
