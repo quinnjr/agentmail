@@ -21,7 +21,7 @@
 // server, from the `_meta` session id). Sessions without one, and a
 // stopped daemon, get nothing. Every agentmail call is a short-lived
 // `agentmail hook ...` process; any failure counts as "nothing to say".
-// No dependencies: Bun's `$` and `Bun.spawn` only.
+// No dependencies: `Bun.spawn` only.
 //
 // See docs/harness-notes.md, "opencode plugin".
 
@@ -80,6 +80,19 @@ function parse(text) {
 }
 
 /**
+ * Run `agentmail <args>` to its end: its exit code and stdout. Its stdin
+ * is empty, never opencode's: every `agentmail hook` reads its stdin to the
+ * end, and under `opencode run --standalone` the server's stdin carries
+ * the CLI's requests (`serve --stdio`), which an inherited stdin would take
+ * and so hang the session. Bun's `$` inherits it, hence `Bun.spawn`.
+ */
+async function run(args) {
+  const proc = Bun.spawn([bin(), ...args], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: childEnv() });
+  const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  return { code, stdout };
+}
+
+/**
  * `agentmail hook status` for `sessionID`: the agent's status with the
  * words to show under `text`, or null when the session has no agent, the
  * daemon is down, or anything fails.
@@ -87,12 +100,9 @@ function parse(text) {
 async function status(sessionID, surfaceUrgent) {
   const flags = surfaceUrgent ? ["--surface-urgent"] : [];
   try {
-    const out = await Bun.$`${bin()} hook status --harness opencode --session ${sessionID} ${flags}`
-      .env(childEnv())
-      .nothrow()
-      .quiet();
-    if (out.exitCode !== 0) return null;
-    const v = parse(out.stdout.toString());
+    const out = await run(["hook", "status", "--harness", "opencode", "--session", sessionID, ...flags]);
+    if (out.code !== 0) return null;
+    const v = parse(out.stdout);
     return v && typeof v.address === "string" ? v : null;
   } catch {
     return null;
@@ -115,7 +125,7 @@ async function status(sessionID, surfaceUrgent) {
  * recorded a wake ends it with nothing recorded, one that comes after
  * lets it print the wake first. A mail answer is returned however the
  * process ended, since agentmail has recorded it as a wake and the caller
- * must not lose it. Bun's `$` cannot be killed, hence `Bun.spawn`.
+ * must not lose it.
  */
 async function waitOnce(sessionID, from, signal, secs = WAIT_SECS) {
   if (signal.aborted) return null;
@@ -161,7 +171,7 @@ async function waitOnce(sessionID, from, signal, secs = WAIT_SECS) {
  */
 async function signoff(sessionID) {
   try {
-    await Bun.$`${bin()} hook signoff --harness opencode --session ${sessionID}`.env(childEnv()).nothrow().quiet();
+    await run(["hook", "signoff", "--harness", "opencode", "--session", sessionID]);
   } catch {}
 }
 

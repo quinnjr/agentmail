@@ -26,7 +26,8 @@ const args = process.argv.slice(2);
 const i = args.indexOf("--session");
 const session = i >= 0 ? args[i + 1] : "";
 const cmd = args.slice(0, 2).join(" ");
-const stdin = cmd === "hook wait" ? fs.readFileSync(0, "utf8") : "";
+// Every command reads its stdin to the end, as the real one does.
+const stdin = fs.readFileSync(0, "utf8");
 const line = { args, stdin, session_env: process.env.OPENCODE_SESSION_ID ?? "", address: process.env.AGENTMAIL_ADDRESS ?? "", human: process.env.AGENTMAIL_HUMAN ?? "" };
 fs.appendFileSync(dir + "/calls.log", JSON.stringify(line) + "\\n");
 if (cmd === "hook status") {
@@ -880,4 +881,64 @@ test("waiter_after_queued_urgent_mail_counts_mail_since_the_last_wake", async ()
   ctx.emit("session.execution.succeeded", { sessionID: "ses_a" });
   await until(() => waits("ses_a").length === 1);
   expect(JSON.parse(waits("ses_a")[0].stdin)).toEqual({ stop_hook_active: false, after_wake: true });
+});
+
+// opencode's `run --standalone` talks to its server (`serve --stdio`)
+// over that process's stdin. Every agentmail command reads its stdin to
+// the end, so one that inherited it would take the server's requests and
+// hang the session: none may.
+test("agentmail_commands_never_inherit_opencodes_stdin", async () => {
+  const dir = fakeDir();
+  setStatus("s1", { address: "a-1", unread: 0, text: {} });
+  const runner = join(dir, "runner.js");
+  writeFileSync(
+    runner,
+    `import plugin from ${JSON.stringify(join(import.meta.dir, "agentmail.js"))};
+const hooks = {};
+const queue = [];
+let wake = null;
+const ctx = {
+  location: { directory: "/work" },
+  tool: { hook: async (name, fn) => ((hooks[name] = fn), { dispose() {} }) },
+  session: {
+    synthetic: async () => ({}),
+    get: async ({ sessionID }) => ({ id: sessionID, location: { directory: "/work" } }),
+  },
+  event: {
+    subscribe: ({ signal }) => ({
+      async *[Symbol.asyncIterator]() {
+        while (!signal.aborted) {
+          if (queue.length) { yield queue.shift(); continue; }
+          await new Promise((r) => { wake = r; signal.addEventListener("abort", r, { once: true }); });
+        }
+      },
+    }),
+  },
+};
+const stop = await plugin.setup(ctx);
+await hooks["execute.after"]({ sessionID: "s1", status: "completed", result: { content: [] } });
+queue.push({ type: "session.deleted", data: { sessionID: "s1" } });
+wake?.();
+const fs = require("node:fs");
+const log = ${JSON.stringify(join(dir, "calls.log"))};
+while (!(fs.existsSync(log) && fs.readFileSync(log, "utf8").includes('"signoff"'))) await Bun.sleep(10);
+await stop();
+`,
+  );
+  // `env`: the fake's PATH and directory, set in this process after start.
+  const proc = Bun.spawn([process.execPath, runner], {
+    stdin: "pipe",
+    stdout: "ignore",
+    stderr: "inherit",
+    env: { ...process.env },
+  });
+  proc.stdin.write("STOLEN");
+  proc.stdin.end();
+  const code = await proc.exited;
+  expect(code).toBe(0);
+  const seen = calls().map((c) => [c.args.slice(0, 2).join(" "), c.stdin]);
+  expect(seen).toEqual([
+    ["hook status", ""],
+    ["hook signoff", ""],
+  ]);
 });

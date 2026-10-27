@@ -1307,3 +1307,81 @@ Deviations from the plan, and why:
   Removing the unit by hand also means removing
   `agentmail.service.agentmail.created`, agentmail's marker, which a later
   install or uninstall trusts.
+
+## Real-harness e2e (Task 10)
+
+`scripts/e2e.sh <claude-code|opencode|kiro|mixed>` (see the README). Run on
+2026-10-27 against Claude Code 2.1.312 (`--model haiku`), opencode 2.0.27
+(`opencode/big-pickle`, a free model) and kiro-cli 2.32.0 (`chat --v3`,
+default model), each in a throwaway home, with the release build:
+
+| mode | result | steps checked |
+|---|---|---|
+| `claude-code` | passed | 1–4 |
+| `opencode` | passed | 1–4, 6 |
+| `kiro` | passed | 1–5 |
+| `mixed` (Claude Code A, opencode B) | passed | 1–4 |
+
+- **Logins.** Claude Code's `.credentials.json` and kiro-cli's
+  `data.sqlite3` were copied into the throwaway home with their refresh
+  tokens removed (kiro: the `kirocli:odic:token` row of `auth_kv`), so a
+  run can only use the access token and never rotate the real login; both
+  copies are deleted when the script exits. Both harnesses ran on the
+  access token alone. The script refuses a login with less than 15
+  minutes left. opencode's free models need no login.
+- **Urgent mail (step 4)** was sent the moment the question had its
+  answer, while A was still in its turn (it then runs `sleep 20` and
+  `echo finished`). In every run the model's own final message quoted the
+  urgent subject: Claude Code at the next `PostToolUse`, opencode by the
+  plugin's steer, kiro by the held `PreToolUse` (the agent said "I
+  received urgent mail from the human", read it, then ran its command).
+- **kiro binding (step 5).** The V3 MCP `register` recorded harness `kiro`
+  and the pid of the `kiro-cli` process the script started, confirming
+  that `kiro-cli-chat` and the engine's `node` in between do not displace
+  the binding (no differing `KIRO_SESSION_ID` reaches the MCP server).
+- **opencode waking (step 6).** A ran under `opencode serve` (a server
+  that outlives the turn; `run --standalone` stops its server at the end
+  of the turn, so nothing could wake there) with `run --server`; B ran in
+  its own session on the same server (`opencode` mode, so both sessions
+  share one MCP server, as in Review Focus 3) or `--standalone`
+  (`mixed`). After A's turn the human's mail started a new turn by itself:
+  opencode's session log (its `session_message` table) shows the plugin's
+  synthetic reminder and the model's answer. The free model answered in
+  text rather than replying over agentmail, so the script accepts either
+  a reply in the thread or that recorded turn. An earlier run showed the
+  same: a wake right after the turn for mail A had left unread, then one
+  for the new mail.
+- **Not checked headlessly:** waking under Claude Code (its wait hook
+  stays silent outside the terminal UI, `claude -p` included) and under
+  kiro (a `--no-interactive` run is never waited in). Both were checked by
+  hand in the TUI (Tasks 4 and 8).
+- **opencode's managed service** (`opencode models`, `run` without
+  `--standalone` or `--server`) uses a fixed local port shared with the
+  user's own service, so the script never starts it: A gets a private
+  `serve` on a free port with a random `OPENCODE_PASSWORD` (both `serve`
+  and `run --server` read it; without it `run --server` fails with
+  "requires a password").
+- **The unix socket path limit** (about 100 bytes) ruled out a socket in
+  the scratch directory; the script puts it in its own `mktemp -d
+  /tmp/am-e2e.XXXXXX`.
+
+### Bug found: the plugin hung `opencode run --standalone`
+
+With agentmail's plugin installed, every `run --standalone` session hung
+after its first tool call (`step_start`, then nothing, until killed;
+`--format json` then printed "Transport: The socket connection was closed
+unexpectedly"). Without the plugin the same run finished in seconds.
+Cause: `run --standalone` talks to its private server (`opencode serve
+--stdio`) over that server's stdin, and Bun's `$` (which the plugin used
+for `hook status` and `hook signoff`) gives the child the parent's stdin.
+`agentmail hook` reads its stdin to the end (the payload), so the first
+`hook status` after a tool call consumed the CLI's requests and waited for
+EOF. (Checked: `cat` run through `Bun.$` in a `bun` that has `x` piped
+into it prints `x`.) Under `opencode serve` stdin carries nothing for
+opencode, which is why the Task 6 checks, all on `serve`, never saw it.
+Fix: every agentmail command the plugin runs now goes through `Bun.spawn`
+with `stdin: "ignore"` (`hook wait` already passed its payload
+explicitly); the unit test
+`agentmail_commands_never_inherit_opencodes_stdin` runs the plugin in a
+child process whose stdin holds data and checks that `hook status` and
+`hook signoff` read nothing.

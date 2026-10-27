@@ -57,45 +57,15 @@ Install the binary:
 cargo install --path .
 ```
 
-Add the MCP server to your harness. `agentmail install` will do this in one
-command, hooks included, once harness integration lands (Plan 2). Until then,
-register it by hand.
-
-**Claude Code**
+Wire it into your harness:
 
 ```sh
-claude mcp add --scope user agentmail -- agentmail mcp
+agentmail install --harness claude-code   # or opencode, or kiro
 ```
 
-**opencode** — in `~/.config/opencode/opencode.json` (or a project's
-`opencode.json`):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "agentmail": {
-      "type": "local",
-      "command": ["agentmail", "mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
-**kiro-cli** — in `~/.kiro/settings/mcp.json` (or a project's
-`.kiro/settings/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "agentmail": {
-      "command": "agentmail",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+That adds the MCP server and agentmail's hooks (opencode: its plugin) to the
+harness's user config. See [Installing into a harness](#installing-into-a-harness)
+for what it changes, `--project`, `--dry-run` and `uninstall`.
 
 Then tell each agent who it is and who its partner is:
 
@@ -116,6 +86,58 @@ and sends only changes, decisions and questions, never progress narration.
 `clarification`, `pending` or `no_one_listening`. On `pending` the agent can
 carry on and call `await_answer` later; the question stays open until someone
 explicitly answers it.
+
+## Installing into a harness
+
+```sh
+agentmail install --harness claude-code|opencode|kiro [--project] [--dry-run]
+agentmail uninstall --harness claude-code|opencode|kiro [--project] [--dry-run]
+```
+
+`install` edits the harness's own config files directly (it never runs the
+harness's CLI). It touches only agentmail's entries, keeping every other
+byte of a file as it was, saves each file's original once as
+`<file>.agentmail.bak` before first changing it, and finds nothing to do
+when run twice. `--dry-run` prints the changes as a diff and writes
+nothing. `uninstall` removes agentmail's entries again and deletes a file
+only if `install` created it. `--project` installs into the current
+directory instead of your user config. Run the harness from the same
+`agentmail` binary you installed with: the config records its absolute
+path.
+
+| harness | user config (default) | `--project` |
+|---|---|---|
+| Claude Code | hooks in `settings.json`, MCP server in `.claude.json`, both under `$CLAUDE_CONFIG_DIR` when set, else `~/.claude/settings.json` and `~/.claude.json` | `.claude/settings.json`, `.mcp.json` (Claude Code asks you to approve the server the first time) |
+| opencode ≥ 2.0 | `opencode.json` (MCP server, `codemode: false`) and `plugins/agentmail.js` in `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode` | `opencode.json`, `.opencode/plugins/agentmail.js` |
+| kiro-cli (V3) | `settings/mcp.json` and `hooks/agentmail.json` in `$KIRO_HOME`, else `~/.kiro` | `.kiro/settings/mcp.json`, `.kiro/hooks/agentmail.json` |
+
+Notes:
+
+- **kiro-cli: V3 engine only.** Run agents with `kiro-cli chat --v3`. kiro's
+  default (V2) engine is not supported; `install` says so. Waking an idle
+  kiro agent is off unless you install with `--kiro-wake` (see
+  [Harness support](#harness-support)). Install at one scope only: kiro
+  loads the user's and a trusted workspace's hooks together, so both would
+  run every hook twice. `--set-default` is accepted and changes nothing:
+  kiro V3 loads agentmail's hooks for every agent.
+- **opencode `codemode`.** agentmail's server is installed with
+  `codemode: false`. opencode only shows a server's `instructions` (how
+  agents should use agentmail) while one of its tools is directly
+  reachable, which code mode hides behind its `execute` tool. A
+  `opencode.jsonc` with comments is never rewritten: install prints the
+  entry to add by hand instead. opencode picks up the change without a
+  restart.
+
+To run the daemon as a systemd user service instead of on demand:
+`agentmail install --service` (see
+[Running the daemon under systemd](#running-the-daemon-under-systemd)).
+
+To register the MCP server by hand instead (no hooks, so no reminders,
+urgent pushes or waking): `claude mcp add --scope user agentmail --
+agentmail mcp`; in `opencode.json`, `"mcp": {"servers": {"agentmail":
+{"type": "local", "command": ["agentmail", "mcp"], "codemode": false}}}`;
+in kiro's `settings/mcp.json`, `"mcpServers": {"agentmail": {"command":
+"agentmail", "args": ["mcp"]}}`.
 
 ## Operating the daemon
 
@@ -404,7 +426,7 @@ broadcast to everyone.
 
 ### Binding a session to its address
 
-The MCP server, shell commands and (later) hooks of one agent are separate
+The MCP server, shell commands and hooks of one agent are separate
 processes, so they find their address through the harness process they share
 (or, under opencode, the session):
 
@@ -486,30 +508,80 @@ never taken. `register --fresh` (MCP: `fresh: true`) always gets a new address.
 
 ## Known limitations
 
-- **One address per harness process** for Claude Code and kiro-cli (opencode
-  gets one per session). Their subagents share the parent's address.
-  opencode subagents run in their own sessions instead, so each is a
-  separate identity that must `register` (or use `AGENTMAIL_ADDRESS`) before
-  it can act.
+- **Waking an idle agent depends on how the harness runs.** Claude Code
+  wakes an idle session only in its terminal UI (`claude`); under `claude
+  -p`, the IDE and desktop integrations and the SDKs the wait hook stays
+  silent, since a headless run would otherwise be held open until mail
+  came. kiro-cli wakes only when installed with `--kiro-wake`, and never in
+  a `--no-interactive` run. opencode wakes an idle session for as long as
+  its server runs (the TUI, `opencode serve`); `opencode run --standalone`
+  stops its server when the turn ends.
+- **kiro-cli subagents act as their root agent.** kiro gives a subagent's
+  hooks and shell the root conversation's session and process, so urgent
+  mail that arrives while a subagent runs is pushed to the subagent, which
+  may or may not pass it on (the root still sees it counted unread at the
+  next prompt). Claude Code subagents share the parent's address but its
+  hooks skip them, so the parent gets the push. opencode subagents run in
+  their own sessions, so each is a separate identity that must `register`
+  (or use `AGENTMAIL_ADDRESS`) before it can act.
+- **kiro-cli's V2 engine is not supported**; run `kiro-cli chat --v3`.
 - macOS process inspection is not implemented yet; Linux and WSL are the
   supported platforms.
 
 ## Harness support
 
-What this release (the core) provides, and what harness integration (Plan 2)
-adds.
+Supported: Claude Code, opencode 2.x (V2 plugin API) and kiro-cli with the
+V3 engine. Each row was checked live against Claude Code 2.1.311–2.1.312,
+opencode 2.0.27 and kiro-cli 2.32.0 (details in
+[`docs/harness-notes.md`](docs/harness-notes.md)), and the headless parts
+by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses).
 
-| | Claude Code | opencode | kiro-cli |
+| | Claude Code | opencode | kiro-cli (V3) |
 |---|---|---|---|
-| MCP server and tools | yes | yes | yes |
-| Agent guidance via MCP `instructions` | yes | yes | yes |
-| Agent identity | by process ancestry (one address per process) | by session (one address per session) | by process ancestry (bound to the nearest `kiro-cli`) |
-| CLI from the agent's shell | yes | yes | yes |
-| Waking idle agents | `wait_for_mail` tool (guided) | `wait_for_mail` tool (guided) | `wait_for_mail` tool (guided) |
-| `agentmail install` / `uninstall` | planned | planned | planned |
-| Unread-mail reminders (`agentmail hook`) | planned | planned | planned |
-| Stop-hook waking | planned | planned | planned |
-| Urgent mail surfaced mid-run | planned | planned | planned |
+| `agentmail install` / `uninstall` | yes (`settings.json`, `.claude.json`) | yes (`opencode.json`, plugin) | yes (`settings/mcp.json`, `hooks/agentmail.json`) |
+| MCP server and tools | yes | yes (installed with `codemode: false`) | yes |
+| Agent guidance via MCP `instructions` | yes | yes, while not in code mode | yes |
+| Agent identity | by process (one address per `claude` process) | by session (one address per session) | by process (the nearest `kiro-cli`) |
+| Who-you-are and unread reminder at session start and on each prompt | yes (`SessionStart`, `UserPromptSubmit`) | no prompt hook in opencode 2.0.27: the agent learns its address from `register`, reminders start after its first tool call | yes (`SessionStart`, `UserPromptSubmit`) |
+| Unread-mail reminder between steps | yes (`PostToolUse`, also for failed calls) | yes (appended to each tool result) | no (kiro ignores `PostToolUse` output); at the next prompt instead |
+| Urgent mail surfaced mid-run, once | yes, at the next tool call | yes, steered into the running turn | yes: the next tool call is held once with the mail, then can run again |
+| Open questions kept in front of the agent at stop | yes (Stop hook blocks, not twice in a row) | yes (queued as one more turn) | yes (Stop hook continues the turn once per prompt) |
+| Waking an idle agent for new mail | terminal UI only (`asyncRewake` Stop hook) | yes, while the server runs (plugin) | opt-in with `install --kiro-wake`; interactive only |
+| CLI from the agent's shell | yes | yes (by `OPENCODE_SESSION_ID`) | yes |
+| Daemon down or session unregistered | hooks print nothing | plugin does nothing | hooks print nothing |
+
+## End-to-end tests against real harnesses
+
+`scripts/e2e.sh <claude-code|opencode|kiro|mixed>` builds agentmail,
+installs it into a throwaway home (private `HOME`, `XDG_*`,
+`CLAUDE_CONFIG_DIR`, `KIRO_HOME`, data directory and socket), and drives two
+real agents headlessly: `backend` registers and answers questions,
+`frontend` registers and asks it what `POST /orders` takes. It checks that a
+question/answer thread exists between them, that urgent mail sent to
+`backend` mid-run reaches it, for kiro that the agent is bound to the
+`kiro-cli` process, and for opencode that an idle `backend` is woken by new
+mail (it replies, or opencode's session log shows the turn the wake
+started). Claude Code and kiro do not wake idle agents in a headless run, so
+their waking is checked only by hand (see `docs/harness-notes.md`). `mixed` runs `backend` under Claude Code and `frontend`
+under opencode. It exits non-zero and names the failed step on any failure.
+
+It needs real model access, so `cargo test` does not run it:
+
+- Claude Code: `AGENTMAIL_E2E_CLAUDE=/path/to/claude` (the binary, not a
+  shell function), and a login (`~/.claude/.credentials.json`, or
+  `$CLAUDE_CONFIG_DIR`'s, or `AGENTMAIL_E2E_CLAUDE_CREDENTIALS`) or
+  `ANTHROPIC_API_KEY`.
+- opencode: on `PATH` or `AGENTMAIL_E2E_OPENCODE`; uses a free opencode
+  model by default (`AGENTMAIL_E2E_OPENCODE_MODEL`).
+- kiro-cli: on `PATH` or `AGENTMAIL_E2E_KIRO`, logged in
+  (`AGENTMAIL_E2E_KIRO_DATA` for a non-default data directory).
+- `jq`, `git`, `cargo`, and `python3` for kiro and opencode (and `curl`
+  for opencode).
+
+Logins are copied into the throwaway home without their refresh token, so
+a run can never rotate your real login, and deleted afterwards; a login
+that expires within 15 minutes is refused. `AGENTMAIL_E2E_KEEP=1` keeps the
+throwaway directory (logs and transcripts) for inspection.
 
 ## Development
 
@@ -517,4 +589,8 @@ adds.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+bun test plugin/        # the opencode plugin
 ```
+
+`scripts/e2e.sh` runs real harnesses; see
+[End-to-end tests against real harnesses](#end-to-end-tests-against-real-harnesses).
