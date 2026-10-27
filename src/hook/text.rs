@@ -7,6 +7,13 @@ use crate::model::Message;
 /// point at `read`.
 pub const MAX_URGENT_BODY: usize = 4096;
 
+/// Longest subject shown, in bytes; longer ones are cut. Subjects have no
+/// limit of their own, and hooks repeat them on every tool call.
+pub const MAX_SUBJECT: usize = 200;
+
+/// Most open questions listed by [`open_questions`]; the rest are counted.
+pub const MAX_LISTED_QUESTIONS: usize = 10;
+
 /// The unread count and open questions, e.g.
 /// `📬 agentmail — you are backend-k3x9q2mz: 2 unread (1 question from
 /// frontend-p7v2c8wd: "POST /orders body?"). Check your inbox before
@@ -17,12 +24,12 @@ pub fn reminder(status: &HookStatus) -> Option<String> {
     }
     let questions = match status.open_questions.as_slice() {
         [] => String::new(),
-        [q] => format!(" (1 question from {}: \"{}\")", q.from, q.subject),
+        [q] => format!(" (1 question from {}: \"{}\")", q.from, subject(&q.subject)),
         [q, rest @ ..] => format!(
             " ({} questions, the oldest from {}: \"{}\")",
             rest.len() + 1,
             q.from,
-            q.subject
+            subject(&q.subject)
         ),
     };
     Some(format!(
@@ -31,7 +38,8 @@ pub fn reminder(status: &HookStatus) -> Option<String> {
     ))
 }
 
-/// Urgent mail in full, each body capped at [`MAX_URGENT_BODY`] bytes.
+/// Urgent mail in full, each body capped at [`MAX_URGENT_BODY`] bytes and
+/// each subject at [`MAX_SUBJECT`].
 /// `None` when there is none.
 pub fn urgent(msgs: &[Message]) -> Option<String> {
     if msgs.is_empty() {
@@ -44,7 +52,7 @@ pub fn urgent(msgs: &[Message]) -> Option<String> {
         out.push_str(&format!(
             "\n\nFrom {}, subject \"{}\" (id {}):\n{}",
             m.from,
-            m.subject,
+            subject(&m.subject),
             m.id,
             capped(&m.body, &m.id)
         ));
@@ -65,7 +73,31 @@ fn capped(body: &str, id: &str) -> String {
     format!("{}… (truncated; read {id})", &body[..end])
 }
 
-/// The open questions addressed to the agent, oldest first, to answer
+/// A message subject as hooks show it: one line (control characters and
+/// line breaks become spaces), cut at a character boundary to at most
+/// [`MAX_SUBJECT`] bytes and ending with `…` when cut.
+fn subject(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(
+            |c| match c.is_control() || (c.is_whitespace() && c != ' ') {
+                true => ' ',
+                false => c,
+            },
+        )
+        .collect();
+    if flat.len() <= MAX_SUBJECT {
+        return flat;
+    }
+    let mut end = MAX_SUBJECT;
+    while !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &flat[..end])
+}
+
+/// The open questions addressed to the agent, oldest first (at most
+/// [`MAX_LISTED_QUESTIONS`], then a count of the rest), to answer
 /// before stopping. `None` when there are none.
 pub fn open_questions(status: &HookStatus) -> Option<String> {
     if status.open_questions.is_empty() {
@@ -75,8 +107,20 @@ pub fn open_questions(status: &HookStatus) -> Option<String> {
         "agentmail — you are {} and these questions to you are still open:",
         status.address
     );
-    for q in &status.open_questions {
-        out.push_str(&format!("\n- {} from {}: \"{}\"", q.id, q.from, q.subject));
+    for q in status.open_questions.iter().take(MAX_LISTED_QUESTIONS) {
+        out.push_str(&format!(
+            "\n- {} from {}: \"{}\"",
+            q.id,
+            q.from,
+            subject(&q.subject)
+        ));
+    }
+    let more = status
+        .open_questions
+        .len()
+        .saturating_sub(MAX_LISTED_QUESTIONS);
+    if more > 0 {
+        out.push_str(&format!("\n+{more} more (see your inbox)"));
     }
     out.push_str("\nRead and answer them (`answer`) before you stop.");
     Some(out)
@@ -177,6 +221,51 @@ mod tests {
         let text = open_questions(&status(0, &[("a-1", "first"), ("b-2", "second")])).unwrap();
         assert!(text.contains("\n- Q0 from a-1: \"first\""), "{text}");
         assert!(text.contains("\n- Q1 from b-2: \"second\""), "{text}");
+    }
+
+    #[test]
+    fn hook_text_subject_is_one_bounded_line() {
+        let huge = format!("line one\nline two\r\t{}", "x".repeat(100_000));
+        let text = reminder(&status(1, &[("a-1", &huge)])).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.len() < MAX_SUBJECT + 200, "{}", text.len());
+        assert!(text.contains("\"line one line two  x"), "{text}");
+        assert!(text.contains("…\""), "{text}");
+        // A short subject is kept as it is.
+        assert_eq!(subject("POST /orders body?"), "POST /orders body?");
+        // Cut at a character boundary.
+        let cut = subject(&"€".repeat(1000));
+        let kept = cut.strip_suffix('…').unwrap();
+        assert_eq!(kept, "€".repeat(MAX_SUBJECT / 3));
+    }
+
+    #[test]
+    fn hook_text_urgent_is_bounded_with_a_huge_subject() {
+        let mut m = msg(&"b".repeat(100_000));
+        m.subject = format!("a\nb{}", "s".repeat(100_000));
+        let text = urgent(&[m]).unwrap();
+        assert!(
+            text.len() < MAX_URGENT_BODY + MAX_SUBJECT + 300,
+            "{}",
+            text.len()
+        );
+        let header = text.lines().nth(2).unwrap();
+        assert!(
+            header.starts_with("From human, subject \"a bsss"),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn hook_text_open_questions_lists_a_bounded_number() {
+        let many: Vec<(String, String)> = (0..MAX_LISTED_QUESTIONS + 5)
+            .map(|i| (format!("a-{i}"), format!("q\n{i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let text = open_questions(&status(0, &refs)).unwrap();
+        assert_eq!(text.matches("\n- ").count(), MAX_LISTED_QUESTIONS, "{text}");
+        assert!(text.contains("\n- Q0 from a-0: \"q 0\""), "{text}");
+        assert!(text.contains("\n+5 more"), "{text}");
     }
 
     #[test]

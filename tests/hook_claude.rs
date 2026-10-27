@@ -572,6 +572,31 @@ async fn wait_goes_by_the_stop_hooks_decision() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+#[tokio::test]
+async fn wait_with_an_unusable_stop_key_decides_at_once() {
+    // A `prompt_id` with whitespace cannot be recorded, so the Stop hook
+    // writes no record for it. The wait must not look for one for the
+    // whole of its limit: it decides alone, at once.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    ask(&d, &a, "POST /orders body?").await;
+    let started = Instant::now();
+    let payload = stop_payload_with("stop", "prompt with space");
+    let out = finish(stop_and_wait_payload(&env, payload).await).await;
+    assert!(silent(&out), "{out:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        wait_files(&d.paths).is_empty(),
+        "{:?}",
+        wait_files(&d.paths)
+    );
+}
+
 /// `name`'s Stop payload with the given `prompt_id`.
 fn stop_payload_with(name: &str, prompt_id: &str) -> Vec<u8> {
     let mut v: Value = serde_json::from_slice(&fixture(name)).unwrap();

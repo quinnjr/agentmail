@@ -337,7 +337,7 @@ impl Daemon {
     /// Stop hook prints, and only for an agent with `wake` on (no wait runs
     /// for one without) and a stop with a key. Best effort.
     pub fn record_stop(&self, status: &HookStatus, key: Option<&str>, block: bool) {
-        let Some(key) = key.filter(|k| !k.contains(char::is_whitespace)) else {
+        let Some(key) = key.filter(|k| usable_stop_key(k)) else {
             return;
         };
         if status.wake {
@@ -581,7 +581,7 @@ impl Daemon {
         address: &str,
         key: Option<&str>,
     ) -> Result<Option<StopRecord>, NoLock> {
-        let Some(key) = key else {
+        let Some(key) = key.filter(|k| usable_stop_key(k)) else {
             return Ok(None);
         };
         let path = state_path(&self.paths.data_dir, address, "stop");
@@ -720,6 +720,14 @@ impl std::str::FromStr for StopRecord {
             key: key.to_string(),
         })
     }
+}
+
+/// Whether a stop key can be recorded: the stop record is one
+/// whitespace-separated line, so a key with whitespace is never written,
+/// and neither hook may look for it ([`Daemon::record_stop`],
+/// [`Daemon::wait`]).
+pub(crate) fn usable_stop_key(key: &str) -> bool {
+    !key.contains(char::is_whitespace)
 }
 
 /// Where waiting hooks keep their per-agent files.
