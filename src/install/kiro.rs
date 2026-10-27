@@ -13,7 +13,8 @@
 //! waits for mail (`--wake`, no timeout) and the MCP server gets
 //! `AGENTMAIL_KIRO_WAKE=1`, so kiro agents register with `wake` on: the
 //! MCP server reads the variable, and the CLI, whose environment kiro
-//! does not give it, reads the installed entry ([`wake_installed`]).
+//! does not give it, reads it from the running MCP server's environment,
+//! else from the installed entry ([`wake_installed`]).
 
 use std::path::{Path, PathBuf};
 
@@ -253,6 +254,11 @@ fn set_wake_env(entry: &mut Map<String, Value>, wake: bool) {
 /// `~/.kiro`), sets `AGENTMAIL_KIRO_WAKE` to `1`. kiro gives that variable only to the MCP
 /// server, not to its shell tool's commands, so the CLI's `register` reads
 /// it here. A file that is missing or cannot be read counts as no entry.
+///
+/// This is only the fallback for when no agentmail MCP server runs under
+/// the `kiro-cli` to ask (see `identity::default_wake_here`): kiro reads
+/// a workspace's `mcp.json` only when the workspace is trusted, which is
+/// not known here, so an untrusted workspace's entry is still taken.
 pub fn wake_installed(env: &Env) -> bool {
     let entry = |project| -> Option<Value> {
         let text = std::fs::read_to_string(mcp_file(&dir(project, env))).ok()?;

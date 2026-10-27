@@ -405,20 +405,31 @@ pub fn default_wake(
         || kiro_wake_installed()
 }
 
-/// [`default_wake`] for this process: its environment, and the kiro
-/// config installed for kiro's workspace and the home. kiro's workspace
-/// is the working directory of the `kiro-cli` process this one runs
-/// under, not this process's own: a shell command often runs in a
-/// subdirectory (`cd crates/x && agentmail register ...`). Without a
-/// `kiro-cli` above (`--harness kiro`), or when its directory cannot be
-/// read, this process's working directory stands in.
+/// [`default_wake`] for this process: its environment, then what kiro
+/// itself runs. kiro does not give its shell tool's commands the MCP
+/// server's `env`, so the CLI asks the source of truth: agentmail's MCP
+/// server running under the same `kiro-cli` ([`kiro_servers_wake`]),
+/// which kiro started with the `env` it settled on (workspace trust and
+/// the order it merges the workspace's and the user's servers included).
+/// Only when there is no such process (no `kiro-cli` above, with
+/// `--harness kiro`, or none started yet) does it read the installed
+/// config for kiro's workspace and the home. kiro's workspace is the
+/// working directory of the `kiro-cli` process this one runs under, not
+/// this process's own: a shell command often runs in a subdirectory
+/// (`cd crates/x && agentmail register ...`). Without a `kiro-cli` above,
+/// or when its directory cannot be read, this process's working
+/// directory stands in.
 pub fn default_wake_here(harness: Harness) -> bool {
     default_wake(
         harness,
         |k| std::env::var_os(k),
         || {
+            let kiro = kiro_ancestor(std::process::id());
+            if let Some(wake) = kiro.and_then(|p| kiro_servers_wake(p.pid)) {
+                return wake;
+            }
             crate::install::Env::from_process().is_ok_and(|mut e| {
-                if let Some(cwd) = kiro_workspace(std::process::id()) {
+                if let Some(cwd) = kiro.and_then(|p| procinfo::cwd(p.pid)) {
                     e.cwd = cwd;
                 }
                 crate::install::kiro_wake_installed(&e)
@@ -427,12 +438,54 @@ pub fn default_wake_here(harness: Harness) -> bool {
     )
 }
 
-/// The working directory of the nearest harness above `pid` when that is
-/// `kiro-cli`: the workspace kiro reads `.kiro/` from.
-fn kiro_workspace(pid: u32) -> Option<std::path::PathBuf> {
+/// The nearest harness above `pid` when that is `kiro-cli`.
+fn kiro_ancestor(pid: u32) -> Option<ProcId> {
     procinfo::find_harness_ancestor(pid)
         .filter(|(_, h)| *h == Harness::Kiro)
-        .and_then(|(p, _)| procinfo::cwd(p.pid))
+        .map(|(p, _)| p)
+}
+
+/// What agentmail's MCP servers running under `kiro` (a `kiro-cli` pid)
+/// say: whether one was started with [`ENV_KIRO_WAKE`]`=1`, or `None`
+/// when none runs there (see [`servers_wake`]).
+fn kiro_servers_wake(kiro: u32) -> Option<bool> {
+    let me = std::process::id();
+    let own_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_os_string()));
+    let names: Vec<&std::ffi::OsStr> = std::iter::once(std::ffi::OsStr::new("agentmail"))
+        .chain(own_name.as_deref())
+        .collect();
+    servers_wake(
+        procinfo::descendants(kiro)
+            .into_iter()
+            .filter(|&pid| pid != me)
+            .filter(|&pid| procinfo::args(pid).is_some_and(|a| is_agentmail_mcp(&a, &names)))
+            .map(|pid| procinfo::env_var(pid, ENV_KIRO_WAKE)),
+    )
+}
+
+/// Whether a process started with `args` (the program first) is
+/// agentmail's MCP server: `<program> mcp`, the program named one of
+/// `names` (agentmail's names: `agentmail`, and this binary's own).
+fn is_agentmail_mcp(args: &[OsString], names: &[&std::ffi::OsStr]) -> bool {
+    let [program, sub, ..] = args else {
+        return false;
+    };
+    sub == "mcp"
+        && std::path::Path::new(program)
+            .file_name()
+            .is_some_and(|n| names.contains(&n))
+}
+
+/// The wake default that agentmail MCP servers, given each one's
+/// [`ENV_KIRO_WAKE`] value, set: `Some(true)` when one has `1`,
+/// `Some(false)` when none has, `None` when there are no servers.
+fn servers_wake(values: impl IntoIterator<Item = Option<OsString>>) -> Option<bool> {
+    values
+        .into_iter()
+        .map(|v| v.is_some_and(|v| v == "1"))
+        .reduce(|a, b| a || b)
 }
 
 #[cfg(test)]
@@ -453,6 +506,46 @@ mod tests {
         assert!(!default_wake(Harness::Kiro, unset, || false));
         assert!(!default_wake(Harness::Kiro, zero, || false));
         assert!(default_wake(Harness::Kiro, unset, || true));
+    }
+
+    #[test]
+    fn servers_wake_follows_the_running_mcp_server() {
+        let one = || Some(OsString::from("1"));
+        assert_eq!(servers_wake([]), None);
+        // A server kiro started without the variable (an untrusted
+        // workspace's entry skipped, say) means no, whatever the files say.
+        assert_eq!(servers_wake([None]), Some(false));
+        assert_eq!(servers_wake([Some(OsString::from("0"))]), Some(false));
+        assert_eq!(servers_wake([one()]), Some(true));
+        assert_eq!(servers_wake([None, one()]), Some(true));
+    }
+
+    #[test]
+    fn is_agentmail_mcp_matches_the_server_command_only() {
+        let names = [
+            std::ffi::OsStr::new("agentmail"),
+            std::ffi::OsStr::new("am-dev"),
+        ];
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_agentmail_mcp(
+            &args(&["/usr/bin/agentmail", "mcp"]),
+            &names
+        ));
+        assert!(is_agentmail_mcp(&args(&["agentmail", "mcp"]), &names));
+        assert!(is_agentmail_mcp(
+            &args(&["/x/target/am-dev", "mcp"]),
+            &names
+        ));
+        assert!(!is_agentmail_mcp(
+            &args(&["/usr/bin/agentmail", "register"]),
+            &names
+        ));
+        assert!(!is_agentmail_mcp(&args(&["/usr/bin/agentmail"]), &names));
+        assert!(!is_agentmail_mcp(
+            &args(&["/usr/bin/other-mcp", "mcp"]),
+            &names
+        ));
+        assert!(!is_agentmail_mcp(&args(&[]), &names));
     }
 
     #[test]

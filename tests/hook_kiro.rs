@@ -303,21 +303,20 @@ async fn stop_exit1_on_open_question() {
 }
 
 #[tokio::test]
-async fn stop_shows_an_open_question_once() {
-    // Without waking: a question the model left open is not shown at
-    // every later stop (the prompt's reminder still counts it).
+async fn stop_shows_open_questions_at_every_stop_without_wake() {
+    // Without waking no stop waits, so a question the model left open is
+    // shown again at every stop (kiro continues once per human prompt).
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", true).await;
     let env = Env::of(&d.paths);
     let q = ask(&d, &a, "POST /orders body?").await;
-    let out = run(&env, HookEvent::Stop, "stop").await;
-    assert_eq!(out.exit, 1, "{out:?}");
-    assert!(out.stderr.contains(&q), "{out:?}");
-    assert!(silent(&run(&env, HookEvent::Stop, "stop").await));
-    let out = run(&env, HookEvent::Prompt, "prompt").await;
-    assert!(out.stdout.contains("1 question"), "{out:?}");
+    for _ in 0..2 {
+        let out = run(&env, HookEvent::Stop, "stop").await;
+        assert_eq!(out.exit, 1, "{out:?}");
+        assert!(out.stderr.contains(&q), "{out:?}");
+    }
 
-    // A new question is shown, with the one still open.
+    // A new question is shown with the one still open.
     let q2 = ask(&d, &a, "GET /orders filters?").await;
     let out = run(&env, HookEvent::Stop, "stop").await;
     assert_eq!(out.exit, 1, "{out:?}");
@@ -325,7 +324,37 @@ async fn stop_shows_an_open_question_once() {
         out.stderr.contains(&q) && out.stderr.contains(&q2),
         "{out:?}"
     );
-    assert!(silent(&run(&env, HookEvent::Stop, "stop").await));
+
+    // Stops without `--wake` record nothing: a `--wake` stop still shows
+    // the questions once.
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(out.stderr.contains(&q2), "{out:?}");
+}
+
+#[tokio::test]
+async fn stop_with_wake_shows_an_open_question_once() {
+    // A question shown at a `--wake` stop is not shown at the next one
+    // (which waits instead); a new question is, with the one still open.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths);
+    let q = ask(&d, &a, "POST /orders body?").await;
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(out.stderr.contains(&q), "{out:?}");
+    let h = spawn_stop(&env);
+    assert!(still_waiting(&h, 0.5).await, "showed the question again");
+    let q2 = ask(&d, &a, "GET /orders filters?").await;
+    assert_eq!(finish(h).await.exit, 1);
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert_eq!(out.exit, 1, "{out:?}");
+    assert!(
+        out.stderr.contains(&q) && out.stderr.contains(&q2),
+        "{out:?}"
+    );
+    let out = run(&env, HookEvent::Prompt, "prompt").await;
+    assert!(out.stdout.contains("2 question"), "{out:?}");
 }
 
 #[tokio::test]

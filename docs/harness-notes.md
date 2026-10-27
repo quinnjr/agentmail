@@ -1026,19 +1026,23 @@ config schema and exit-code rules come from the engine bundle
   kiro needs nothing like Claude Code's `stop_hook_active`; but after a
   wake (or an open-question continuation) the agent is not woken again
   until the human's next prompt.
-- **Each open question is shown at one stop only.** Because a stop that
-  shows open questions (exit 1) is one that does not wait, a question the
-  model leaves open (not its call, or ignored) would otherwise be shown
-  at every later stop and keep a `--kiro-wake` agent from ever being
-  woken while it stays open. The Stop hook records the open questions it
-  showed (the agent's `shown` file under `hook-wait/`, removed with the
-  other wait files) and continues a stop only for a question it has not
-  shown yet (listing all open ones). Otherwise it falls through to the
-  wait, where the unread messages of the questions it has shown do not
-  count as mail to wake for (nor does mail the last wake was for); a
-  question that arrives while it waits wakes the agent like other mail,
-  and the next stop shows it. The prompt hooks' reminder still counts
-  questions left open.
+- **Open questions at every stop, except while waking.** Without
+  `--kiro-wake` the Stop hook never waits, so it exits 1 with the open
+  questions at every stop (as the plan says); kiro continues only once
+  per human prompt, so this cannot hold a model that cannot answer. With
+  `--kiro-wake` a stop that shows open questions (exit 1) is one that
+  does not wait, so a question the model leaves open (not its call, or
+  ignored) would otherwise be shown at every later stop and keep the
+  agent from ever being woken while it stays open. The waiting Stop hook
+  therefore records the open questions it showed (the agent's `shown`
+  file under `hook-wait/`, removed with the other wait files; the plain
+  Stop hook neither reads nor writes it) and continues a stop only for a
+  question it has not shown yet (listing all open ones). Otherwise it
+  falls through to the wait, where the unread messages of the questions
+  it has shown do not count as mail to wake for (nor does mail the last
+  wake was for); a question that arrives while it waits wakes the agent
+  like other mail, and the next stop shows it. The prompt hooks'
+  reminder still counts questions left open.
 - **(c) The human cannot reach the agent while a Stop hook blocks.** While
   it runs, the TUI shows "Kiro is working · Type to steer". A message
   typed and submitted then is queued ("1 message queued") and delivered
@@ -1052,14 +1056,27 @@ config schema and exit-code rules come from the engine bundle
   `register` (MCP and CLI) defaults `wake` to false for a kiro agent
   unless `--kiro-wake` is installed: the MCP server sees the variable;
   kiro does not pass the server's `env` to its shell tool's commands, so
-  the CLI instead reads agentmail's server entry in the workspace's
-  `.kiro/settings/mcp.json` (kiro's workspace: the working directory of
-  the `kiro-cli` process the CLI runs under, read from
+  the CLI asks the source of truth instead: agentmail's MCP server (a
+  process `<agentmail> mcp`) among the descendants of the `kiro-cli` the
+  CLI runs under, reading `AGENTMAIL_KIRO_WAKE` from its
+  `/proc/<pid>/environ` (`1` there means on; a server without it means
+  off, whatever the files say). The config files cannot be relied on for
+  this: kiro's V3 `MCPConfigManager.readWorkspaceFiles` returns nothing
+  unless the workspace is trusted (`if(!this.workspaceTrusted)return r`
+  in the 2.32.0 bundle), and the order in which `items.merged()` lets a
+  workspace's server override the user's of the same name was not
+  checked live, so the files could disagree with the server kiro started
+  and a CLI `register` would then flip the agent's `wake`. Only when no
+  such server runs (no `kiro-cli` above, with `--harness kiro`, or kiro
+  has not started it) does the CLI fall back to agentmail's server entry
+  in the workspace's `.kiro/settings/mcp.json` (kiro's workspace: the
+  working directory of the `kiro-cli` process, read from
   `/proc/<pid>/cwd`, so a command run in a subdirectory finds it; the
   CLI's own directory only without a `kiro-cli` above it; the
-  workspace's entry decides when it has one), else the user's
-  (`$KIRO_HOME`, else `~/.kiro`), and takes
-  `env.AGENTMAIL_KIRO_WAKE = "1"` there as the install's choice.
+  workspace's entry is taken when it has one, trusted or not, since the
+  trust is not known outside kiro), else the user's (`$KIRO_HOME`, else
+  `~/.kiro`), and takes `env.AGENTMAIL_KIRO_WAKE = "1"` there as the
+  install's choice.
   `wake: true` / `--wake` still turns it on.
   A Stop hook left running after Esc ends at the human's next prompt or
   tool call (they mark the session busy), so it never wakes a busy session
@@ -1115,9 +1132,9 @@ config schema and exit-code rules come from the engine bundle
 - **Both scopes at once.** kiro loads a trusted workspace's
   `.kiro/hooks/` alongside the user's `hooks/`, so agentmail installed
   at both scopes runs every hook twice: two reminders at session start
-  and on each prompt, two `PreToolUse` hooks, and two Stop hooks. The
-  two Stop hooks share the `shown` file without a lock, so both can show
-  the same open questions; with `--kiro-wake` at one scope only, that
+  and on each prompt, two `PreToolUse` hooks, and two Stop hooks. Two
+  waiting Stop hooks share the `shown` file without a lock, so both can
+  show the same open questions; with `--kiro-wake` at one scope only, that
   scope's waiting Stop hook runs beside the other's plain one, which
   ends the stop at once with any open questions. `install` therefore
   notes when the other scope's `hooks/agentmail.json` already holds

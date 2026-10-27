@@ -56,6 +56,46 @@ fn walk_ancestors(pid: u32, read: impl Fn(u32) -> Option<(u32, u64)>) -> Vec<Pro
     chain
 }
 
+/// The descendants of `pid` (children, their children, ...), found by
+/// reading every `/proc/<pid>/stat`. Excludes `pid` itself; a process that
+/// exits during the scan is left out.
+pub fn descendants(pid: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let table: Vec<(u32, u32)> = dir
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter_map(|p| Some((p, read_stat(p)?.0)))
+            .collect();
+        walk_descendants(pid, &table)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
+/// The walk behind [`descendants`], over a `(pid, ppid)` table, nearest
+/// first.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn walk_descendants(pid: u32, table: &[(u32, u32)]) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut next = vec![pid];
+    while let Some(parent) = next.pop() {
+        for &(child, ppid) in table {
+            // The guard against a cycle in a malformed table.
+            if ppid == parent && child != pid && !found.contains(&child) {
+                found.push(child);
+                next.push(child);
+            }
+        }
+    }
+    found
+}
+
 /// The command name of `pid` (`/proc/<pid>/comm`), without the trailing newline.
 pub fn comm(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -228,6 +268,25 @@ mod tests {
         let chain = walk_ancestors(30, |p| table.get(&p).copied());
         let pids: Vec<u32> = chain.iter().map(|p| p.pid).collect();
         assert_eq!(pids, vec![20]);
+    }
+
+    #[test]
+    fn procinfo_walk_descendants_finds_the_whole_subtree() {
+        let table = [
+            (2, 1),
+            (10, 2),
+            (11, 10),
+            (12, 11),
+            (13, 10),
+            (20, 1),
+            (21, 20),
+        ];
+        let mut found = walk_descendants(10, &table);
+        found.sort_unstable();
+        assert_eq!(found, vec![11, 12, 13]);
+        assert!(walk_descendants(12, &table).is_empty());
+        // A cycle in a malformed table ends the walk.
+        assert_eq!(walk_descendants(5, &[(6, 5), (5, 6)]), vec![6]);
     }
 
     #[test]

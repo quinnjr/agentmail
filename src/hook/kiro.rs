@@ -15,11 +15,12 @@
 //! - All three mark the session busy, which ends a `stop --wake` still
 //!   waiting from an earlier turn (kiro does not stop a Stop hook when the
 //!   human presses Esc).
-//! - `stop`: open questions to the agent continue the turn (exit 1), each
-//!   at one stop only (the `shown` file): kiro runs Stop hooks once per
-//!   human prompt (the continued turn ends without another Stop), so a
-//!   model that cannot answer is never held, and a question it leaves open
-//!   does not keep later stops from waiting. Otherwise,
+//! - `stop`: open questions to the agent continue the turn (exit 1) at
+//!   every stop; kiro runs Stop hooks once per human prompt (the continued
+//!   turn ends without another Stop), so a model that cannot answer is
+//!   never held. With `--wake` each is shown at one stop only (the `shown`
+//!   file), so a question it leaves open does not keep later stops from
+//!   waiting. Otherwise,
 //!   with `--wake` (`install --kiro-wake`) and the agent's `wake` on, it
 //!   waits while the agent is idle ([`Daemon::wait`]) and continues the
 //!   turn with the reminder (exit 1) when mail comes. While it waits kiro
@@ -152,15 +153,20 @@ async fn stop(d: &mut Daemon, wake: bool) -> HookOutput {
     let Some(status) = d.status(false).await else {
         return HookOutput::default();
     };
-    // Each open question continues one stop. kiro runs Stop once per human
-    // prompt, so showing a question the model leaves open at every stop
-    // would keep every stop from waiting for as long as it stays open.
+    // Open questions continue the turn. With `--wake` each continues one
+    // stop only: kiro runs Stop once per human prompt, so showing a
+    // question the model leaves open at every stop would keep every stop
+    // from waiting for as long as it stays open. Without `--wake` no stop
+    // waits, so every stop shows them.
     let open: Vec<String> = status.open_questions.iter().map(|q| q.id.clone()).collect();
-    let shown = d.shown_questions(&status.address);
-    if open.iter().any(|id| !shown.contains(id))
-        && let Some(questions) = text::open_questions(&status)
-    {
-        d.record_shown_questions(&status.address, &open);
+    let unshown = !wake || {
+        let shown = d.shown_questions(&status.address);
+        open.iter().any(|id| !shown.contains(id))
+    };
+    if unshown && let Some(questions) = text::open_questions(&status) {
+        if wake {
+            d.record_shown_questions(&status.address, &open);
+        }
         return HookOutput {
             stderr: questions,
             exit: EXIT_CONTINUE,
