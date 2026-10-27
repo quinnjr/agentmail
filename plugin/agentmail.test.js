@@ -921,7 +921,15 @@ queue.push({ type: "session.deleted", data: { sessionID: "s1" } });
 wake?.();
 const fs = require("node:fs");
 const log = ${JSON.stringify(join(dir, "calls.log"))};
-while (!(fs.existsSync(log) && fs.readFileSync(log, "utf8").includes('"signoff"'))) await Bun.sleep(10);
+// A plugin that never signs off fails here, not by hanging the test run.
+const deadline = Date.now() + 5000;
+while (!(fs.existsSync(log) && fs.readFileSync(log, "utf8").includes('"signoff"'))) {
+  if (Date.now() > deadline) {
+    console.error("runner: no hook signoff within 5s");
+    process.exit(3);
+  }
+  await Bun.sleep(10);
+}
 await stop();
 `,
   );
@@ -932,6 +940,10 @@ await stop();
     stderr: "inherit",
     env: { ...process.env },
   });
+  // Never leave the runner behind if this test fails or times out.
+  cleanups.push(() => {
+    if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+  });
   proc.stdin.write("STOLEN");
   proc.stdin.end();
   const code = await proc.exited;
@@ -941,4 +953,4 @@ await stop();
     ["hook status", ""],
     ["hook signoff", ""],
   ]);
-});
+}, 15000);

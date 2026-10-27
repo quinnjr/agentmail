@@ -17,7 +17,7 @@
 #   3. `agentmail --as human threads --json` shows a question/answer thread
 #      between the two addresses.
 #   4. Urgent mail from the human to A, sent while A is still working,
-#      shows up in A's output or transcript.
+#      shows up in A's output or its own session's transcript.
 #   5. kiro only: A's agent is recorded with harness `kiro`, bound to the
 #      `kiro-cli` process the script started.
 #   6. opencode A only (the one harness that wakes in a headless setup): A's
@@ -451,17 +451,83 @@ qa_thread() {
     return 1
 }
 
-# mentions <who> <token>: the agent's output, or its harness's transcript,
-# mentions the token.
+# session_of <address>: the harness session agentmail recorded for it.
+session_of() {
+    human agents --json --all 2>/dev/null |
+        jq -r --arg a "$1" '.[] | select(.address == $a) | .session.id // empty'
+}
+
+# mentions <who> <token> <harness> <address>: the agent's own output, or
+# its own session's transcript, mentions the token. B's transcript sits in
+# the same throwaway home, so the search is tied to the agent's session.
 mentions() {
-    local who=$1 token=$2 harness=$3
+    local who=$1 token=$2 harness=$3 addr=$4 sess
     grep -q -- "$token" "$TMP/logs/$who.out" "$TMP/logs/$who.out.err" 2>/dev/null && return 0
     case $harness in
-    claude-code) grep -rqs -- "$token" "$H/.claude/projects" ;;
-    opencode) grep -rqs -- "$token" "$H/.local/share/opencode" ;;
-    # The whole private copy: the conversation may still be in the -wal.
-    kiro) grep -rqs -- "$token" "$H/.kiro" "$H/.local/share/kiro-cli" ;;
+    claude-code)
+        # `-p --output-format json` names the session; agentmail's record
+        # of it is the fallback.
+        sess=$(jq -r '.session_id // empty' "$TMP/logs/$who.out" 2>/dev/null)
+        [ -n "$sess" ] || sess=$(session_of "$addr")
+        [ -n "$sess" ] || return 1
+        find "$H/.claude/projects" -name "$sess.jsonl" -exec grep -qs -- "$token" {} + 2>/dev/null
+        ;;
+    opencode)
+        sess=$(session_of "$addr")
+        [ -n "$sess" ] || return 1
+        session_mentions_opencode "$sess" "$token"
+        ;;
+    kiro)
+        # Only A is checked; its session is the one older than B's start.
+        [ "$who" = A ] || return 1
+        session_mentions_kiro "$B_STARTED" "$token"
+        ;;
+    *) return 1 ;;
     esac
+}
+
+# session_mentions_opencode <session id> <token>: a message or part of that
+# session in opencode's database mentions the token.
+session_mentions_opencode() {
+    python3 -I - "$H/.local/share/opencode/opencode.db" "$1" "$2" <<'PY' 2>/dev/null
+import sqlite3, sys
+db, session, token = sys.argv[1:4]
+c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+for (data,) in c.execute("select data from session_message where session_id = ?", (session,)):
+    if token in (data if isinstance(data, str) else bytes(data).decode("utf-8", "replace")):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# session_mentions_kiro <before, ms> <token>: a kiro session that began
+# before the given time (A's: B starts only once A has registered) mentions
+# the token. agentmail records no session for kiro agents, and kiro V3
+# keeps each session in KIRO_HOME/sessions/<workspace>/sess_<id>/, its
+# session.json giving createdAt.
+session_mentions_kiro() {
+    python3 -I - "$H/.kiro/sessions" "$1" "$2" <<'PY' 2>/dev/null
+import calendar, glob, json, os, re, sys
+root, before, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+def ms(s):
+    # kiro writes UTC as 2026-10-27T23:11:56.492Z.
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z", s)
+    secs = calendar.timegm(tuple(map(int, re.split("[-T:]", m[1]))) + (0, 0, 0))
+    return secs * 1000 + int((m[2] or "0")[:3].ljust(3, "0"))
+
+for meta in glob.glob(os.path.join(root, "*", "sess_*", "session.json")):
+    with open(meta) as f:
+        if ms(json.load(f)["createdAt"]) >= before:
+            continue
+    for name in os.listdir(os.path.dirname(meta)):
+        path = os.path.join(os.path.dirname(meta), name)
+        if os.path.isfile(path):
+            with open(path, errors="replace") as f:
+                if token in f.read():
+                    sys.exit(0)
+sys.exit(1)
+PY
 }
 
 replied_in() {
@@ -538,6 +604,7 @@ ADDR_A=$(address_of backend)
 note "backend is $ADDR_A"
 
 STEP="2 (B registers and asks)"
+B_STARTED=$(now_ms)
 start_agent B "$HB" "$PROMPT_B"
 PID_B=$AGENT_PID
 wait_until "$TIMEOUT" "frontend to register (output in $TMP/logs/B.out*)" registered frontend "$PID_B" B
@@ -554,7 +621,7 @@ human send --to "$ADDR_A" --urgent --subject "$TOKEN" \
     fail "sending urgent mail failed"
 finish "$PID_B" B
 finish "$PID_A" A
-mentions A "$TOKEN" "$HA" || fail "A's output and transcript never mention $TOKEN (see $TMP/logs/A.out)"
+mentions A "$TOKEN" "$HA" "$ADDR_A" || fail "A's output and its session's transcript never mention $TOKEN (see $TMP/logs/A.out)"
 note "A saw the urgent mail"
 
 if [ "$HA" = kiro ]; then
@@ -567,7 +634,7 @@ fi
 
 if [ "$HA" = opencode ]; then
     STEP="6 (idle A is woken)"
-    SESSION_A=$(human agents --json --all | jq -r --arg a "$ADDR_A" '.[] | select(.address == $a) | .session.id // empty')
+    SESSION_A=$(session_of "$ADDR_A")
     [ -n "$SESSION_A" ] || fail "$ADDR_A has no opencode session"
     # Let a wake for mail A left unread (it may not read every message)
     # run its course first.

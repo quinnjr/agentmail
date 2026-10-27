@@ -1313,11 +1313,13 @@ Deviations from the plan, and why:
 `scripts/e2e.sh <claude-code|opencode|kiro|mixed>` (see the README). Run on
 2026-10-27 against Claude Code 2.1.312 (`--model haiku`), opencode 2.0.27
 (`opencode/big-pickle`, a free model) and kiro-cli 2.32.0 (`chat --v3`,
-default model), each in a throwaway home, with the release build. After
-review, `opencode`, `kiro` and `mixed` were run again with the script as
-committed (B on A's server in `opencode` mode, the narrower kiro data dir,
-the stricter step 6 check); `claude-code`, whose path did not change, was
-not re-run:
+default model), each in a throwaway home, with the release build. All
+four modes passed with the script as committed at 62d4740 (`claude-code`,
+`kiro` and `mixed` re-run on 2026-10-27 after the `setsid`/`henv` change,
+`AGENTMAIL_E2E_TIMEOUT=300`, with no process left behind). All four
+passed again, the same day, with the committed script after step 4 was
+tied to A's own session (see below; `AGENTMAIL_E2E_TIMEOUT=300`, kiro
+with `AGENTMAIL_E2E_MIN_LOGIN_SECS=600`):
 
 | mode | result | steps checked |
 |---|---|---|
@@ -1341,14 +1343,10 @@ not re-run:
   access token alone. Since the copy cannot be refreshed, the script
   refuses a login that expires before the longest possible run ends: 6 ×
   `AGENTMAIL_E2E_TIMEOUT` + 300 seconds by default (six waits plus
-  setup), or `AGENTMAIL_E2E_MIN_LOGIN_SECS`. (The kiro re-run had about 9
-  minutes left on the login, and the user's own login must not be
-  refreshed from here; it ran from a scratch copy of the script, then
-  fixed at 15 minutes, with the margin lowered to 4 minutes, and
-  finished in under 2. That knob is now the environment variable, so
-  such a run needs no edited copy.) The expiry is parsed with any number
-  of fraction digits (none, 3, 6, 9). opencode's free models need no
-  login.
+  setup), or `AGENTMAIL_E2E_MIN_LOGIN_SECS`. A login close to expiry can
+  be used by lowering `AGENTMAIL_E2E_MIN_LOGIN_SECS`. The expiry is
+  parsed with any number of fraction digits (none, 3, 6, 9). opencode's
+  free models need no login.
 - **kiro's data dir.** Only what kiro-cli never writes is linked from
   the real `~/.local/share/kiro-cli`: `bun`, `node`, `tui.js`, their
   `.sha256` files and each versioned engine directory under `kas/` (the
@@ -1366,6 +1364,19 @@ not re-run:
   urgent subject: Claude Code at the next `PostToolUse`, opencode by the
   plugin's steer, kiro by the held `PreToolUse` (the agent said "I
   received urgent mail from the human", read it, then ran its command).
+- **Step 4 looks only at A.** It accepts A's own output (`A.out`,
+  `A.out.err`) or A's own session's transcript, never the harness's whole
+  data directory, since B's transcript sits in the same throwaway home
+  and also carries the token. Claude Code: `projects/*/<session_id>.jsonl`
+  for the `session_id` in A's `-p` JSON (agentmail's record of A's
+  session as the fallback). opencode: the `session_message` rows of the
+  session agentmail recorded for A. kiro: agentmail records no session for
+  kiro agents, so the script takes the kiro V3 session
+  (`$KIRO_HOME/sessions/<workspace>/sess_<id>/`) whose `session.json`
+  `createdAt` is before B was started (B starts only once A has
+  registered). Checked against the kept homes of the re-runs: the token
+  was in A's session only (Claude Code: A's transcript 6 hits, B's 0;
+  opencode: A's session 3, B's 0; kiro: A's `sess_` directory, not B's).
 - **kiro binding (step 5).** The V3 MCP `register` recorded harness `kiro`
   and the pid of the `kiro-cli` process the script started, confirming
   that `kiro-cli-chat` and the engine's `node` in between do not displace
