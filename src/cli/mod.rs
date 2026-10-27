@@ -292,6 +292,14 @@ pub enum Command {
         /// The harness session the hook is for (opencode's plugin).
         #[arg(long)]
         session: Option<String>,
+        /// `status`: mark the urgent mail reported surfaced, so it is
+        /// pushed once (opencode's plugin).
+        #[arg(long)]
+        surface_urgent: bool,
+        /// `wait`: report no mail after this many seconds (opencode's
+        /// plugin; default 300).
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
     },
     /// Wire agentmail into a harness: its hooks and MCP server. Edits the
     /// harness's config files, keeping everything else in them; each file's
@@ -712,7 +720,7 @@ const MAX_HOOK_INPUT: u64 = 16 * 1024 * 1024;
 
 /// `agentmail hook`: read the payload (unless stdin is a terminal), run
 /// the hook and print its output. Never fails: see [`crate::hook`].
-async fn hook(event: HookEvent, harness: &str, session: Option<&str>) -> ExitCode {
+async fn hook(event: HookEvent, harness: &str, args: &crate::hook::HookArgs<'_>) -> ExitCode {
     use std::io::IsTerminal;
     let mut stdin = Vec::new();
     if !std::io::stdin().is_terminal() {
@@ -722,7 +730,7 @@ async fn hook(event: HookEvent, harness: &str, session: Option<&str>) -> ExitCod
             .read_to_end(&mut stdin);
     }
     let harness = harness_from(harness).unwrap_or(Harness::Other);
-    let out = crate::hook::run_as(harness, event, session, &stdin, &|k| std::env::var_os(k)).await;
+    let out = crate::hook::run_with(harness, event, args, &stdin, &|k| std::env::var_os(k)).await;
     if !out.stdout.is_empty() {
         let _ = print_text(&out.stdout);
     }
@@ -950,6 +958,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         event,
         harness,
         session,
+        surface_urgent,
+        timeout,
     } = cli.command
     {
         // `--as human` is the human, like `AGENTMAIL_HUMAN=1`: a hook run
@@ -957,7 +967,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         if cli.as_who.is_some() {
             return Ok(ExitCode::SUCCESS);
         }
-        return Ok(hook(event, &harness, session.as_deref()).await);
+        let args = crate::hook::HookArgs {
+            session: session.as_deref(),
+            surface_urgent,
+            timeout: timeout.map(Duration::from_secs),
+        };
+        return Ok(hook(event, &harness, &args).await);
     }
     match cli.command {
         Command::Install {

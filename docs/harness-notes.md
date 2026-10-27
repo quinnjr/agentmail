@@ -548,11 +548,14 @@ still silences a hook, and so does `--as human`. Tests bind their agent to the t
 
 The code differs from the plan's sketch; build on the code:
 
-- `hook::run(harness, event, stdin, env)` and `hook::run_as(harness,
-  event, session: Option<&str>, stdin, env)`, where `env: &(dyn Fn(&str)
-  -> Option<OsString> + Sync)` (the `Sync` lets a waiting hook run on a
-  spawned task). `run_as` dispatches on the harness; opencode and kiro
-  currently return empty output there.
+- `hook::run(harness, event, stdin, env)`, `hook::run_as(harness,
+  event, session: Option<&str>, stdin, env)` and `hook::run_with(harness,
+  event, &HookArgs { session, surface_urgent, timeout }, stdin, env)`
+  (the whole `hook` command line), where `env: &(dyn Fn(&str) ->
+  Option<OsString> + Sync)` (the `Sync` lets a waiting hook run on a
+  spawned task). `run_with` dispatches on the harness: Claude Code and
+  opencode (Task 6) are implemented; kiro currently returns empty
+  output there.
 - `HookInput` also carries `agent_id` (Claude Code subagents), `prompt_id` and
   `hook_event_name`.
 - `hook::Daemon` (`connect`, `status(surface_urgent)`, `mark_busy(&status)`,
@@ -597,3 +600,144 @@ has these instead (Claude Code's `claude.rs` shows the pattern):
   path, `shell_quote` quotes it for a command line. `plan_install` /
   `plan_uninstall` dispatch per harness, `apply` writes (with backups) and
   `diff` renders `--dry-run`.
+
+## opencode plugin (Task 6)
+
+Checked live against opencode 2.0.27 (`~/.opencode/bin/opencode`) with
+private `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+`XDG_CACHE_HOME` and `HOME`, a probe plugin in
+`$XDG_CONFIG_HOME/opencode/plugins/`, and opencode's free
+`opencode/deepseek-v4.1-flash-free` model (no login needed). Single runs
+used `opencode run --standalone`; anything that happens after a turn ends
+needs a server that stays up, so those used `opencode serve` (with
+`OPENCODE_PASSWORD`) and `opencode run --server`. `run --standalone` shuts
+its server down as soon as the turn ends, so nothing that waits for an idle
+session can be seen with it. The plugin API was read from the shipped
+bundle (the `fromPromise` adapter that wraps a `{ id, setup }` module).
+
+- **Plugin context.** `setup(ctx)` gets `app`, `location`, `options`,
+  `agent`, `aisdk`, `command`, `event`, `experimental`, `generate`,
+  `model`, `provider`, `integration`, `mcp`, `permission`, `plugin`,
+  `reference`, `rpc`, `skill`, `storage`, `tool`, `vcs`, `websearch`,
+  `worktree`, `session` and `shell`. `ctx.session` has `hook`, `create`,
+  `get`, `remove`, `switchAgent`, `switchModel`, `prompt`, `generate`,
+  `command`, `compact`, `synthetic`, `interrupt`, `update`, `move`, `wait`
+  and `context`. `ctx.tool.hook(name, fn)` resolves to `{ dispose }`. The
+  function `setup` returns is called when the plugin is unloaded (server
+  shutdown, or the plugin file changing: opencode watches it).
+- **(a) `ctx.session.synthetic({sessionID, text, delivery, resume})`
+  works; the `prompt` fallback is not needed.** `delivery` is `"steer"` or
+  `"queue"`. With `delivery: "queue", resume: true` on an idle session it
+  starts a turn at once (`session.inbox.enqueued` with a `synthetic` item,
+  then `session.execution.started` 16 ms later); the model sees the text
+  as a message of its own. With `delivery: "steer", resume: false` during a
+  turn, the text is delivered after the current step's tool calls
+  (`session.inbox.delivered` right after `session.step.ended`) and the
+  model acted on it in that same turn. Both were also seen end to end with
+  the real plugin below.
+- **(b) `ctx.tool.hook("execute.after", fn)` can add to the result.** `fn`
+  gets `{tool, sessionID, agent, messageID, id, input, status, result}`;
+  for `status: "completed"`, `result` is `{output?, content, metadata?}`,
+  and after the hook opencode builds the tool's result from
+  `result.content` (an array of `{type: "text", text}` parts), so pushing a
+  text part there reaches the model (it repeated the appended line
+  verbatim). `output` is tool-specific (an object for `shell`), so
+  agentmail appends to `content` only. A failed call has `status:
+  "error"` and `error`, no `result`: nothing can be appended, and the
+  plugin only steers urgent mail for it. The hook is awaited before the
+  result goes back to the model, so its cost (one `agentmail hook status`,
+  a few ms) is added to every tool call. With opencode's "code mode" the
+  model's tools run inside an `execute` tool: `execute.after` fires for
+  each tool called from the code and for `execute` itself.
+- **(c) Event names.** `ctx.event.subscribe({signal})` is an async iterable
+  of `{id, type, data, ...}`. A turn is `session.execution.started` and then
+  one of `session.execution.succeeded`, `session.execution.failed` (with
+  `error`) or `session.execution.interrupted` (with `reason`: `user`,
+  `shutdown`, `superseded`, `inactivity`), all with `data.sessionID`.
+  Deleting a session (`opencode session delete`, or `ctx.session.remove`)
+  publishes `session.deleted` with `data.sessionID`. A prompt is
+  `session.inbox.enqueued` with `data.item.type` `user` (`synthetic` for
+  the plugin's own).
+- **One plugin instance per directory, one event stream for all.**
+  opencode loads a separate instance of each plugin for every directory
+  (location) it serves, in the same process. `ctx.tool.hook` sees only its
+  own directory's tool calls, but `ctx.event.subscribe` delivers every
+  session's events to every instance (seen with two `run --server` in two
+  directories: both instances got both sessions' `execution.*` events). The
+  plugin therefore acts on a session only when `ctx.session.get` places it
+  in its own `ctx.location.directory` (cached per session); otherwise two
+  instances would each queue the same question or run two waiters. A
+  deleted session cannot be looked up any more: an instance that never saw
+  it signs it off too, which is harmless twice.
+- **No `session.hook("context")`.** The spec's table names it for the
+  reminder at start and on a prompt; 2.0.27 has no such hook (the session
+  hooks are `prompt`, `title`, `retry`, `model.request`, `http.request`,
+  `http.response` and three `experimental.ws.*`). `prompt` could append to
+  the human's prompt text, but that text is stored and shown as the human's
+  own message, so agentmail does not touch it. On opencode the agent learns
+  who it is from the MCP server's instructions and from `register`, and is
+  reminded of mail after its first tool call.
+
+How the plugin (`plugin/agentmail.js`) behaves, built on that:
+
+- It runs `agentmail hook status --harness opencode --session <id>
+  [--surface-urgent]`, which prints the agent's `HookStatus` plus a
+  `text` object (`guidance`, `reminder`, `urgent`, `questions`; `null`
+  when there is nothing), or `{}` for a session without an agent or with
+  the daemon down (and never starts the daemon). Rendering stays in Rust,
+  shared with the other harnesses.
+- After each tool call (`--surface-urgent`): urgent mail goes into the
+  running turn with `synthetic` `steer` (once: agentmail marks it surfaced),
+  else, with unread mail, the reminder is appended to the tool result.
+- At the end of a successful turn, open questions are queued as the next
+  turn (`queue`, `resume: true`), unless that turn was itself one the
+  plugin started (a wake or the questions): like Claude Code's
+  `stop_hook_active`, it is not held in a loop by questions the model does
+  not answer. A human prompt (`inbox.enqueued` with a `user` item) clears
+  that mark.
+- While a session is idle (after `execution.succeeded`, `failed` or
+  `interrupted`) and its agent has `wake` on, one waiter per session runs
+  `agentmail hook wait --harness opencode --session <id> --timeout 300`
+  with `{"stop_hook_active": <the turn was the plugin's, or did not
+  succeed>}` on stdin, the same `Daemon::wait` Claude Code's wait hook
+  uses (one waiter per agent, wake once per message, new mail only after
+  a wake). It prints `{"mail":true,"text":...}`, `{"mail":false}` on the
+  timeout (the plugin waits again, at most once a second), `{"busy":true}`
+  (open questions continue the turn, or another wait took over),
+  `{"skip":true}` (`wake` off, or the lock unusable) or `{"gone":true}`
+  (signed off, gone, no agent, daemon down, opencode exited). On mail the
+  plugin queues the reminder with `resume: true`, which starts a turn; on
+  anything but the timeout the waiter stops until the session is idle
+  again. `execution.started` kills the waiter's process, so a wake never
+  lands in a busy turn (`Bun.spawn`, since Bun's `$` cannot be killed).
+  There are no busy-mark files for opencode: the plugin sees the session's
+  state directly.
+- The waiter starts lazily, at the first end of turn whose status shows the
+  agent registered with `wake`. After opencode restarts, a session that
+  was idle when it went down is not waited on until its next turn ends.
+- `session.deleted` stops the waiter and runs `agentmail signoff` with
+  `OPENCODE_SESSION_ID` set to that session; the CLI accepts it because
+  its nearest harness ancestor is opencode itself.
+- `AGENTMAIL_ADDRESS` is removed from the environment of every agentmail
+  command the plugin runs: opencode may have inherited it from the shell
+  that started it, and the CLI's `signoff` would act as that address.
+- The plugin's cleanup kills every waiter and stops its event stream.
+- The installed file has the binary's absolute path in place of the
+  `__AGENTMAIL_BIN__` placeholder; uninstalled (the placeholder left as is,
+  as in the unit tests) it runs `agentmail` from `PATH`.
+
+End to end with the real plugin and agentmail (debug build, private data
+dir, socket under `/run/user/1000` because the scratch path exceeded the
+socket path limit), `opencode serve` plus `opencode run --server`:
+
+- The model registered over MCP; when the turn ended the plugin started a
+  `hook wait` for the session. `agentmail --as human send` woke the idle
+  session within the same second (the reminder was enqueued, and the turn
+  started), and the model read the mail and
+  replied with the `reply` tool.
+- Urgent mail sent during a turn's `sleep 6` tool call was steered into
+  that turn; the model followed it in its final answer.
+- `opencode session delete` signed the session's agent off (`signed_off:
+  true`) and left no `hook wait` process behind.
+- Killing the server left no `hook wait` process behind either.
+

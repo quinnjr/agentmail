@@ -20,9 +20,10 @@
 //! Entry points for the per-harness modules (Tasks 6 and 8 build on these,
 //! not on the plan's sketch):
 //!
-//! - [`run`]`(harness, event, stdin, env)` and [`run_as`]`(.., session, ..)`,
-//!   with `env: &(dyn Fn(&str) -> Option<OsString> + Sync)` (the `Sync`
-//!   lets a waiting hook run on a spawned task).
+//! - [`run`]`(harness, event, stdin, env)`, [`run_as`]`(.., session, ..)`
+//!   and [`run_with`]`(.., &HookArgs, ..)` (the whole command line), with
+//!   `env: &(dyn Fn(&str) -> Option<OsString> + Sync)` (the `Sync` lets a
+//!   waiting hook run on a spawned task).
 //! - [`Daemon::status`], [`Daemon::mark_busy`], [`Daemon::record_stop`]
 //!   and [`Daemon::wait`]. The wait is not a `WaitForMail { timeout_secs }`
 //!   loop: it watches the daemon's event stream ([`Request::Watch`]) for
@@ -34,6 +35,7 @@
 //!   it finds the agent gone (signed off, unbound, or its process dead).
 
 pub mod claude;
+pub mod opencode;
 pub mod text;
 
 use std::collections::HashSet;
@@ -253,13 +255,53 @@ pub async fn run_as(
     stdin: &[u8],
     env: &(dyn Fn(&str) -> Option<OsString> + Sync),
 ) -> HookOutput {
+    let args = HookArgs {
+        session,
+        ..HookArgs::default()
+    };
+    run_with(harness, event, &args, stdin, env).await
+}
+
+/// What a `hook` command line carries besides the harness and the event.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HookArgs<'a> {
+    /// The harness session the hook is for (`--session`; opencode's plugin).
+    pub session: Option<&'a str>,
+    /// `--surface-urgent`: a `status` hook marks the urgent mail it reports
+    /// surfaced, so it is pushed once (opencode's plugin, after a tool call).
+    pub surface_urgent: bool,
+    /// `--timeout`: the longest a `wait` hook waits before reporting no
+    /// mail (opencode's plugin; its default is
+    /// [`opencode::DEFAULT_WAIT`]). Claude Code bounds its hooks itself.
+    pub timeout: Option<Duration>,
+}
+
+/// [`run`] with everything the command line gave ([`HookArgs`]).
+pub async fn run_with(
+    harness: Harness,
+    event: HookEvent,
+    args: &HookArgs<'_>,
+    stdin: &[u8],
+    env: &(dyn Fn(&str) -> Option<OsString> + Sync),
+) -> HookOutput {
     let input = HookInput::parse(stdin);
-    let Some(mut daemon) = Daemon::connect(harness, session, env).await else {
-        return HookOutput::default();
+    // opencode's process is shared by all its sessions: without a session
+    // the hook is nobody's.
+    let session_needed = harness == Harness::Opencode && args.session.is_none();
+    let daemon = match session_needed {
+        true => None,
+        false => Daemon::connect(harness, args.session, env).await,
+    };
+    let Some(mut daemon) = daemon else {
+        return match harness {
+            Harness::Opencode => opencode::unavailable(event),
+            _ => HookOutput::default(),
+        };
     };
     match harness {
         Harness::ClaudeCode => claude::run(&mut daemon, event, &input, env).await,
-        Harness::Opencode | Harness::Kiro | Harness::Other => HookOutput::default(),
+        Harness::Opencode => opencode::run(&mut daemon, event, args, &input).await,
+        Harness::Kiro | Harness::Other => HookOutput::default(),
     }
 }
 
