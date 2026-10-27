@@ -535,7 +535,7 @@ impl AgentMailServer {
             fresh: p.fresh,
             wake: p
                 .wake
-                .unwrap_or_else(|| crate::identity::default_wake_here(harness)),
+                .unwrap_or_else(|| crate::identity::default_wake_for_server(harness)),
             session: s.0.clone(),
         };
         Ok(match self.request(&s, req).await {

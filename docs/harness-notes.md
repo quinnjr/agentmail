@@ -1057,7 +1057,10 @@ config schema and exit-code rules come from the engine bundle
   10); `install --kiro-wake` writes `hook stop --harness kiro --wake` with
   `timeout: 0` and gives the MCP server `AGENTMAIL_KIRO_WAKE=1`.
   `register` (MCP and CLI) defaults `wake` to false for a kiro agent
-  unless `--kiro-wake` is installed: the MCP server sees the variable;
+  unless `--kiro-wake` is installed: the MCP server sees the variable
+  and decides from its own environment alone (kiro started it with the
+  `env` it settled on, so without the variable it is off, whatever the
+  files say; it never reads them);
   kiro does not pass the server's `env` to its shell tool's commands, so
   the CLI asks the source of truth instead: agentmail's MCP server (a
   process `<agentmail> mcp`) among the descendants of the `kiro-cli` the

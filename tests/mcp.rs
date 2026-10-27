@@ -904,3 +904,28 @@ async fn mcp_register_wake_defaults_off_for_kiro() {
     assert_eq!(me["agent"]["wake"], true, "{me}");
     client.cancel().await.unwrap();
 }
+
+/// The MCP server is the process kiro started with the `env` it settled
+/// on, so without `AGENTMAIL_KIRO_WAKE=1` in its own environment
+/// `--kiro-wake` is off, whatever the installed `mcp.json` files say (an
+/// untrusted workspace's file, say, which kiro did not load).
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_register_wake_ignores_installed_files() {
+    let env = Env::new();
+    let entry = json!({"mcpServers": {"agentmail": {
+        "command": "agentmail",
+        "args": ["mcp"],
+        "env": {"AGENTMAIL_KIRO_WAKE": "1"},
+    }}})
+    .to_string();
+    for dir in [env.dir.path().join("kiro"), env.work.join(".kiro")] {
+        let settings = dir.join("settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(settings.join("mcp.json"), &entry).unwrap();
+    }
+    let client = env.mcp().await;
+    ok(&call(&client, "register", json!({"name": "k", "harness": "kiro"})).await);
+    let me = ok(&call(&client, "whoami", json!({})).await);
+    assert_eq!(me["agent"]["wake"], false, "{me}");
+    client.cancel().await.unwrap();
+}

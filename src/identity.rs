@@ -405,6 +405,17 @@ pub fn default_wake(
         || kiro_wake_installed()
 }
 
+/// [`default_wake`] for agentmail's MCP server: its own environment only.
+/// The server is the process kiro started with the `env` it settled on
+/// (workspace trust and the merge of the workspace's and the user's
+/// servers included), so without [`ENV_KIRO_WAKE`]`=1` there `--kiro-wake`
+/// is not in effect, whatever the installed files say. The process scan
+/// and file fallback of [`default_wake_here`] are for the CLI, which kiro
+/// does not give the variable.
+pub fn default_wake_for_server(harness: Harness) -> bool {
+    default_wake(harness, |k| std::env::var_os(k), || false)
+}
+
 /// [`default_wake`] for this process: its environment, then what kiro
 /// itself runs. kiro does not give its shell tool's commands the MCP
 /// server's `env`, so the CLI asks the source of truth: agentmail's MCP
