@@ -317,8 +317,19 @@ pub enum Command {
     /// in them; each file's original is saved once as `<file>.agentmail.bak`.
     Install {
         /// The harness to install into (kiro: the V3 engine only).
-        #[arg(long, value_parser = ["claude-code", "opencode", "kiro"])]
-        harness: String,
+        #[arg(
+            long,
+            value_parser = ["claude-code", "opencode", "kiro"],
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
+        harness: Option<String>,
+        /// Instead of a harness, run the daemon as a systemd user service:
+        /// write `~/.config/systemd/user/agentmail.service` (honouring
+        /// XDG_CONFIG_HOME), stop any daemon started on demand, and enable
+        /// and start the unit.
+        #[arg(long, conflicts_with_all = ["project", "set_default", "kiro_wake"])]
+        service: bool,
         /// Install into the current project instead of your user config.
         #[arg(long)]
         project: bool,
@@ -339,8 +350,17 @@ pub enum Command {
     /// Remove what `install` added to a harness's config files.
     Uninstall {
         /// The harness to remove agentmail from.
-        #[arg(long, value_parser = ["claude-code", "opencode", "kiro"])]
-        harness: String,
+        #[arg(
+            long,
+            value_parser = ["claude-code", "opencode", "kiro"],
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
+        harness: Option<String>,
+        /// Instead of a harness, stop and disable agentmail's systemd user
+        /// service and remove its unit.
+        #[arg(long, conflicts_with = "project")]
+        service: bool,
         /// Remove it from the current project instead of your user config.
         #[arg(long)]
         project: bool,
@@ -955,6 +975,123 @@ fn install(harness: &str, flags: InstallFlags, uninstall: bool, json: bool) -> R
     Ok(ExitCode::SUCCESS)
 }
 
+/// `agentmail install --service` / `uninstall --service`: plan the unit
+/// file's change, then show it and the commands to run (`--dry-run`), or
+/// check systemd, make it and run them. Needs no daemon.
+fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCode> {
+    use crate::install::{self as inst, Env, service};
+    let bin = std::env::current_exe().context("locating the agentmail binary")?;
+    let env = Env::from_process()?;
+    let changes = service::plan(&bin, &env, !uninstall)?;
+    // Uninstalling a service that is not there touches nothing, systemd
+    // included; installing one that is runs its commands again, so it is
+    // running.
+    // A unit that was there may be running: it is restarted to run ours.
+    let restart = !uninstall && changes.iter().any(|c| c.before.is_some());
+    let steps = if uninstall && changes.is_empty() {
+        Vec::new()
+    } else {
+        service::steps(!uninstall, restart)
+    };
+    let mut notes = Vec::new();
+    if !uninstall {
+        let set: Vec<&str> = ["AGENTMAIL_DATA_DIR", "AGENTMAIL_SOCKET"]
+            .into_iter()
+            .filter(|k| env.var(k).is_some())
+            .collect();
+        if !set.is_empty() {
+            notes.push(format!(
+                "note: {} is set here but not in the service, which uses the default data \
+                 directory and socket.",
+                set.join(" and ")
+            ));
+        }
+    }
+    if !dry_run && !steps.is_empty() {
+        service::check(&env, &|| service::manual(&bin, &env, !uninstall))?;
+        if uninstall {
+            service::stop(&env)?;
+            inst::apply(&changes)?;
+            service::reload(&env)?;
+        } else {
+            inst::apply(&changes)?;
+            service::start(&bin, &env, restart)?;
+        }
+    }
+    let action = |c: &inst::Change| match (&c.before, &c.after) {
+        (None, _) => "create",
+        (Some(_), Some(_)) => "update",
+        (Some(_), None) => "delete",
+    };
+    let path = service::unit_path(&env);
+    let backup = (!dry_run)
+        .then(|| service::backup_kept(&path))
+        .flatten()
+        .filter(|_| changes.iter().any(|c| c.before.is_some()));
+    if json {
+        let list: Vec<Value> = changes
+            .iter()
+            .map(|c| {
+                json!({
+                    "path": c.path.display().to_string(),
+                    "action": action(c),
+                    "backup": backup.as_ref().map(|b| b.display().to_string()),
+                    "saved": null,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "dry_run": dry_run,
+            "changes": list,
+            "commands": steps,
+            "notes": notes,
+        }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if dry_run {
+        for c in &changes {
+            print_text(&inst::diff(c))?;
+        }
+        if changes.is_empty() {
+            print_line("nothing to change")?;
+        }
+        if !steps.is_empty() {
+            print_line("then run:")?;
+            for s in &steps {
+                print_line(&format!("  {s}"))?;
+            }
+        }
+    } else {
+        for c in &changes {
+            let verb = match action(c) {
+                "create" => "created",
+                "update" => "updated",
+                _ => "removed",
+            };
+            let kept = match &backup {
+                Some(b) if c.after.is_some() => format!(" (original kept as {})", b.display()),
+                Some(b) => format!(" (backup kept as {})", b.display()),
+                None => String::new(),
+            };
+            print_line(&format!("{verb} {}{kept}", c.path.display()))?;
+        }
+        for s in &steps {
+            print_line(&format!("ran {s}"))?;
+        }
+        print_line(match (uninstall, changes.is_empty()) {
+            (false, _) => "the agentmail daemon runs as the systemd user service agentmail.",
+            (true, false) => "the agentmail systemd user service is removed.",
+            (true, true) => {
+                "the agentmail systemd user service is not installed; nothing to remove."
+            }
+        })?;
+    }
+    for n in &notes {
+        print_line(n)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Print an error as `error: <message>` on stderr, with the candidate table
 /// for an ambiguous recipient. With `--json`, also print it as
 /// `{"error":{code,message,candidates}}` on stdout.
@@ -1105,11 +1242,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Install {
             harness,
+            service,
             project,
             dry_run,
             set_default,
             kiro_wake,
         } => {
+            let Some(harness) = harness.filter(|_| !service) else {
+                return install_service(dry_run, false, cli.json);
+            };
             if kiro_wake && harness != "kiro" {
                 use clap::CommandFactory;
                 let e = Cli::command().error(
@@ -1142,9 +1283,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Uninstall {
             harness,
+            service,
             project,
             dry_run,
         } => {
+            let Some(harness) = harness.filter(|_| !service) else {
+                return install_service(dry_run, true, cli.json);
+            };
             let flags = InstallFlags {
                 project,
                 dry_run,

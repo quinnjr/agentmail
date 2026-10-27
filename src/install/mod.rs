@@ -20,6 +20,7 @@ mod claude;
 pub mod json;
 mod kiro;
 mod opencode;
+pub mod service;
 
 use std::collections::HashMap;
 use std::io::Write as _;

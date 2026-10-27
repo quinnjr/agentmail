@@ -122,8 +122,25 @@ explicitly answers it.
 ### Running the daemon under systemd
 
 On-demand start is enough, but a daemon started by an agent outlives that
-agent's session outside any supervisor. To have systemd own it instead, add a
-user unit at `~/.config/systemd/user/agentmail.service`:
+agent's session outside any supervisor. To have systemd own it instead, run:
+
+```sh
+agentmail install --service            # --dry-run shows what it would do
+loginctl enable-linger "$USER"         # optional: keep it running while logged out
+```
+
+It writes the unit below to `~/.config/systemd/user/agentmail.service` (or
+under `$XDG_CONFIG_HOME`), with `ExecStart` running the binary you invoked,
+saving any unit already there as `agentmail.service.agentmail.bak`. It then
+runs the first three commands below. If the systemd user manager is not reachable
+(`systemctl --user is-system-running` reports it offline), it changes nothing
+and prints these steps to do by hand. `agentmail uninstall --service`
+disables and stops the service, removes the unit and reloads systemd. The
+service uses the default data directory and socket, whatever
+`AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you run the install.
+
+To set it up by hand instead, add a user unit at
+`~/.config/systemd/user/agentmail.service`:
 
 ```ini
 [Unit]

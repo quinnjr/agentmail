@@ -1,5 +1,5 @@
-//! Harness Tasks 5 and 7: `agentmail install` / `uninstall` for Claude Code
-//! and opencode.
+//! Harness Tasks 5, 7, 8 and 9: `agentmail install` / `uninstall` for Claude Code
+//! opencode, kiro, and the systemd user service.
 //!
 //! Each test works in its own temporary home and working directory and
 //! drives the planner and `apply` directly, except the CLI tests, which run
@@ -2889,4 +2889,356 @@ fn cli_kiro_set_default_changes_nothing() {
     assert!(out.contains("--set-default"), "{out}");
     assert!(!h.kiro_dir().join("agents").exists());
     assert!(!h.kiro_dir().join("settings/cli.json").exists());
+}
+
+// ---- Task 9: `install --service` -------------------------------------------
+
+/// The systemd unit in the README's "Running the daemon under systemd"
+/// section.
+fn readme_unit() -> String {
+    let readme = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"));
+    let section = readme
+        .split("### Running the daemon under systemd")
+        .nth(1)
+        .expect("README has the systemd section");
+    let block = section
+        .split("```ini\n")
+        .nth(1)
+        .expect("the section has an ini block");
+    block.split("```").next().unwrap().to_string()
+}
+
+#[test]
+fn service_unit_content_matches_readme() {
+    let bin = Path::new("/opt/agentmail/bin/agentmail");
+    let want: String = readme_unit()
+        .lines()
+        .map(|l| {
+            if l.starts_with("ExecStart=") {
+                "ExecStart=/opt/agentmail/bin/agentmail daemon run --wait-for-lock\n".to_string()
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    assert!(readme_unit().contains("\nExecStart="), "{}", readme_unit());
+    assert_eq!(install::service::unit(bin).unwrap(), want);
+}
+
+#[test]
+fn service_unit_quotes_the_binary_for_systemd() {
+    let exec = |bin: &str| {
+        install::service::unit(Path::new(bin))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        exec("/a b/agentmail"),
+        "ExecStart=\"/a b/agentmail\" daemon run --wait-for-lock"
+    );
+    assert_eq!(
+        exec("/a%b$c/agent\"mail"),
+        "ExecStart=\"/a%%b$$c/agent\\\"mail\" daemon run --wait-for-lock"
+    );
+    assert!(install::service::unit(Path::new("relative/agentmail")).is_err());
+    assert!(install::service::unit(Path::new("/a\nb/agentmail")).is_err());
+}
+
+/// A temporary home for `install --service`: a fake `systemctl` that logs
+/// each call (with whether the test's daemon was up then), and a private
+/// daemon data directory and socket.
+struct ServiceHome {
+    h: Home,
+}
+
+impl ServiceHome {
+    fn new() -> ServiceHome {
+        let h = Home::new();
+        let fake = h.dir.path().join("systemctl");
+        write(
+            &fake,
+            r#"#!/bin/sh
+if "$AGENTMAIL_TEST_BIN" daemon status >/dev/null 2>&1; then up=up; else up=down; fi
+echo "$* [$up]" >> "$FAKE_LOG"
+case "$*" in
+  *is-system-running*) echo "${FAKE_STATE:-running}"; exit "${FAKE_RC:-0}" ;;
+esac
+exit 0
+"#,
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        ServiceHome { h }
+    }
+
+    fn config(&self) -> PathBuf {
+        self.h.dir.path().join("cfg")
+    }
+
+    fn unit(&self) -> PathBuf {
+        self.config().join("systemd/user/agentmail.service")
+    }
+
+    fn log(&self) -> Vec<String> {
+        std::fs::read_to_string(self.h.dir.path().join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn cli(&self) -> Command {
+        let d = self.h.dir.path();
+        let mut c = cli(&self.h);
+        c.env("XDG_CONFIG_HOME", self.config())
+            .env("AGENTMAIL_SYSTEMCTL", d.join("systemctl"))
+            .env("AGENTMAIL_TEST_BIN", env!("CARGO_BIN_EXE_agentmail"))
+            .env("FAKE_LOG", d.join("log"))
+            .env("AGENTMAIL_DATA_DIR", d.join("data"))
+            .env("AGENTMAIL_SOCKET", d.join("sock"))
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("FAKE_STATE")
+            .env_remove("FAKE_RC");
+        c
+    }
+}
+
+impl Drop for ServiceHome {
+    fn drop(&mut self) {
+        let _ = self.cli().args(["daemon", "stop"]).ok();
+    }
+}
+
+fn bin_path() -> String {
+    std::fs::canonicalize(env!("CARGO_BIN_EXE_agentmail"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn service_calls_systemctl_in_order() {
+    let s = ServiceHome::new();
+    // A daemon started on demand, which the service replaces.
+    s.cli().args(["daemon", "start"]).assert().success();
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains(&s.unit().display().to_string()), "{out}");
+    assert_eq!(
+        read(&s.unit()),
+        install::service::unit(Path::new(&bin_path())).unwrap()
+    );
+    // systemd is checked first, and the on-demand daemon is stopped before
+    // systemd is told about the unit.
+    assert_eq!(
+        s.log(),
+        [
+            "--user is-system-running [up]",
+            "--user daemon-reload [down]",
+            "--user enable --now agentmail [down]",
+        ]
+    );
+    // Again: the unit is unchanged, and the service (re)enabled.
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(s.log().len(), 6);
+    assert!(!bak(&s.unit()).exists());
+}
+
+#[test]
+fn service_dry_run_changes_and_runs_nothing() {
+    let s = ServiceHome::new();
+    let out = s
+        .cli()
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!("+++ {}", s.unit().display())),
+        "{out}"
+    );
+    assert!(
+        out.contains("systemctl --user enable --now agentmail"),
+        "{out}"
+    );
+    assert!(!s.unit().exists());
+    assert!(s.log().is_empty());
+}
+
+#[test]
+fn service_uninstall() {
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    assert!(s.unit().exists());
+    let n = s.log().len();
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    assert_eq!(
+        s.log()[n..],
+        [
+            "--user is-system-running [down]",
+            "--user disable --now agentmail [down]",
+            "--user daemon-reload [down]",
+        ]
+    );
+    assert!(!s.unit().exists());
+    assert!(!marker(&s.unit()).exists());
+    // The directories install created for the unit are gone again.
+    assert!(!s.config().exists());
+    // Nothing left to remove: systemd is not touched.
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(out).unwrap().contains("not installed"),
+        "second uninstall"
+    );
+    assert_eq!(s.log().len(), n + 3);
+}
+
+#[test]
+fn service_replaces_a_hand_written_unit_keeping_it() {
+    let s = ServiceHome::new();
+    write(
+        &s.unit(),
+        "[Service]\nExecStart=/old/agentmail daemon run\n",
+    );
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(
+        read(&bak(&s.unit())),
+        "[Service]\nExecStart=/old/agentmail daemon run\n"
+    );
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    assert!(!s.unit().exists());
+    // The user's own unit is not thrown away.
+    assert!(bak(&s.unit()).exists());
+}
+
+#[test]
+fn service_no_systemd_errors() {
+    let s = ServiceHome::new();
+    let out = s
+        .cli()
+        .env("FAKE_STATE", "offline")
+        .env("FAKE_RC", "1")
+        .args(["install", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("offline"), "{err}");
+    // The manual steps: the unit, where it goes, and the commands.
+    assert!(err.contains(&s.unit().display().to_string()), "{err}");
+    assert!(err.contains("ExecStart="), "{err}");
+    assert!(err.contains("agentmail daemon stop"), "{err}");
+    assert!(
+        err.contains("systemctl --user enable --now agentmail"),
+        "{err}"
+    );
+    assert!(!s.unit().exists());
+    assert_eq!(s.log(), ["--user is-system-running [down]"]);
+
+    // Uninstall says how to remove it by hand.
+    write(&s.unit(), "x\n");
+    let out = s
+        .cli()
+        .env("FAKE_STATE", "offline")
+        .env("FAKE_RC", "1")
+        .args(["uninstall", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(
+        err.contains("systemctl --user disable --now agentmail"),
+        "{err}"
+    );
+    assert!(s.unit().exists());
+}
+
+#[test]
+fn service_degraded_systemd_is_usable() {
+    // `is-system-running` exits non-zero when some unit failed, but the
+    // manager is up and can run agentmail's.
+    let s = ServiceHome::new();
+    s.cli()
+        .env("FAKE_STATE", "degraded")
+        .env("FAKE_RC", "1")
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert!(s.unit().exists());
+}
+
+#[test]
+fn service_respects_home_without_xdg_config() {
+    let s = ServiceHome::new();
+    s.cli()
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["install", "--service"])
+        .assert()
+        .success();
+    assert!(
+        s.h.home()
+            .join(".config/systemd/user/agentmail.service")
+            .exists()
+    );
+}
+
+#[test]
+fn service_excludes_harness_flags() {
+    let s = ServiceHome::new();
+    s.cli()
+        .args(["install", "--service", "--harness", "claude-code"])
+        .assert()
+        .code(2);
+    s.cli().args(["install"]).assert().code(2);
+    assert!(s.log().is_empty());
+    assert!(!s.unit().exists());
+}
+
+#[test]
+fn service_restarts_a_replaced_unit() {
+    // enable --now leaves a running service on its old unit: a unit that
+    // changed is restarted.
+    let s = ServiceHome::new();
+    write(
+        &s.unit(),
+        "[Service]\nExecStart=/old/agentmail daemon run\n",
+    );
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(
+        s.log(),
+        [
+            "--user is-system-running [down]",
+            "--user daemon-reload [down]",
+            "--user enable --now agentmail [down]",
+            "--user try-restart agentmail [down]",
+        ]
+    );
 }
