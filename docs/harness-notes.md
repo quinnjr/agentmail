@@ -919,7 +919,9 @@ them all.
   agentmail's plugin, uninstall puts that backup back instead. A symlink
   at `plugins/agentmail.js` (a dev or dotfiles setup) is never written
   through: install refuses it, and uninstall removes only the link,
-  leaving the file it points to and any backup beside it.
+  leaving the file it points to and any backup beside it, also when
+  agentmail created the plugin (its `.agentmail.created` is there) and
+  the user then swapped in the link.
 - **One agentmail plugin per opencode.** opencode loads the user scope's
   `plugin/` and `plugins/`, then the project's `.opencode/plugin/` and
   `.opencode/plugins/`, in that order, but runs `setup()` for only one
@@ -943,7 +945,10 @@ them all.
   it cannot read), so the project's plugin will not run; `install` at user
   scope when the current project's plugin runs another binary, so it
   stops running there; and `uninstall` at user scope when the current
-  project has an agentmail plugin, which then runs there.
+  project has an agentmail plugin, which then runs there. The notes are
+  advisory: a path in the other scope that cannot be read (a directory,
+  a file that is not UTF-8) counts as no agentmail plugin there and never
+  stops the command.
 - The rest (backups, creation markers, keeping the file's layout, symlinks,
   modes) is the shared install machinery described under Claude Code's
   install (Task 5).

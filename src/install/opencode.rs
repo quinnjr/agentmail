@@ -20,7 +20,7 @@
 //! is `plugin/agentmail.js`, embedded, with the binary's path in place of
 //! its placeholder; a `plugins/agentmail.js` that is not agentmail's, or
 //! is a symlink, is never replaced, and of a symlink uninstall removes
-//! only the link.
+//! only the link, even when agentmail created the file it replaced.
 //!
 //! opencode loads the user scope's `plugin/` and `plugins/`, then the
 //! project's, but runs only the first plugin of each `id`: an agentmail
@@ -103,18 +103,20 @@ fn plugin_dir(project: bool, env: &Env) -> PathBuf {
 /// The agentmail plugin opencode would run from a scope: the first that is
 /// agentmail's of `plugin/agentmail.js` and `plugins/agentmail.js`, the
 /// order opencode loads them in, with the binary it runs (`None`: not
-/// readable from the file).
-fn scope_plugin(project: bool, env: &Env) -> Result<Option<(PathBuf, Option<String>)>> {
+/// readable from the file). A path that cannot be read (a directory, a
+/// file that is not UTF-8) is no agentmail plugin: this only feeds the
+/// advisory [`notes`], which never stop a command.
+fn scope_plugin(project: bool, env: &Env) -> Option<(PathBuf, Option<String>)> {
     let plugins = plugin_dir(project, env);
     for dir in [plugins.with_file_name("plugin"), plugins] {
         let path = dir.join("agentmail.js");
-        if let Some(text) = read_opt(&path)?
+        if let Ok(Some(text)) = read_opt(&path)
             && is_plugin(&text)
         {
-            return Ok(Some((path, plugin_bin(&text))));
+            return Some((path, plugin_bin(&text)));
         }
     }
-    Ok(None)
+    None
 }
 
 /// The binary an agentmail plugin's text runs: the string literal where
@@ -136,7 +138,7 @@ fn plugin_bin(text: &str) -> Option<String> {
 /// project's.
 pub(super) fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
     let bin = bin_str(o)?;
-    let Some((other, other_bin)) = scope_plugin(!o.project, env)? else {
+    let Some((other, other_bin)) = scope_plugin(!o.project, env) else {
         return Ok(Vec::new());
     };
     let runs = match &other_bin {
@@ -156,7 +158,7 @@ pub(super) fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Str
              in this project the one installed now for {bin} runs, not the project's {other} \
              ({runs})."
         )),
-        (false, false) if scope_plugin(false, env)?.is_some() => Some(format!(
+        (false, false) if scope_plugin(false, env).is_some() => Some(format!(
             "note: in this project opencode now runs the project's agentmail plugin {other} \
              ({runs})."
         )),
@@ -353,6 +355,9 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
             before,
             after: restore,
             record_anew: false,
+            // The file a link points to is never agentmail's to delete,
+            // even one it created before the user swapped in the link.
+            unlink: link,
         }));
     }
     if link {
@@ -379,6 +384,7 @@ fn plan_plugin(path: PathBuf, install: bool, bin: &str) -> Result<Option<Change>
         record_anew: before.is_none(),
         before,
         after: Some(after),
+        unlink: false,
     }))
 }
 

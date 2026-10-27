@@ -1805,6 +1805,62 @@ fn opencode_symlinked_plugin_is_never_written_through() {
 }
 
 #[test]
+fn opencode_plugin_agentmail_created_then_symlinked_keeps_link_target() {
+    // agentmail created the plugin (its marker says so), then the user
+    // swapped it for a link to their own copy: uninstall removes only the
+    // link and the marker, never the file the link points to.
+    let h = Home::new();
+    let env = h.env(&[]);
+    install(&oc_opts(false, BIN), &env);
+    assert!(marker(&h.oc_plugin()).exists());
+    let src = h.dir.path().join("src/agentmail.js");
+    let text = oc_plugin_text("/home/dev/agentmail");
+    write(&src, &text);
+    std::fs::remove_file(h.oc_plugin()).unwrap();
+    std::os::unix::fs::symlink(&src, h.oc_plugin()).unwrap();
+
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(std::fs::symlink_metadata(h.oc_plugin()).is_err());
+    assert!(!marker(&h.oc_plugin()).exists());
+    assert_eq!(read(&src), text);
+}
+
+#[test]
+fn opencode_unreadable_plugin_in_other_scope_is_no_plugin() {
+    // The notes are advisory: a path in the other scope that cannot be
+    // read (a directory, a file that is not UTF-8) is no agentmail plugin
+    // there, and never stops the install or uninstall.
+    let h = Home::new();
+    let env = h.env(&[]);
+    std::fs::create_dir_all(h.proj().join(".opencode/plugins/agentmail.js")).unwrap();
+    let odd = h.proj().join(".opencode/plugin/agentmail.js");
+    std::fs::create_dir_all(odd.parent().unwrap()).unwrap();
+    std::fs::write(&odd, b"// agentmail for opencode\n\xff\xfe\n").unwrap();
+    assert!(
+        install::notes(&oc_opts(false, BIN), &env, true)
+            .unwrap()
+            .is_empty()
+    );
+    install(&oc_opts(false, BIN), &env);
+    assert!(h.oc_plugin().exists());
+    assert!(
+        install::notes(&oc_opts(false, BIN), &env, false)
+            .unwrap()
+            .is_empty()
+    );
+    uninstall(&oc_opts(false, BIN), &env);
+    assert!(!h.oc_plugin().exists());
+
+    // Likewise the user scope's, for a project install.
+    std::fs::create_dir_all(h.oc_plugin()).unwrap();
+    assert!(
+        install::notes(&oc_opts(true, BIN), &env, true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn opencode_plugin_agentmail_did_not_create_is_restored_or_removed() {
     let h = Home::new();
     let env = h.env(&[]);

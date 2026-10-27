@@ -51,6 +51,9 @@ pub struct Change {
     /// the file before agentmail, replacing any backup or marker an earlier
     /// install left, which no longer describe it.
     pub record_anew: bool,
+    /// Deleting `path`, a symlink, removes only the link (and its marker),
+    /// never the file it points to, even one agentmail created.
+    pub unlink: bool,
 }
 
 /// The environment the config locations depend on.
@@ -151,8 +154,8 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// one whose target does not exist yet: the file it points to changes, the
 /// link stays. A file to delete (one agentmail created, emptied by an
 /// uninstall, or agentmail's opencode plugin) goes with its backup and
-/// marker (a symlink agentmail did not create the target of: only the
-/// link and its marker), and so do the directories
+/// marker (a symlink agentmail did not create the target of, or one
+/// [`Change::unlink`] marks: only the link and its marker), and so do the directories
 /// agentmail created for it once they are empty.
 pub fn apply(changes: &[Change]) -> Result<()> {
     for c in changes {
@@ -242,16 +245,21 @@ fn apply_one(c: &Change) -> Result<Vec<PathBuf>> {
         // Only agentmail's own file is deleted ([`JsonFile::change`], the
         // opencode plugin): any backup of it holds nothing but agentmail's
         // entries. A file agentmail created (its marker says so) goes even
-        // behind a symlink, which stays. Otherwise of a symlink only the
-        // link goes, never the file it points to, and a backup beside it,
-        // which may hold that file's original (an older install wrote
-        // through links), stays.
+        // behind a symlink, which stays, unless [`Change::unlink`] says
+        // only the link goes. Otherwise of a symlink only the link goes,
+        // never the file it points to, and a backup beside it, which may
+        // hold that file's original (an older install wrote through
+        // links), stays.
         let (dirs, created) = match std::fs::read_to_string(&marker) {
             Ok(text) => (text.lines().map(PathBuf::from).collect(), true),
             Err(_) => (Vec::new(), false),
         };
         let link = std::fs::symlink_metadata(&c.path).is_ok_and(|m| m.file_type().is_symlink());
-        std::fs::remove_file(if created { &target } else { &c.path })?;
+        std::fs::remove_file(if created && !(link && c.unlink) {
+            &target
+        } else {
+            &c.path
+        })?;
         if created || !link {
             remove_if_there(&bak)?;
         }
@@ -536,6 +544,7 @@ impl JsonFile {
             before: self.before,
             after,
             record_anew,
+            unlink: false,
         })
     }
 }
@@ -903,6 +912,7 @@ mod tests {
             before: Some(before),
             after: Some(after),
             record_anew: false,
+            unlink: false,
         });
         assert_eq!(
             d,
@@ -914,6 +924,7 @@ mod tests {
             before: None,
             after: Some("a\n".into()),
             record_anew: false,
+            unlink: false,
         });
         assert_eq!(d, "--- /dev/null\n+++ /f\n@@ -0,0 +1,1 @@\n+a\n");
     }
