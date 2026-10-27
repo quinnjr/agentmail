@@ -130,14 +130,30 @@ loginctl enable-linger "$USER"         # optional: keep it running while logged 
 ```
 
 It writes the unit below to `~/.config/systemd/user/agentmail.service` (or
-under `$XDG_CONFIG_HOME`), with `ExecStart` running the binary you invoked,
-saving any unit already there as `agentmail.service.agentmail.bak`. It then
-runs the first three commands below. If the systemd user manager is not reachable
-(`systemctl --user is-system-running` reports it offline), it changes nothing
-and prints these steps to do by hand. `agentmail uninstall --service`
-disables and stops the service, removes the unit and reloads systemd. The
-service uses the default data directory and socket, whatever
-`AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you run the install.
+under `$XDG_CONFIG_HOME`), with `ExecStart` running the binary you invoked by
+the path you invoked it as (a symlink stays a symlink, so a unit pointing at
+`~/.local/bin/agentmail` follows it to a newer version; a path that is not
+this binary, or one with `..` in it, gives way to the binary's resolved
+path). It saves a unit already there as `agentmail.service.agentmail.bak`,
+and refuses to replace one you wrote when that backup already keeps a
+different one, so that neither is lost. It then runs the first three
+commands below: `agentmail daemon stop` (with `AGENTMAIL_DATA_DIR` and
+`AGENTMAIL_SOCKET` unset, so it stops the daemon at the default location, the
+one the service replaces; skipped when the unit is unchanged and the service
+is already active, so a re-run leaves its daemon alone), `daemon-reload` and
+`enable --now`. When it replaced an existing unit it also runs
+`systemctl --user try-restart agentmail`, since enabling a running service
+does not restart it on the new unit. It first asks
+`systemctl --user is-system-running`: a manager that answers `running`,
+`degraded` (some other unit failed), `starting` or `initializing` can run the
+service; any other answer, or none, changes nothing and prints these steps to
+do by hand. `agentmail uninstall --service` disables and stops the service,
+removes the unit and reloads systemd. It removes only agentmail's unit (the
+one below, whatever its `ExecStart`): one it created and you then edited is
+saved as the backup first, and any other unit is left in place with the
+commands to remove it by hand. The service uses the default data directory
+and socket, whatever `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you
+run the install.
 
 To set it up by hand instead, add a user unit at
 `~/.config/systemd/user/agentmail.service`:

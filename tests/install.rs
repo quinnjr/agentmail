@@ -2457,7 +2457,12 @@ fn cli_opencode_notes_plugin_in_other_scope() {
     let v: Value = serde_json::from_slice(&out).unwrap();
     let notes = v["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 1, "{v}");
-    assert!(notes[0].as_str().unwrap().starts_with("note: "), "{v}");
+    // The "note: " prefix is the text form's.
+    let note = notes[0].as_str().unwrap();
+    assert!(
+        !note.starts_with("note: ") && note.contains("opencode"),
+        "{v}"
+    );
 }
 
 // kiro-cli (V3).
@@ -2948,8 +2953,8 @@ fn service_unit_quotes_the_binary_for_systemd() {
 }
 
 /// A temporary home for `install --service`: a fake `systemctl` that logs
-/// each call (with whether the test's daemon was up then), and a private
-/// daemon data directory and socket.
+/// each call (with whether the test's daemon at the default location was
+/// up then), and the daemon's default data directory and socket inside it.
 struct ServiceHome {
     h: Home,
 }
@@ -2961,10 +2966,11 @@ impl ServiceHome {
         write(
             &fake,
             r#"#!/bin/sh
-if "$AGENTMAIL_TEST_BIN" daemon status >/dev/null 2>&1; then up=up; else up=down; fi
+if env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET "$AGENTMAIL_TEST_BIN" daemon status >/dev/null 2>&1; then up=up; else up=down; fi
 echo "$* [$up]" >> "$FAKE_LOG"
 case "$*" in
   *is-system-running*) echo "${FAKE_STATE:-running}"; exit "${FAKE_RC:-0}" ;;
+  *is-active*) [ "$FAKE_ACTIVE" = active ]; exit $? ;;
 esac
 exit 0
 "#,
@@ -2994,42 +3000,67 @@ exit 0
     }
 
     fn cli(&self) -> Command {
+        self.cli_as(Path::new(env!("CARGO_BIN_EXE_agentmail")))
+    }
+
+    /// The CLI, run as `prog`. The daemon's location is the default one
+    /// under the temporary home.
+    fn cli_as(&self, prog: &Path) -> Command {
         let d = self.h.dir.path();
-        let mut c = cli(&self.h);
-        c.env("XDG_CONFIG_HOME", self.config())
+        let mut c = Command::new(prog);
+        c.env("HOME", self.h.home())
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .current_dir(self.h.proj())
+            .timeout(Duration::from_secs(30))
+            .env("XDG_CONFIG_HOME", self.config())
             .env("AGENTMAIL_SYSTEMCTL", d.join("systemctl"))
             .env("AGENTMAIL_TEST_BIN", env!("CARGO_BIN_EXE_agentmail"))
             .env("FAKE_LOG", d.join("log"))
-            .env("AGENTMAIL_DATA_DIR", d.join("data"))
-            .env("AGENTMAIL_SOCKET", d.join("sock"))
+            .env_remove("AGENTMAIL_DATA_DIR")
+            .env_remove("AGENTMAIL_SOCKET")
+            .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("FAKE_STATE")
-            .env_remove("FAKE_RC");
+            .env_remove("FAKE_RC")
+            .env_remove("FAKE_ACTIVE");
         c
+    }
+
+    /// The CLI with a private daemon location, as `AGENTMAIL_DATA_DIR` and
+    /// `AGENTMAIL_SOCKET` set it.
+    fn private_cli(&self) -> Command {
+        let d = self.h.dir.path();
+        let mut c = self.cli();
+        c.env("AGENTMAIL_DATA_DIR", d.join("data"))
+            .env("AGENTMAIL_SOCKET", d.join("sock"));
+        c
+    }
+
+    fn daemon_up(&self, mut c: Command) -> bool {
+        c.args(["daemon", "status"]).ok().is_ok()
     }
 }
 
 impl Drop for ServiceHome {
     fn drop(&mut self) {
         let _ = self.cli().args(["daemon", "stop"]).ok();
+        let _ = self.private_cli().args(["daemon", "stop"]).ok();
     }
 }
 
 fn bin_path() -> String {
-    std::fs::canonicalize(env!("CARGO_BIN_EXE_agentmail"))
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string()
+    env!("CARGO_BIN_EXE_agentmail").to_string()
 }
 
 #[test]
 fn service_calls_systemctl_in_order() {
     let s = ServiceHome::new();
-    // A daemon started on demand, which the service replaces.
+    // A daemon started on demand, which the service replaces, and one at a
+    // private location, which is not the service's business.
     s.cli().args(["daemon", "start"]).assert().success();
+    s.private_cli().args(["daemon", "start"]).assert().success();
     let out = s
-        .cli()
+        .private_cli()
         .args(["install", "--service"])
         .assert()
         .success()
@@ -3038,6 +3069,14 @@ fn service_calls_systemctl_in_order() {
         .clone();
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains(&s.unit().display().to_string()), "{out}");
+    // The command run is shown as run: this binary, at the default location.
+    assert!(
+        out.contains(&format!(
+            "ran env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET {} daemon stop",
+            bin_path()
+        )),
+        "{out}"
+    );
     assert_eq!(
         read(&s.unit()),
         install::service::unit(Path::new(&bin_path())).unwrap()
@@ -3052,10 +3091,109 @@ fn service_calls_systemctl_in_order() {
             "--user enable --now agentmail [down]",
         ]
     );
-    // Again: the unit is unchanged, and the service (re)enabled.
+    assert!(!s.daemon_up(s.cli()));
+    assert!(
+        s.daemon_up(s.private_cli()),
+        "the private daemon was stopped"
+    );
+
+    // Again, with the service running its daemon: the unit is unchanged,
+    // the service (re)enabled, and its daemon left alone.
+    s.cli().args(["daemon", "start"]).assert().success();
+    let out = s
+        .cli()
+        .env("FAKE_ACTIVE", "active")
+        .args(["install", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("daemon stop"), "{out}");
+    assert_eq!(
+        s.log()[3..],
+        [
+            "--user is-system-running [up]",
+            "--user is-active --quiet agentmail [up]",
+            "--user daemon-reload [up]",
+            "--user enable --now agentmail [up]",
+        ]
+    );
+    assert!(s.daemon_up(s.cli()));
+    // The service is not running: a daemon on demand is stopped.
     s.cli().args(["install", "--service"]).assert().success();
-    assert_eq!(s.log().len(), 6);
+    assert_eq!(
+        s.log()[7..],
+        [
+            "--user is-system-running [up]",
+            "--user is-active --quiet agentmail [up]",
+            "--user daemon-reload [down]",
+            "--user enable --now agentmail [down]",
+        ]
+    );
     assert!(!bak(&s.unit()).exists());
+}
+
+#[test]
+fn service_unit_runs_the_binary_by_the_path_invoked() {
+    // A symlink to the binary (say, to a versioned install) stays in the
+    // unit, so that it follows the link when it is updated.
+    let s = ServiceHome::new();
+    let link = s.h.dir.path().join("bin/agentmail");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_agentmail"), &link).unwrap();
+    let out = s
+        .cli_as(&link)
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!(
+            "+ExecStart={} daemon run --wait-for-lock",
+            link.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("  {} daemon stop", link.display())),
+        "{out}"
+    );
+}
+
+#[test]
+fn service_notes_the_location_overrides() {
+    let s = ServiceHome::new();
+    let out = s
+        .private_cli()
+        .args(["install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("note: AGENTMAIL_DATA_DIR and AGENTMAIL_SOCKET are set here"),
+        "{out}"
+    );
+    let out = s
+        .cli()
+        .env("AGENTMAIL_SOCKET", s.h.dir.path().join("sock"))
+        .args(["--json", "install", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    let note = v["notes"][0].as_str().unwrap();
+    assert!(note.starts_with("AGENTMAIL_SOCKET is set here"), "{v}");
 }
 
 #[test]
@@ -3153,7 +3291,10 @@ fn service_no_systemd_errors() {
     // The manual steps: the unit, where it goes, and the commands.
     assert!(err.contains(&s.unit().display().to_string()), "{err}");
     assert!(err.contains("ExecStart="), "{err}");
-    assert!(err.contains("agentmail daemon stop"), "{err}");
+    assert!(
+        err.contains(&format!("{} daemon stop", bin_path())),
+        "{err}"
+    );
     assert!(
         err.contains("systemctl --user enable --now agentmail"),
         "{err}"
@@ -3162,7 +3303,10 @@ fn service_no_systemd_errors() {
     assert_eq!(s.log(), ["--user is-system-running [down]"]);
 
     // Uninstall says how to remove it by hand.
-    write(&s.unit(), "x\n");
+    write(
+        &s.unit(),
+        &install::service::unit(Path::new("/x/agentmail")).unwrap(),
+    );
     let out = s
         .cli()
         .env("FAKE_STATE", "offline")
@@ -3241,4 +3385,112 @@ fn service_restarts_a_replaced_unit() {
             "--user try-restart agentmail [down]",
         ]
     );
+}
+
+#[test]
+fn service_uninstall_leaves_a_unit_agentmail_did_not_write() {
+    let s = ServiceHome::new();
+    let mine = "[Service]\nExecStart=/old/agentmail daemon run\nEnvironment=FOO=1\n";
+    write(&s.unit(), mine);
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("not the unit agentmail installs"), "{err}");
+    assert_eq!(read(&s.unit()), mine);
+    assert!(!bak(&s.unit()).exists());
+    assert!(s.log().is_empty());
+}
+
+#[test]
+fn service_uninstall_removes_the_readme_unit() {
+    // The README's hand-made unit is agentmail's, whatever binary it runs.
+    let s = ServiceHome::new();
+    write(
+        &s.unit(),
+        &install::service::unit(Path::new("/x/agentmail")).unwrap(),
+    );
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    assert!(!s.unit().exists());
+}
+
+#[test]
+fn service_keeps_edits_to_its_unit() {
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    assert!(marker(&s.unit()).exists());
+    let edited = read(&s.unit()).replace("[Service]\n", "[Service]\nEnvironment=FOO=1\n");
+    write(&s.unit(), &edited);
+    // Uninstall keeps the edited unit as the backup.
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("backup kept as"), "{out}");
+    assert!(!s.unit().exists());
+    assert_eq!(read(&bak(&s.unit())), edited);
+
+    // Install over an edited unit agentmail created keeps it too.
+    std::fs::remove_file(bak(&s.unit())).unwrap();
+    s.cli().args(["install", "--service"]).assert().success();
+    write(&s.unit(), &edited);
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(read(&bak(&s.unit())), edited);
+    assert!(!marker(&s.unit()).exists());
+}
+
+#[test]
+fn service_install_never_drops_an_earlier_kept_unit() {
+    let s = ServiceHome::new();
+    let a = "[Service]\nExecStart=/a/agentmail daemon run\n";
+    let b = "[Service]\nExecStart=/b/agentmail daemon run\n";
+    write(&s.unit(), a);
+    s.cli().args(["install", "--service"]).assert().success();
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    assert_eq!(read(&bak(&s.unit())), a);
+    write(&s.unit(), b);
+    let n = s.log().len();
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(out).unwrap();
+    assert!(err.contains("different earlier unit"), "{err}");
+    assert_eq!(read(&s.unit()), b);
+    assert_eq!(read(&bak(&s.unit())), a);
+    assert_eq!(s.log().len(), n);
+    // With the old one moved away, B is kept in its place.
+    std::fs::remove_file(bak(&s.unit())).unwrap();
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(read(&bak(&s.unit())), b);
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    assert_eq!(read(&bak(&s.unit())), b);
+}
+
+#[test]
+fn service_install_keeps_a_unit_already_kept() {
+    // The unit there is the one already kept: installing again is fine.
+    let s = ServiceHome::new();
+    let a = "[Service]\nExecStart=/a/agentmail daemon run\n";
+    write(&s.unit(), a);
+    s.cli().args(["install", "--service"]).assert().success();
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    std::fs::rename(bak(&s.unit()), s.unit()).unwrap();
+    write(&bak(&s.unit()), a);
+    s.cli().args(["install", "--service"]).assert().success();
+    assert_eq!(read(&bak(&s.unit())), a);
 }

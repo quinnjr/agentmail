@@ -899,6 +899,11 @@ fn install(harness: &str, flags: InstallFlags, uninstall: bool, json: bool) -> R
         let restart = (!dry_run)
             .then(|| restart_hint(harness, uninstall, &changes))
             .flatten();
+        // The "note: " prefix is for the text form only.
+        let notes: Vec<&str> = notes
+            .iter()
+            .map(|n| n.strip_prefix("note: ").unwrap_or(n))
+            .collect();
         print_json(
             &json!({"dry_run": dry_run, "changes": list, "restart": restart, "notes": notes}),
         )?;
@@ -980,32 +985,32 @@ fn install(harness: &str, flags: InstallFlags, uninstall: bool, json: bool) -> R
 /// check systemd, make it and run them. Needs no daemon.
 fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCode> {
     use crate::install::{self as inst, Env, service};
-    let bin = std::env::current_exe().context("locating the agentmail binary")?;
     let env = Env::from_process()?;
+    let argv0 = std::env::args_os().next();
+    let bin = service::binary(&env, argv0.as_deref())?;
     let changes = service::plan(&bin, &env, !uninstall)?;
+    let unset = service::location_overrides(&env);
     // Uninstalling a service that is not there touches nothing, systemd
     // included; installing one that is runs its commands again, so it is
     // running.
     // A unit that was there may be running: it is restarted to run ours.
     let restart = !uninstall && changes.iter().any(|c| c.before.is_some());
-    let steps = if uninstall && changes.is_empty() {
-        Vec::new()
-    } else {
-        service::steps(!uninstall, restart)
-    };
-    let mut notes = Vec::new();
-    if !uninstall {
-        let set: Vec<&str> = ["AGENTMAIL_DATA_DIR", "AGENTMAIL_SOCKET"]
-            .into_iter()
-            .filter(|k| env.var(k).is_some())
-            .collect();
-        if !set.is_empty() {
-            notes.push(format!(
-                "note: {} is set here but not in the service, which uses the default data \
-                 directory and socket.",
-                set.join(" and ")
-            ));
+    let steps_for = |stop_daemon: bool| {
+        if uninstall && changes.is_empty() {
+            Vec::new()
+        } else {
+            service::steps(&bin, &unset, !uninstall, stop_daemon, restart)
         }
+    };
+    let mut steps = steps_for(true);
+    let mut notes = Vec::new();
+    if !uninstall && !unset.is_empty() {
+        notes.push(format!(
+            "{} {} set here but not in the service, which uses the default data directory \
+             and socket.",
+            unset.join(" and "),
+            if unset.len() == 1 { "is" } else { "are" }
+        ));
     }
     if !dry_run && !steps.is_empty() {
         service::check(&env, &|| service::manual(&bin, &env, !uninstall))?;
@@ -1014,8 +1019,13 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
             inst::apply(&changes)?;
             service::reload(&env)?;
         } else {
+            // A service already running this unit runs the daemon: there
+            // is no daemon on demand to stop, and stopping its own would
+            // only drop its clients.
+            let stop_daemon = !(changes.is_empty() && service::is_active(&env));
+            steps = steps_for(stop_daemon);
             inst::apply(&changes)?;
-            service::start(&bin, &env, restart)?;
+            service::start(&bin, &env, stop_daemon, restart)?;
         }
     }
     let action = |c: &inst::Change| match (&c.before, &c.after) {
@@ -1087,7 +1097,7 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         })?;
     }
     for n in &notes {
-        print_line(n)?;
+        print_line(&format!("note: {n}"))?;
     }
     Ok(ExitCode::SUCCESS)
 }
