@@ -845,8 +845,13 @@ the background service moved to a private port (`opencode service set
 port`, which writes `service.json` in the private config dir); `opencode
 debug config` shows the config the service resolved, and the service log
 shows the plugin loading and the server connecting. The service reads its
-config at start, so after an install or uninstall it needs `opencode
-service restart` (the command says so); the plugin file itself is watched.
+config at start, so after an install or uninstall that changes
+`opencode.json`/`opencode.jsonc` it needs `opencode service restart` (the
+command says so, instead of the "restart running sessions" line other
+harnesses get: every opencode session lives in that service, so restarting
+a session loads nothing). The plugin file itself is watched, so a change to
+it alone needs no restart and the command prints none. `--json` carries the
+same instruction as `restart` (null when nothing needs restarting).
 
 - **Where.** The config dir is `$XDG_CONFIG_HOME/opencode` (a relative
   value is taken from the current directory, as opencode does), else

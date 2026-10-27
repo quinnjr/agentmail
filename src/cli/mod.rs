@@ -769,6 +769,37 @@ fn harness_title(h: Harness) -> &'static str {
     }
 }
 
+/// What the user must restart for the harness to pick up `changes`, if
+/// anything. opencode runs every session inside one background service that
+/// keeps the config it read at start, so a session restart loads nothing;
+/// the service needs restarting, and only for a config change (it watches
+/// and reloads its plugin files by itself).
+fn restart_hint(
+    harness: Harness,
+    uninstall: bool,
+    changes: &[crate::install::Change],
+) -> Option<String> {
+    if changes.is_empty() {
+        return None;
+    }
+    let what = if uninstall { "unload" } else { "load" };
+    if harness == Harness::Opencode {
+        let config = changes.iter().any(|c| {
+            matches!(
+                c.path.file_name().and_then(|n| n.to_str()),
+                Some("opencode.json" | "opencode.jsonc")
+            )
+        });
+        return config.then(|| {
+            format!(
+                "Run `opencode service restart` to {what} it: opencode's background service reads its config only at start."
+            )
+        });
+    }
+    let name = harness_title(harness);
+    Some(format!("Restart running {name} sessions to {what} it."))
+}
+
 /// `agentmail install` / `uninstall`: plan the changes, then show them
 /// (`--dry-run`) or make them. Needs no daemon.
 fn install(
@@ -812,7 +843,10 @@ fn install(
                 json!({"path": c.path.display().to_string(), "action": action(c), "backup": backup})
             })
             .collect();
-        print_json(&json!({"dry_run": dry_run, "changes": list}))?;
+        let restart = (!dry_run)
+            .then(|| restart_hint(harness, uninstall, &changes))
+            .flatten();
+        print_json(&json!({"dry_run": dry_run, "changes": list, "restart": restart}))?;
         return Ok(ExitCode::SUCCESS);
     }
     let name = harness_title(harness);
@@ -844,9 +878,7 @@ fn install(
     let summary = match (uninstall, changes.is_empty()) {
         (false, true) => format!("agentmail is already installed for {name}."),
         (false, false) => {
-            let mut s = format!(
-                "agentmail is installed for {name}. Restart running {name} sessions to load it."
-            );
+            let mut s = format!("agentmail is installed for {name}.");
             if project && harness == Harness::ClaudeCode {
                 s.push_str(
                     "\nClaude Code asks you to approve the project's MCP servers (.mcp.json) when it next starts.",
@@ -855,16 +887,11 @@ fn install(
             s
         }
         (true, true) => format!("agentmail is not installed for {name}; nothing to remove."),
-        (true, false) => format!(
-            "agentmail is removed from {name}. Restart running {name} sessions to unload it."
-        ),
+        (true, false) => format!("agentmail is removed from {name}."),
     };
     print_line(&summary)?;
-    if harness == Harness::Opencode && !changes.is_empty() {
-        // The background service keeps the config it read at start.
-        print_line(
-            "opencode's background service reads its config at start: run `opencode service restart`.",
-        )?;
+    if let Some(hint) = restart_hint(harness, uninstall, &changes) {
+        print_line(&hint)?;
     }
     Ok(ExitCode::SUCCESS)
 }

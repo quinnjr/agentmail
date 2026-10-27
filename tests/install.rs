@@ -968,7 +968,7 @@ fn cli_json_reports_changes() {
         json!({"dry_run": false, "changes": [
             {"path": settings, "action": "update", "backup": bak(&h.settings()).display().to_string()},
             {"path": mcp, "action": "create", "backup": null},
-        ]})
+        ], "restart": "Restart running Claude Code sessions to load it."})
     );
     let out = cli(&h)
         .args([
@@ -989,7 +989,7 @@ fn cli_json_reports_changes() {
         json!({"dry_run": true, "changes": [
             {"path": settings, "action": "update", "backup": null},
             {"path": mcp, "action": "delete", "backup": null},
-        ]})
+        ], "restart": null})
     );
 }
 
@@ -1556,7 +1556,17 @@ fn cli_opencode_install_and_uninstall() {
         .clone();
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains(&h.oc_plugin().display().to_string()), "{out}");
-    assert!(out.contains("opencode"), "{out}");
+    assert!(
+        out.contains("agentmail is installed for opencode."),
+        "{out}"
+    );
+    // Sessions run inside opencode's background service, which keeps the
+    // config it read at start: restarting a session loads nothing.
+    assert!(
+        out.contains("Run `opencode service restart` to load it"),
+        "{out}"
+    );
+    assert!(!out.contains("Restart running"), "{out}");
     let bin = std::fs::canonicalize(env!("CARGO_BIN_EXE_agentmail")).unwrap();
     let bin = bin.to_str().unwrap();
     assert_eq!(
@@ -1564,11 +1574,68 @@ fn cli_opencode_install_and_uninstall() {
         oc_server(bin)
     );
     assert_eq!(read(&h.oc_plugin()), oc_plugin_text(bin));
-    cli(&h)
+    // Only the plugin file changes: opencode reloads it by itself.
+    std::fs::remove_file(h.oc_plugin()).unwrap();
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["install", "--harness", "opencode"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains(&h.oc_plugin().display().to_string()), "{out}");
+    assert!(!out.contains(&h.oc_config().display().to_string()), "{out}");
+    assert!(!out.contains("restart"), "{out}");
+    assert!(!out.contains("Restart"), "{out}");
+    std::fs::remove_file(h.oc_plugin()).unwrap();
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--json", "install", "--harness", "opencode"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["restart"], Value::Null, "{v}");
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--json", "uninstall", "--harness", "opencode", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["restart"], Value::Null, "{v}");
+    let out = cli(&h)
         .env_remove("XDG_CONFIG_HOME")
         .args(["uninstall", "--harness", "opencode"])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("agentmail is removed from opencode."), "{out}");
+    assert!(
+        out.contains("Run `opencode service restart` to unload it"),
+        "{out}"
+    );
+    assert!(!out.contains("Restart running"), "{out}");
     assert!(!h.oc_config().exists());
     assert!(!h.oc_plugin().exists());
+    let out = cli(&h)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["--json", "install", "--harness", "opencode"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    let restart = v["restart"].as_str().unwrap_or_default();
+    assert!(restart.contains("`opencode service restart`"), "{v}");
 }
