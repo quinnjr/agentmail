@@ -990,14 +990,20 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     let bin = service::binary(&env, argv0.as_deref())?;
     let changes = service::plan(&bin, &env, !uninstall)?;
     let unset = service::location_overrides(&env);
-    // Uninstalling a service that is not there touches nothing, systemd
-    // included; installing one that is runs its commands again, so it is
-    // running.
+    // Uninstalling a service whose unit is not there touches only what
+    // systemd still has of it (its unit removed by hand), if anything;
+    // installing one that is runs its commands again, so it is running.
+    let orphan = (uninstall && changes.is_empty())
+        .then(|| service::orphan(&env))
+        .flatten();
     // A unit that was there may be running: it is restarted to run ours.
     let restart = !uninstall && changes.iter().any(|c| c.before.is_some());
     let steps_for = |stop_daemon: bool| {
         if uninstall && changes.is_empty() {
-            Vec::new()
+            orphan
+                .as_ref()
+                .map(service::orphan_steps)
+                .unwrap_or_default()
         } else {
             service::steps(&bin, &unset, !uninstall, stop_daemon, restart)
         }
@@ -1025,16 +1031,43 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
             steps = steps_for(stop_daemon());
         }
     } else if !steps.is_empty() {
-        service::check(&env, &|| service::manual(&bin, &env, !uninstall))?;
+        let manual = || match &orphan {
+            Some(o) => format!(
+                "To clean up what systemd still has of the service by hand, run:\n{}",
+                service::orphan_steps(o)
+                    .iter()
+                    .map(|s| format!("  {s}\n"))
+                    .collect::<String>()
+            ),
+            None => service::manual(&bin, &env, !uninstall),
+        };
+        service::check(&env, &manual)?;
         let shown = inst::shell_quote(&path.to_string_lossy());
-        if uninstall {
+        if let Some(o) = &orphan {
+            service::clean_orphan(&env, o).with_context(|| {
+                format!(
+                    "the unit {shown} was already removed, and cleaning up what systemd still \
+                     has of the service failed; run these to finish:\n{}",
+                    service::orphan_steps(o)
+                        .iter()
+                        .map(|s| format!("  {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })?;
+        } else if uninstall {
             service::stop(&env).with_context(|| {
                 format!(
                     "the unit {shown} is kept; run `agentmail uninstall --service` again to \
                      remove it"
                 )
             })?;
-            inst::apply(&changes)?;
+            inst::apply(&changes).with_context(|| {
+                format!(
+                    "the service is disabled and stopped, but the unit {shown} could not be \
+                     removed; remove it and run `systemctl --user daemon-reload`"
+                )
+            })?;
             service::reload(&env).with_context(|| {
                 format!(
                     "the unit {shown} is removed and the service disabled, but systemd still \
@@ -1044,7 +1077,12 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         } else {
             let stop_daemon = stop_daemon();
             steps = steps_for(stop_daemon);
-            inst::apply(&changes)?;
+            inst::apply(&changes).with_context(|| {
+                format!(
+                    "the unit {shown} could not be written; systemd was not told about it and \
+                     the service is unchanged"
+                )
+            })?;
             service::start(&bin, &env, stop_daemon, restart).with_context(|| {
                 format!(
                     "the unit {shown} is written but the service may not be running; run \
@@ -1063,6 +1101,15 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         .then(|| service::backup_kept(&path))
         .flatten()
         .filter(|_| changes.iter().any(|c| c.before.is_some()));
+    if let Some(b) = backup.as_ref().filter(|_| uninstall) {
+        notes.push(format!(
+            "uninstall does not put the unit kept as {} back; to restore it, run: mv {} {} && \
+             systemctl --user daemon-reload",
+            b.display(),
+            inst::shell_quote(&b.to_string_lossy()),
+            inst::shell_quote(&path.to_string_lossy())
+        ));
+    }
     if json {
         let list: Vec<Value> = changes
             .iter()
@@ -1117,10 +1164,14 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
         for s in &steps {
             print_line(&format!("ran {s}"))?;
         }
-        print_line(match (uninstall, changes.is_empty()) {
-            (false, _) => "the agentmail daemon runs as the systemd user service agentmail.",
-            (true, false) => "the agentmail systemd user service is removed.",
-            (true, true) => {
+        print_line(match (uninstall, changes.is_empty(), orphan.is_some()) {
+            (false, _, _) => "the agentmail daemon runs as the systemd user service agentmail.",
+            (true, false, _) => "the agentmail systemd user service is removed.",
+            (true, true, true) => {
+                "the agentmail systemd user service's unit was already removed; what systemd \
+                 still had of the service is cleaned up."
+            }
+            (true, true, false) => {
                 "the agentmail systemd user service is not installed; nothing to remove."
             }
         })?;

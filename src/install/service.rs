@@ -3,11 +3,13 @@
 //!
 //! Install writes the unit from the README (its "Running the daemon under
 //! systemd" section, verbatim but for `ExecStart`, which runs this binary),
-//! stops any daemon started on demand, then has systemd load the unit,
-//! enable it and start it. Uninstall disables and stops the service,
-//! removes the unit and has systemd forget it. Neither discards a unit of
-//! the user's (see [`plan`]). Both first check that the
-//! user's systemd manager is reachable, and otherwise give the steps to do
+//! has systemd load the unit, enable it and start it, then stops any daemon
+//! started on demand, so that the service's takes over. Uninstall disables
+//! and stops the service, removes the unit and has systemd forget it; with
+//! the unit already removed by hand, it cleans up what systemd still has
+//! of the service (see [`orphan`]). Neither discards a unit of the user's
+//! (see [`plan`]). Both first check that the user's systemd manager is
+//! reachable, and otherwise give the steps to do
 //! by hand. `AGENTMAIL_SYSTEMCTL` names the `systemctl` to run (tests).
 
 use std::path::{Path, PathBuf};
@@ -175,9 +177,12 @@ pub fn unit(bin: &Path) -> Result<String> {
     Ok(UNIT.replace("{exec}", &exec_arg(bin)?))
 }
 
-/// `bin` as the first word of a systemd command line: `%` (specifiers) and
-/// `$` (variables) doubled, and double-quoted, with `\` and `"` escaped,
-/// when it holds anything but plain path characters.
+/// `bin` as the first word of a systemd command line: `%` (specifiers)
+/// doubled, and double-quoted, with `\` and `"` escaped, when it holds
+/// anything but plain path characters. `$` is left as is: systemd expands
+/// variables only in the arguments after the executable, so it would not
+/// turn a doubled `$$` in the path back into `$` (checked with
+/// `systemd-analyze verify`).
 fn exec_arg(bin: &Path) -> Result<String> {
     if !bin.is_absolute() {
         bail!(
@@ -194,7 +199,7 @@ fn exec_arg(bin: &Path) -> Result<String> {
             s.escape_debug()
         );
     }
-    let s = s.replace('%', "%%").replace('$', "$$");
+    let s = s.replace('%', "%%");
     let plain = s
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%,=$".contains(&b));
@@ -288,10 +293,12 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
 /// `bin` and the daemon location overrides `unset` (see
 /// [`location_overrides`]), which `daemon stop` leaves out so that it stops
 /// the daemon at the default location, the one the service replaces. With
-/// `stop_daemon`, install first stops any daemon run on demand. With
 /// `restart` (install, replacing a unit systemd may be running), the
 /// service is restarted so that it runs the new unit: enabling a running
-/// service does not.
+/// service does not. With `stop_daemon`, install then stops any daemon run
+/// on demand: last, so that the service's daemon, already waiting for the
+/// lock, takes over as it exits, leaving no time for a client to start
+/// another on demand.
 pub fn steps(
     bin: &Path,
     unset: &[&str],
@@ -300,7 +307,13 @@ pub fn steps(
     restart: bool,
 ) -> Vec<String> {
     if install {
-        let mut s = Vec::new();
+        let mut s = vec![
+            "systemctl --user daemon-reload".to_string(),
+            format!("systemctl --user enable --now {NAME}"),
+        ];
+        if restart {
+            s.push(format!("systemctl --user try-restart {NAME}"));
+        }
         if stop_daemon {
             let env_u: String = unset.iter().map(|k| format!("-u {k} ")).collect();
             let env_u = if env_u.is_empty() {
@@ -313,11 +326,6 @@ pub fn steps(
                 shell_quote(&bin.to_string_lossy())
             ));
         }
-        s.push("systemctl --user daemon-reload".to_string());
-        s.push(format!("systemctl --user enable --now {NAME}"));
-        if restart {
-            s.push(format!("systemctl --user try-restart {NAME}"));
-        }
         s
     } else {
         vec![
@@ -325,6 +333,72 @@ pub fn steps(
             "systemctl --user daemon-reload".to_string(),
         ]
     }
+}
+
+/// What systemd still has of the service once its unit file is gone (the
+/// user removed it by hand): the service running, and the link `enable`
+/// made in `default.target.wants`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub active: bool,
+    pub link: Option<PathBuf>,
+}
+
+/// The link `systemctl --user enable` makes for the unit (its
+/// `WantedBy=default.target`).
+pub fn wants_link(env: &Env) -> PathBuf {
+    let unit = unit_path(env);
+    unit.parent()
+        .expect("the unit path has a directory")
+        .join("default.target.wants")
+        .join(format!("{NAME}.service"))
+}
+
+/// Uninstall, with no unit file: what systemd still has of the service,
+/// if anything (see [`Orphan`]).
+pub fn orphan(env: &Env) -> Option<Orphan> {
+    let link = wants_link(env);
+    let link = std::fs::symlink_metadata(&link)
+        .is_ok_and(|m| m.file_type().is_symlink())
+        .then_some(link);
+    let active = is_active(env);
+    (active || link.is_some()).then_some(Orphan { active, link })
+}
+
+/// The commands that clean up `o`, as the user would type them.
+/// (`disable` cannot: with the unit file gone it fails, "Unit ... does not
+/// exist", so the link is removed directly.)
+pub fn orphan_steps(o: &Orphan) -> Vec<String> {
+    let mut s = Vec::new();
+    if o.active {
+        s.push(format!("systemctl --user stop {NAME}"));
+    }
+    if let Some(l) = &o.link {
+        s.push(format!("rm {}", shell_quote(&l.to_string_lossy())));
+    }
+    s.push("systemctl --user daemon-reload".to_string());
+    s
+}
+
+/// Clean up `o` (see [`orphan_steps`]).
+pub fn clean_orphan(env: &Env, o: &Orphan) -> Result<()> {
+    if o.active {
+        user_systemctl(env, &["stop", NAME])?;
+    }
+    if let Some(l) = &o.link {
+        match std::fs::remove_file(l) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("removing {}", l.display())));
+            }
+        }
+        // `systemctl disable` drops the directory once empty; so do we.
+        if let Some(d) = l.parent() {
+            let _ = std::fs::remove_dir(d);
+        }
+    }
+    user_systemctl(env, &["daemon-reload"])
 }
 
 /// The `systemctl` to run: `AGENTMAIL_SYSTEMCTL`, else `systemctl`.
@@ -428,12 +502,17 @@ pub fn is_active(env: &Env) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Install: with `stop_daemon`, stop any daemon running on demand at the
-/// default location (with `bin daemon stop`, [`LOCATION_VARS`] left out,
-/// so the one systemd starts takes over), then load, enable and start the
-/// unit, restarting it with `restart` (see [`steps`]). Run once its file
-/// is written.
+/// Install, once the unit file is written: load, enable and start the
+/// unit, restarting it with `restart`, then, with `stop_daemon`, stop any
+/// daemon running on demand at the default location (with
+/// `bin daemon stop`, [`LOCATION_VARS`] left out), so that the service's,
+/// waiting for the lock, takes over (see [`steps`]).
 pub fn start(bin: &Path, env: &Env, stop_daemon: bool, restart: bool) -> Result<()> {
+    user_systemctl(env, &["daemon-reload"])?;
+    user_systemctl(env, &["enable", "--now", NAME])?;
+    if restart {
+        user_systemctl(env, &["try-restart", NAME])?;
+    }
     if stop_daemon {
         let mut cmd = Command::new(bin);
         cmd.args(["daemon", "stop"]);
@@ -441,11 +520,6 @@ pub fn start(bin: &Path, env: &Env, stop_daemon: bool, restart: bool) -> Result<
             cmd.env_remove(k);
         }
         run_cmd(cmd, &format!("{} daemon stop", bin.display()))?;
-    }
-    user_systemctl(env, &["daemon-reload"])?;
-    user_systemctl(env, &["enable", "--now", NAME])?;
-    if restart {
-        user_systemctl(env, &["try-restart", NAME])?;
     }
     Ok(())
 }

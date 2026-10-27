@@ -2946,7 +2946,12 @@ fn service_unit_quotes_the_binary_for_systemd() {
     );
     assert_eq!(
         exec("/a%b$c/agent\"mail"),
-        "ExecStart=\"/a%%b$$c/agent\\\"mail\" daemon run --wait-for-lock"
+        "ExecStart=\"/a%%b$c/agent\\\"mail\" daemon run --wait-for-lock"
+    );
+    // systemd expands no `$` in the executable path, so it stays single.
+    assert_eq!(
+        exec("/a$b/agentmail"),
+        "ExecStart=/a$b/agentmail daemon run --wait-for-lock"
     );
     assert!(install::service::unit(Path::new("relative/agentmail")).is_err());
     assert!(install::service::unit(Path::new("/a\nb/agentmail")).is_err());
@@ -2973,6 +2978,9 @@ case "$*" in
 esac
 if env -u AGENTMAIL_DATA_DIR -u AGENTMAIL_SOCKET "$AGENTMAIL_TEST_BIN" daemon status >/dev/null 2>&1; then up=up; else up=down; fi
 echo "$* [$up]" >> "$FAKE_LOG"
+case "$*" in
+  *disable*) if [ -n "$FAKE_RO" ]; then chmod 555 "$FAKE_RO"; fi ;;
+esac
 if [ -n "$FAKE_FAIL" ]; then
   case "$*" in *"$FAKE_FAIL"*) echo "Failed to $FAKE_FAIL" >&2; exit 1 ;; esac
 fi
@@ -3032,7 +3040,8 @@ exit 0
             .env_remove("FAKE_RC")
             .env_remove("FAKE_ACTIVE")
             .env_remove("FAKE_ENV")
-            .env_remove("FAKE_FAIL");
+            .env_remove("FAKE_FAIL")
+            .env_remove("FAKE_RO");
         c
     }
 
@@ -3091,16 +3100,20 @@ fn service_calls_systemctl_in_order() {
         read(&s.unit()),
         install::service::unit(Path::new(&bin_path())).unwrap()
     );
-    // systemd is checked first, and the on-demand daemon is stopped before
-    // systemd is told about the unit.
+    // systemd is checked first, and the on-demand daemon is stopped only
+    // once the service is started, so that the service's daemon, waiting
+    // for the lock, takes over at once.
     assert_eq!(
         s.log(),
         [
             "--user is-system-running [up]",
-            "--user daemon-reload [down]",
-            "--user enable --now agentmail [down]",
+            "--user daemon-reload [up]",
+            "--user enable --now agentmail [up]",
         ]
     );
+    let ran: Vec<&str> = out.lines().filter(|l| l.starts_with("ran ")).collect();
+    assert!(ran.last().unwrap().ends_with("daemon stop"), "{out}");
+    assert!(ran[0].ends_with("daemon-reload"), "{out}");
     assert!(!s.daemon_up(s.cli()));
     assert!(
         s.daemon_up(s.private_cli()),
@@ -3138,10 +3151,11 @@ fn service_calls_systemctl_in_order() {
         [
             "--user is-system-running [up]",
             "--user is-active --quiet agentmail [up]",
-            "--user daemon-reload [down]",
-            "--user enable --now agentmail [down]",
+            "--user daemon-reload [up]",
+            "--user enable --now agentmail [up]",
         ]
     );
+    assert!(!s.daemon_up(s.cli()));
     assert!(!bak(&s.unit()).exists());
 }
 
@@ -3352,6 +3366,61 @@ fn service_failure_after_writing_the_unit_says_so() {
     assert!(!s.unit().exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn service_failure_to_write_or_remove_the_unit_says_so() {
+    let s = ServiceHome::new();
+    let dir = s.unit().parent().unwrap().to_path_buf();
+    let mode = |m: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    mode(0o555);
+    let out = s
+        .cli()
+        .args(["install", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    mode(0o755);
+    let err = String::from_utf8(out).unwrap();
+    assert!(
+        err.contains(&format!(
+            "the unit {} could not be written",
+            s.unit().display()
+        )),
+        "{err}"
+    );
+    assert!(err.contains("the service is unchanged"), "{err}");
+    assert_eq!(s.log(), ["--user is-system-running [down]"]);
+
+    // Uninstall: the service is disabled, then the unit cannot be removed.
+    s.cli().args(["install", "--service"]).assert().success();
+    let out = s
+        .cli()
+        .env("FAKE_RO", &dir)
+        .args(["uninstall", "--service"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    mode(0o755);
+    let err = String::from_utf8(out).unwrap();
+    assert!(
+        err.contains(&format!(
+            "the service is disabled and stopped, but the unit {} could not be removed",
+            s.unit().display()
+        )),
+        "{err}"
+    );
+    assert!(err.contains("systemctl --user daemon-reload"), "{err}");
+    assert!(s.unit().exists());
+}
+
 #[test]
 fn service_uninstall() {
     let s = ServiceHome::new();
@@ -3384,7 +3453,91 @@ fn service_uninstall() {
         String::from_utf8(out).unwrap().contains("not installed"),
         "second uninstall"
     );
-    assert_eq!(s.log().len(), n + 3);
+    // Only asked whether it runs.
+    assert_eq!(
+        s.log()[n + 3..],
+        ["--user is-active --quiet agentmail [down]"]
+    );
+}
+
+#[test]
+fn service_uninstall_cleans_up_after_a_unit_removed_by_hand() {
+    // The unit file was deleted while the service was enabled and running:
+    // systemd still has its `default.target.wants` link and runs it.
+    let s = ServiceHome::new();
+    s.cli().args(["install", "--service"]).assert().success();
+    let link = s
+        .unit()
+        .parent()
+        .unwrap()
+        .join("default.target.wants/agentmail.service");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(s.unit(), &link).unwrap();
+    std::fs::remove_file(s.unit()).unwrap();
+    let n = s.log().len();
+    // A dry run shows what it would do, and does nothing.
+    let out = s
+        .cli()
+        .env("FAKE_ACTIVE", "active")
+        .args(["uninstall", "--service", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("systemctl --user stop agentmail"), "{out}");
+    assert!(out.contains(&format!("rm {}", link.display())), "{out}");
+    assert!(std::fs::symlink_metadata(&link).is_ok());
+    let out = s
+        .cli()
+        .env("FAKE_ACTIVE", "active")
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("already removed"), "{out}");
+    assert!(out.contains("ran systemctl --user daemon-reload"), "{out}");
+    assert_eq!(
+        s.log()[n + 1..],
+        [
+            "--user is-active --quiet agentmail [down]",
+            "--user is-system-running [down]",
+            "--user stop agentmail [down]",
+            "--user daemon-reload [down]",
+        ]
+    );
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert!(!link.parent().unwrap().exists());
+    // Only the link left (the service not running): removed, no stop.
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(s.unit(), &link).unwrap();
+    let n = s.log().len();
+    s.cli().args(["uninstall", "--service"]).assert().success();
+    assert_eq!(
+        s.log()[n..],
+        [
+            "--user is-active --quiet agentmail [down]",
+            "--user is-system-running [down]",
+            "--user daemon-reload [down]",
+        ]
+    );
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    // Nothing left: nothing is touched.
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(String::from_utf8(out).unwrap().contains("not installed"));
 }
 
 #[test]
@@ -3399,10 +3552,34 @@ fn service_replaces_a_hand_written_unit_keeping_it() {
         read(&bak(&s.unit())),
         "[Service]\nExecStart=/old/agentmail daemon run\n"
     );
-    s.cli().args(["uninstall", "--service"]).assert().success();
+    let out = s
+        .cli()
+        .args(["uninstall", "--service"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
     assert!(!s.unit().exists());
-    // The user's own unit is not thrown away.
+    // The user's own unit is not thrown away, nor put back: the output
+    // says how to.
     assert!(bak(&s.unit()).exists());
+    assert!(
+        out.contains(&format!(
+            "note: uninstall does not put the unit kept as {} back",
+            bak(&s.unit()).display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "mv {} {} && systemctl --user daemon-reload",
+            bak(&s.unit()).display(),
+            s.unit().display()
+        )),
+        "{out}"
+    );
 }
 
 #[test]
