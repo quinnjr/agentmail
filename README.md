@@ -139,13 +139,20 @@ and refuses to replace one you wrote when that backup already keeps a
 different one, so that neither is lost. It then runs the commands below,
 `daemon-reload` and `enable --now`, and, when it replaced an
 existing unit, `systemctl --user try-restart agentmail`, since enabling a
-running service does not restart it on the new unit. Last, it runs
-`agentmail daemon stop` (with `AGENTMAIL_DATA_DIR` and `AGENTMAIL_SOCKET`
-unset, so it stops the daemon at the default location, the one the service
-replaces; skipped when the unit is unchanged and the service is already
-active, so a re-run leaves its daemon alone): the service's daemon, already
-waiting for the lock, takes over as the on-demand one exits, so no client can
-start another on demand in between. It first asks
+running service does not restart it on the new unit. Last, when a daemon
+started on demand runs at the default location (its lock record does not say
+it is supervised), it runs `agentmail daemon stop` (with `AGENTMAIL_DATA_DIR`
+and `AGENTMAIL_SOCKET` unset, so it stops the daemon at the default location,
+the one the service replaces): the service's daemon, already waiting for the
+lock, takes over as the on-demand one exits, so no client can start another
+on demand in between. With no daemon running, or the service's own
+(supervised) one, it skips that step, so a re-run leaves the service's daemon
+alone; should the step fail, the service is running all the same, and the
+error says to stop the on-demand daemon yourself. It refuses, changing
+nothing, when the systemd user manager loads user units from another
+directory than the one it would write to (the manager's `XDG_CONFIG_HOME` or
+`HOME` differs from your shell's, as `systemctl --user show-environment`
+shows), since the manager would never see the unit. It first asks
 `systemctl --user is-system-running`: a manager that answers `running`,
 `degraded` (some other unit failed), `starting` or `initializing` can run the
 service; any other answer, or none, changes nothing and prints these steps to
@@ -153,12 +160,20 @@ do by hand. `agentmail uninstall --service` disables and stops the service,
 removes the unit and reloads systemd. It removes only agentmail's unit (the
 one below, whatever its `ExecStart`): one it created and you then edited is
 saved as the backup first, and any other unit is left in place with the
-commands to remove it by hand. Uninstall does not put a unit kept in the
+commands to remove it by hand. Removing it by hand, also remove
+`agentmail.service.agentmail.created` next to it (agentmail's marker, which
+a later install or uninstall trusts), and either move a unit kept as
+`agentmail.service.agentmail.bak` back or remove it too. Uninstall does not put a unit kept in the
 backup back (it says so); to restore it, run
 `mv agentmail.service.agentmail.bak agentmail.service && systemctl --user daemon-reload`
 in that directory. When the unit file is already gone (removed by hand) but
 systemd still runs the service or has its `default.target.wants` link,
-uninstall stops it, removes the link and reloads systemd. The service uses
+uninstall stops it, removes the link and reloads systemd: the service only
+when systemd has no unit file for it any more (or still loads it from
+agentmail's removed unit), and the link only when it points to agentmail's
+unit. A service named `agentmail` loaded from elsewhere (say,
+`~/.local/share/systemd/user` or a package's), and a link to it, are yours,
+and left alone with a note saying so. The service uses
 the default data directory and socket, whatever `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET` say where you
 run the install, as the systemd user manager's environment sets them
 (`XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `HOME`); install notes when those put

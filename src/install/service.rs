@@ -3,8 +3,8 @@
 //!
 //! Install writes the unit from the README (its "Running the daemon under
 //! systemd" section, verbatim but for `ExecStart`, which runs this binary),
-//! has systemd load the unit, enable it and start it, then stops any daemon
-//! started on demand, so that the service's takes over. Uninstall disables
+//! has systemd load the unit, enable it and start it, then stops the daemon
+//! started on demand, if one runs, so that the service's takes over. Uninstall disables
 //! and stops the service, removes the unit and has systemd forget it; with
 //! the unit already removed by hand, it cleans up what systemd still has
 //! of the service (see [`orphan`]). Neither discards a unit of the user's
@@ -54,32 +54,35 @@ pub fn location_overrides(env: &Env) -> Vec<&'static str> {
         .collect()
 }
 
-/// The data directory and socket the service's daemon uses, from the
-/// systemd user manager's environment (`systemctl --user show-environment`,
-/// whose `HOME` defaults to `env`'s), when they differ from the defaults
-/// here, which `daemon stop` (and every client here not told otherwise)
-/// uses: then a note saying so. The defaults depend on `XDG_DATA_HOME` and
-/// `XDG_RUNTIME_DIR`, which a shell (say, an ssh session without
-/// pam_systemd) may set differently from the manager. Nothing when the
-/// manager cannot be asked, or a value cannot be read.
-pub fn location_mismatch(env: &Env) -> Option<String> {
+/// The systemd user manager's environment (`systemctl --user
+/// show-environment`), with `HOME` defaulting to `env`'s. Nothing when the
+/// manager cannot be asked, or a value cannot be read (one with special
+/// characters is shown quoted, `$'...'`).
+fn manager_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
     let out = Command::new(systemctl(env))
         .args(["--user", "show-environment"])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
     let text = String::from_utf8(out.stdout).ok()?;
-    let mut manager: std::collections::HashMap<&str, &str> =
-        text.lines().filter_map(|l| l.split_once('=')).collect();
-    // A value with special characters is shown quoted (`$'...'`).
+    let mut manager: std::collections::HashMap<String, String> = text
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     if manager.values().any(|v| v.starts_with("$'")) {
         return None;
     }
-    let home = env.home.to_str()?;
-    manager.entry("HOME").or_insert(home);
-    let service =
-        crate::paths::Paths::from_vars(|k| manager.get(k).map(std::ffi::OsString::from)).ok()?;
-    let here = crate::paths::Paths::from_vars(|k| {
+    manager
+        .entry("HOME".to_string())
+        .or_insert(env.home.to_str()?.to_string());
+    Some(manager)
+}
+
+/// The default daemon location here: `env`'s, but for [`LOCATION_VARS`],
+/// which the service does not see. `daemon stop` run by install uses it.
+pub fn default_paths(env: &Env) -> Option<crate::paths::Paths> {
+    crate::paths::Paths::from_vars(|k| {
         if LOCATION_VARS.contains(&k) {
             None
         } else if k == "HOME" {
@@ -88,7 +91,32 @@ pub fn location_mismatch(env: &Env) -> Option<String> {
             env.var(k).map(std::ffi::OsString::from)
         }
     })
-    .ok()?;
+    .ok()
+}
+
+/// Whether a daemon started on demand runs at the default location (see
+/// [`default_paths`]): one holds the lock there, and its lock record does
+/// not say it is supervised (a daemon from before lock records, which
+/// writes none, is taken as on demand). Install stops only such a daemon:
+/// a supervised one is the service's own (or another supervisor's), and
+/// stopping it would only drop its clients while it is restarted.
+pub fn on_demand_daemon(env: &Env) -> bool {
+    default_paths(env)
+        .is_some_and(|p| p.lock_held() && !p.lock_record().is_some_and(|r| r.supervised))
+}
+
+/// The data directory and socket the service's daemon uses, from the
+/// systemd user manager's environment (see [`manager_env`]), when they
+/// differ from the defaults here, which `daemon stop` (and every client
+/// here not told otherwise) uses: then a note saying so. The defaults
+/// depend on `XDG_DATA_HOME` and `XDG_RUNTIME_DIR`, which a shell (say, an
+/// ssh session without pam_systemd) may set differently from the manager.
+/// Nothing when the manager cannot be asked, or a value cannot be read.
+pub fn location_mismatch(env: &Env) -> Option<String> {
+    let manager = manager_env(env)?;
+    let service =
+        crate::paths::Paths::from_vars(|k| manager.get(k).map(std::ffi::OsString::from)).ok()?;
+    let here = default_paths(env)?;
     let mut diff = Vec::new();
     if service.socket != here.socket {
         diff.push(format!(
@@ -113,6 +141,48 @@ pub fn location_mismatch(env: &Env) -> Option<String> {
          here use a daemon of their own, not the service's. Set the same values here, or in \
          the manager with `systemctl --user set-environment`.",
         diff.join(" and the ")
+    ))
+}
+
+/// The directory user units go in under the config root `XDG_CONFIG_HOME`
+/// (`xdg`, when absolute), else `home`'s `.config`.
+fn unit_dir(xdg: Option<&str>, home: &Path) -> PathBuf {
+    xdg.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("systemd/user")
+}
+
+/// When the systemd user manager loads user units from another directory
+/// than the one the unit goes in here (its `XDG_CONFIG_HOME`, or `HOME`,
+/// differs from this shell's): why agentmail refuses, since the manager
+/// would never see the unit (and `enable` it, which the manager does). Nothing
+/// when they match, or the manager cannot be asked.
+pub fn config_mismatch(env: &Env) -> Option<String> {
+    let manager = manager_env(env)?;
+    let theirs = unit_dir(
+        manager.get("XDG_CONFIG_HOME").map(String::as_str),
+        Path::new(manager.get("HOME")?),
+    );
+    let ours = unit_path(env).parent()?.to_path_buf();
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(x), Ok(y)) if x == y
+            )
+    };
+    if same(&theirs, &ours) {
+        return None;
+    }
+    Some(format!(
+        "the systemd user manager loads user units from {} (its XDG_CONFIG_HOME or HOME), not \
+         {}, where agentmail would put the unit (from XDG_CONFIG_HOME or HOME here), so it \
+         would never see it. Run this with the manager's values (`systemctl --user \
+         show-environment` shows them), or set XDG_CONFIG_HOME in the manager with \
+         `systemctl --user set-environment`.",
+        theirs.display(),
+        ours.display()
     ))
 }
 
@@ -214,12 +284,7 @@ fn exec_arg(bin: &Path) -> Result<String> {
 /// else under `~/.config`. A relative `XDG_CONFIG_HOME` is ignored, as the
 /// XDG spec says and systemd does.
 pub fn unit_path(env: &Env) -> PathBuf {
-    env.var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| env.home.join(".config"))
-        .join("systemd/user")
-        .join(format!("{NAME}.service"))
+    unit_dir(env.var("XDG_CONFIG_HOME"), &env.home).join(format!("{NAME}.service"))
 }
 
 /// The change that installs the unit for `bin` (none when it is already
@@ -279,13 +344,29 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
     } else if !saved {
         bail!(
             "{} is not the unit agentmail installs (it was edited, or agentmail did not write \
-             it), so agentmail leaves it; nothing was changed. To remove it anyway, run:\n  \
-             systemctl --user disable --now {NAME}\n  rm {}\n  systemctl --user daemon-reload",
+             it), so agentmail leaves it; nothing was changed. To remove it anyway, run:\n{}",
             c.path.display(),
-            shell_quote(&c.path.to_string_lossy())
+            removal_steps(&c.path)
         );
     }
     Ok(vec![c])
+}
+
+/// The commands that remove the unit at `path` by hand, with the files
+/// agentmail keeps next to it: its marker (which a later install or
+/// uninstall would trust) and, if any, the unit that was there before
+/// agentmail's, kept as its backup.
+fn removal_steps(path: &Path) -> String {
+    let q = |p: &Path| shell_quote(&p.to_string_lossy());
+    format!(
+        "  systemctl --user disable --now {NAME}\n  rm {}\n  rm -f {}\n  systemctl --user \
+         daemon-reload\nA unit kept as {} is the one that was there before agentmail's: to \
+         restore it, move it back to {} before the daemon-reload; otherwise remove it too.\n",
+        q(path),
+        q(&created_marker_path(path)),
+        backup_path(path).display(),
+        path.display()
+    )
 }
 
 /// The commands install (`install`) or uninstall runs after (install) or
@@ -298,7 +379,8 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
 /// service does not. With `stop_daemon`, install then stops any daemon run
 /// on demand: last, so that the service's daemon, already waiting for the
 /// lock, takes over as it exits, leaving no time for a client to start
-/// another on demand.
+/// another on demand. (Install passes `stop_daemon` only when such a daemon
+/// runs; see [`on_demand_daemon`].)
 pub fn steps(
     bin: &Path,
     unset: &[&str],
@@ -354,15 +436,88 @@ pub fn wants_link(env: &Env) -> PathBuf {
         .join(format!("{NAME}.service"))
 }
 
-/// Uninstall, with no unit file: what systemd still has of the service,
-/// if anything (see [`Orphan`]).
-pub fn orphan(env: &Env) -> Option<Orphan> {
-    let link = wants_link(env);
-    let link = std::fs::symlink_metadata(&link)
-        .is_ok_and(|m| m.file_type().is_symlink())
-        .then_some(link);
-    let active = is_active(env);
-    (active || link.is_some()).then_some(Orphan { active, link })
+/// Where systemd loads the service from: `None` when it has no unit file
+/// for it (`LoadState=not-found`), else its `FragmentPath` (empty when it
+/// has none). An error when systemd cannot be asked.
+fn fragment(env: &Env) -> Result<Option<PathBuf>> {
+    let out = Command::new(systemctl(env))
+        .args(["--user", "show", "-p", "LoadState,FragmentPath", NAME])
+        .output()
+        .context("asking systemd about the service")?;
+    if !out.status.success() {
+        bail!("systemctl --user show {NAME} failed ({})", out.status);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let prop = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok((prop("LoadState") != "not-found").then(|| PathBuf::from(prop("FragmentPath"))))
+}
+
+/// Uninstall, with no unit file: what systemd still has of agentmail's
+/// service, if anything (see [`Orphan`]), and a note on a service named
+/// `agentmail` it leaves alone as not agentmail's. The running service is
+/// agentmail's only when systemd has no unit file for it any more, or
+/// loads it from [`unit_path`] (not yet reloaded); one loaded from
+/// elsewhere (say, `~/.local/share/systemd/user` or a package's) is the
+/// user's. Likewise the `default.target.wants` link is agentmail's only
+/// when it points to [`unit_path`] (it may dangle there).
+pub fn orphan(env: &Env) -> (Option<Orphan>, Option<String>) {
+    let unit = unit_path(env);
+    let mut left = Vec::new();
+    let wants = wants_link(env);
+    let link = match std::fs::read_link(&wants) {
+        Ok(target) => {
+            let target = wants.parent().map_or(target.clone(), |d| d.join(&target));
+            if target == unit {
+                Some(wants)
+            } else {
+                left.push(format!(
+                    "the link {} points to {}, not agentmail's unit",
+                    wants.display(),
+                    target.display()
+                ));
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    let active = is_active(env)
+        && match fragment(env) {
+            Ok(None) => true,
+            Ok(Some(f)) if f == unit => true,
+            Ok(Some(f)) => {
+                left.push(format!(
+                    "the running service {NAME} is loaded from {}, not from agentmail's unit",
+                    if f.as_os_str().is_empty() {
+                        "no unit file agentmail knows".to_string()
+                    } else {
+                        f.display().to_string()
+                    }
+                ));
+                false
+            }
+            Err(e) => {
+                left.push(format!(
+                    "the service {NAME} is running, but whether it is agentmail's could not be \
+                     told ({e:#})"
+                ));
+                false
+            }
+        };
+    let note = (!left.is_empty()).then(|| {
+        format!(
+            "{}; agentmail did not install it, so it is left alone.",
+            left.join(", and ")
+        )
+    });
+    (
+        (active || link.is_some()).then_some(Orphan { active, link }),
+        note,
+    )
 }
 
 /// The commands that clean up `o`, as the user would type them.
@@ -488,8 +643,8 @@ pub fn manual(bin: &Path, env: &Env, install: bool) -> String {
         )
     } else {
         format!(
-            "To remove the service by hand, run:\n  systemctl --user disable --now {NAME}\n  rm {}\n  systemctl --user daemon-reload\n",
-            super::shell_quote(&path.to_string_lossy())
+            "To remove the service by hand, run:\n{}",
+            removal_steps(&path)
         )
     }
 }
@@ -503,25 +658,27 @@ pub fn is_active(env: &Env) -> bool {
 }
 
 /// Install, once the unit file is written: load, enable and start the
-/// unit, restarting it with `restart`, then, with `stop_daemon`, stop any
-/// daemon running on demand at the default location (with
-/// `bin daemon stop`, [`LOCATION_VARS`] left out), so that the service's,
-/// waiting for the lock, takes over (see [`steps`]).
-pub fn start(bin: &Path, env: &Env, stop_daemon: bool, restart: bool) -> Result<()> {
+/// unit, restarting it with `restart` (see [`steps`]).
+pub fn start(env: &Env, restart: bool) -> Result<()> {
     user_systemctl(env, &["daemon-reload"])?;
     user_systemctl(env, &["enable", "--now", NAME])?;
     if restart {
         user_systemctl(env, &["try-restart", NAME])?;
     }
-    if stop_daemon {
-        let mut cmd = Command::new(bin);
-        cmd.args(["daemon", "stop"]);
-        for k in LOCATION_VARS {
-            cmd.env_remove(k);
-        }
-        run_cmd(cmd, &format!("{} daemon stop", bin.display()))?;
-    }
     Ok(())
+}
+
+/// Install, once the service is started: stop the daemon running on
+/// demand at the default location (with `bin daemon stop`,
+/// [`LOCATION_VARS`] left out), so that the service's, waiting for the
+/// lock, takes over (see [`steps`] and [`on_demand_daemon`]).
+pub fn stop_on_demand(bin: &Path) -> Result<()> {
+    let mut cmd = Command::new(bin);
+    cmd.args(["daemon", "stop"]);
+    for k in LOCATION_VARS {
+        cmd.env_remove(k);
+    }
+    run_cmd(cmd, &format!("{} daemon stop", bin.display()))
 }
 
 /// Uninstall, before the unit file is removed: disable and stop the

@@ -326,8 +326,8 @@ pub enum Command {
         harness: Option<String>,
         /// Instead of a harness, run the daemon as a systemd user service:
         /// write `~/.config/systemd/user/agentmail.service` (honouring
-        /// XDG_CONFIG_HOME), stop any daemon started on demand, and enable
-        /// and start the unit.
+        /// XDG_CONFIG_HOME), enable and start the unit, and stop the daemon
+        /// started on demand, if one runs.
         #[arg(long, conflicts_with_all = ["project", "set_default", "kiro_wake"])]
         service: bool,
         /// Install into the current project instead of your user config.
@@ -993,27 +993,26 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     // Uninstalling a service whose unit is not there touches only what
     // systemd still has of it (its unit removed by hand), if anything;
     // installing one that is runs its commands again, so it is running.
-    let orphan = (uninstall && changes.is_empty())
-        .then(|| service::orphan(&env))
-        .flatten();
+    let (orphan, foreign) = if uninstall && changes.is_empty() {
+        service::orphan(&env)
+    } else {
+        (None, None)
+    };
     // A unit that was there may be running: it is restarted to run ours.
     let restart = !uninstall && changes.iter().any(|c| c.before.is_some());
-    let steps_for = |stop_daemon: bool| {
-        if uninstall && changes.is_empty() {
-            orphan
-                .as_ref()
-                .map(service::orphan_steps)
-                .unwrap_or_default()
-        } else {
-            service::steps(&bin, &unset, !uninstall, stop_daemon, restart)
-        }
+    // Only a daemon started on demand is stopped, decided before the
+    // service starts: a supervised one (the service's own, say, on a
+    // re-run) would only drop its clients while it is restarted.
+    let stop_daemon = !uninstall && service::on_demand_daemon(&env);
+    let steps = if uninstall && changes.is_empty() {
+        orphan
+            .as_ref()
+            .map(service::orphan_steps)
+            .unwrap_or_default()
+    } else {
+        service::steps(&bin, &unset, !uninstall, stop_daemon, restart)
     };
-    // A service already running this unit runs the daemon: there is no
-    // daemon on demand to stop, and stopping its own would only drop its
-    // clients. (`is-active` only reads.)
-    let stop_daemon = || !(changes.is_empty() && service::is_active(&env));
     let path = service::unit_path(&env);
-    let mut steps = steps_for(true);
     let mut notes = Vec::new();
     if !uninstall && !unset.is_empty() {
         notes.push(format!(
@@ -1026,11 +1025,17 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
     if !uninstall {
         notes.extend(service::location_mismatch(&env));
     }
+    notes.extend(foreign);
+    // The manager would never see a unit put where it does not look.
+    let elsewhere = (!steps.is_empty())
+        .then(|| service::config_mismatch(&env))
+        .flatten();
     if dry_run {
-        if !uninstall {
-            steps = steps_for(stop_daemon());
-        }
+        notes.extend(elsewhere);
     } else if !steps.is_empty() {
+        if let Some(why) = elsewhere {
+            bail!("{why} Nothing was changed.");
+        }
         let manual = || match &orphan {
             Some(o) => format!(
                 "To clean up what systemd still has of the service by hand, run:\n{}",
@@ -1075,21 +1080,26 @@ fn install_service(dry_run: bool, uninstall: bool, json: bool) -> Result<ExitCod
                 )
             })?;
         } else {
-            let stop_daemon = stop_daemon();
-            steps = steps_for(stop_daemon);
             inst::apply(&changes).with_context(|| {
                 format!(
                     "the unit {shown} could not be written; systemd was not told about it and \
                      the service is unchanged"
                 )
             })?;
-            service::start(&bin, &env, stop_daemon, restart).with_context(|| {
+            service::start(&env, restart).with_context(|| {
                 format!(
                     "the unit {shown} is written but the service may not be running; run \
                      `agentmail install --service` again to finish, or \
                      `agentmail uninstall --service` to undo it"
                 )
             })?;
+            if stop_daemon {
+                service::stop_on_demand(&bin).with_context(|| {
+                    "the service is enabled and running, but stopping the daemon started on \
+                     demand failed; stop it with `agentmail daemon stop` (with \
+                     AGENTMAIL_DATA_DIR and AGENTMAIL_SOCKET unset)"
+                })?;
+            }
         }
     }
     let action = |c: &inst::Change| match (&c.before, &c.after) {
