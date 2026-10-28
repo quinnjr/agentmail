@@ -1554,18 +1554,46 @@ wake exists (`claude -p`, kiro without `--kiro-wake`, `opencode run
 (a headless `-p`/`--no-interactive` run cannot be woken), which is the
 human-asks case the instruction allows.
 
-### Turning waking off: no global config setting (branch review)
+### Turning waking off: `AGENTMAIL_WAKE=0` (branch review)
 
 The spec's "Waking idle agents" asks for `register --no-wake` and a config
-setting to turn waking off. Only the per-agent switch was built:
-`agentmail register --no-wake` (MCP `register` with `wake: false`; `--wake`
-/ `wake: true` turns it on), plus kiro's install-time `--kiro-wake`, which
-sets `AGENTMAIL_KIRO_WAKE=1` for kiro's MCP server and makes waking the
-default for kiro agents. A global setting was not built because agentmail
-has no config file to put it in (everything else is per harness install or
-per agent), waking only happens when it is wanted per session, and the
-harness install already decides it wholesale: kiro wakes only with
-`--kiro-wake`, and `uninstall` removes Claude Code's wait hook and
-opencode's plugin. The README's Harness support section says how
-waking works and how to turn it off.
+setting to turn waking off. An earlier revision built only the per-agent
+switch and recorded the global setting as left out. That was the human's
+decision, so the branch review reopened it, and the global switch is now
+built:
+
+- Per agent: `agentmail register --no-wake` (MCP `register` with
+  `wake: false`). `--wake` / `wake: true` turns it on. kiro's install-time
+  `--kiro-wake` sets `AGENTMAIL_KIRO_WAKE=1` for kiro's MCP server, which
+  makes waking the default for kiro agents.
+- Globally: `AGENTMAIL_WAKE=0` (`identity::ENV_WAKE`). agentmail has no
+  config file, so the setting is an environment variable, set where the
+  harness is started. Hook commands and shell commands inherit the
+  harness's environment, and opencode's plugin passes `process.env` on to
+  every `agentmail hook` it spawns. Whether each harness also passes it to
+  its MCP server was not checked. That only affects the `wake` an MCP
+  `register` records: the hooks check the variable themselves (below), so
+  no wait runs either way. With the switch set:
+  - `register` (CLI and MCP) records `wake` off, even with `--wake` /
+    `wake: true` or `AGENTMAIL_KIRO_WAKE=1` (`identity::register_wake`,
+    `default_wake`).
+  - Every hook reports `wake` off, whatever the agent registered with
+    (`hook::Daemon::status`), so none waits or keeps wait state. Claude
+    Code's `asyncRewake` wait hook and kiro's `stop --wake` return at
+    once. opencode's `status` reports `"wake": false`, so the plugin starts
+    no waiter, and a `wait` answers `{"skip":true}`. An agent registered
+    earlier with `wake` on is therefore not woken either.
+  - Tests: `identity::tests::global_wake_switch_turns_waking_off`,
+    `cli::register_wake_defaults_off_for_kiro`,
+    `mcp::mcp_register_wake_defaults_off_for_kiro`,
+    `hook_claude::wait_respects_the_global_wake_switch`,
+    `hook_opencode::global_wake_switch_turns_waking_off`,
+    `hook_kiro::stop_silent_with_the_global_wake_switch_off`. The test
+    harnesses remove `AGENTMAIL_WAKE` from their child processes, and
+    `scripts/e2e.sh` runs harnesses in a clean environment, so a user's
+    own setting never affects a run.
+
+Only `0` turns waking off. Any other value, or none, leaves it to the
+agent. The README's Harness support section says how waking works and how
+to turn it off.
 

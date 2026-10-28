@@ -768,6 +768,26 @@ async fn wait_exits_0_when_daemon_stops() {
 }
 
 #[tokio::test]
+async fn wait_respects_the_global_wake_switch() {
+    // `AGENTMAIL_WAKE=0` in the harness's environment: the wait hook never
+    // waits, even for an agent registered with `wake` on and mail there.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths).with("AGENTMAIL_WAKE", "0");
+    send(&d, &a, "schema", "see the PR", false).await;
+    let started = Instant::now();
+    let out = run(&env, HookEvent::Wait, "stop").await;
+    assert!(silent(&out), "{out:?}");
+    let out = run(&env, HookEvent::Wait, "stop-active").await;
+    assert!(silent(&out), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // Any other value leaves waking on.
+    let env = Env::of(&d.paths).with("AGENTMAIL_WAKE", "1");
+    let out = run(&env, HookEvent::Wait, "stop").await;
+    assert_eq!(out.exit, 2, "{out:?}");
+}
+
+#[tokio::test]
 async fn wait_respects_no_wake() {
     let d = TestDaemon::start().await;
     let a = register_here(&d, "backend", false).await;
@@ -1010,6 +1030,7 @@ fn cli(paths: &Paths, args: &[&str], payload: &str) -> std::process::Output {
         .env("AGENTMAIL_SOCKET", &paths.socket)
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("OPENCODE_SESSION_ID")
         .env_remove("KIRO_SESSION_ID")
         .env_remove("CLAUDE_PID")
@@ -1114,6 +1135,7 @@ async fn wait_exits_when_its_harness_exits() {
         .env("CLAUDE_CODE_ENTRYPOINT", "cli")
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("CLAUDE_PID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1191,6 +1213,7 @@ async fn wait_does_not_spin_while_it_waits() {
         .env("CLAUDE_CODE_ENTRYPOINT", "cli")
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("CLAUDE_PID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1369,6 +1392,7 @@ async fn harness_exit_between_waits_leaves_no_files() {
         .env("CLAUDE_CODE_ENTRYPOINT", "cli")
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("CLAUDE_PID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -45,6 +45,11 @@ impl Env {
         Env(m)
     }
 
+    fn with(mut self, k: &str, v: &str) -> Env {
+        self.0.insert(k.into(), v.into());
+        self
+    }
+
     fn get(&self, k: &str) -> Option<OsString> {
         self.0.get(k).cloned()
     }
@@ -420,6 +425,22 @@ async fn stop_wakes_once_for_mail_already_there() {
 }
 
 #[tokio::test]
+async fn stop_silent_with_the_global_wake_switch_off() {
+    // Installed with `--kiro-wake` and registered with `wake`, but
+    // `AGENTMAIL_WAKE=0` in kiro's environment: the Stop hook never waits.
+    let d = TestDaemon::start().await;
+    let a = register_here(&d, "backend", true).await;
+    let env = Env::of(&d.paths).with("AGENTMAIL_WAKE", "0");
+    let started = Instant::now();
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert!(silent(&out), "{out:?}");
+    send(&d, &a, "schema", "see the PR", false).await;
+    let out = run_wake(&env, HookEvent::Stop, "stop", true).await;
+    assert!(silent(&out), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
 async fn stop_silent_without_wake() {
     // Installed without `--kiro-wake`: the Stop hook never waits.
     let d = TestDaemon::start().await;
@@ -590,6 +611,7 @@ fn hook_cmd(paths: &Paths, args: &[&str], stdin: &[u8]) -> std::process::Output 
         .env("AGENTMAIL_SOCKET", &paths.socket)
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("AGENTMAIL_BIN")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -721,6 +743,7 @@ fn fake_kiro_stops(
         .env("AGENTMAIL_SOCKET", &paths.socket)
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

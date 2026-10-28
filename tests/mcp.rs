@@ -65,6 +65,7 @@ impl Env {
             .env("AGENTMAIL_SOCKET", self.socket())
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_WAKE")
             .env_remove("AGENTMAIL_BIN")
             .env_remove("OPENCODE_SESSION_ID")
             .env_remove("KIRO_SESSION_ID")
@@ -101,6 +102,7 @@ impl Env {
         let transport = TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|c| {
             // A private kiro config, so the user's never sets the default.
             c.env_remove("AGENTMAIL_KIRO_WAKE")
+                .env_remove("AGENTMAIL_WAKE")
                 .env("KIRO_HOME", self.dir.path().join("kiro"))
                 .envs(vars.iter().copied())
                 .arg("mcp")
@@ -144,6 +146,7 @@ impl Env {
                     .env("AGENTMAIL_SOCKET", self.socket())
                     .env_remove("AGENTMAIL_ADDRESS")
                     .env_remove("AGENTMAIL_HUMAN")
+                    .env_remove("AGENTMAIL_WAKE")
                     .env_remove("AGENTMAIL_BIN")
                     .env_remove("OPENCODE_SESSION_ID")
                     .env_remove("KIRO_SESSION_ID")
@@ -902,6 +905,18 @@ async fn mcp_register_wake_defaults_off_for_kiro() {
     ok(&call(&client, "register", args).await);
     let me = ok(&call(&client, "whoami", json!({})).await);
     assert_eq!(me["agent"]["wake"], true, "{me}");
+    client.cancel().await.unwrap();
+
+    // `AGENTMAIL_WAKE=0` turns waking off for every harness, `wake: true`
+    // and `AGENTMAIL_KIRO_WAKE=1` included.
+    let vars = [("AGENTMAIL_WAKE", "0"), ("AGENTMAIL_KIRO_WAKE", "1")];
+    let client = env.mcp_with(&vars).await;
+    for (name, harness) in [("k3", "kiro"), ("c1", "claude-code"), ("o1", "other")] {
+        let args = json!({"name": name, "harness": harness, "fresh": true, "wake": true});
+        ok(&call(&client, "register", args).await);
+        let me = ok(&call(&client, "whoami", json!({})).await);
+        assert_eq!(me["agent"]["wake"], false, "{harness}: {me}");
+    }
     client.cancel().await.unwrap();
 }
 

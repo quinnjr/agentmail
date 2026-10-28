@@ -22,6 +22,17 @@ pub const ENV_KIRO_SESSION: &str = "KIRO_SESSION_ID";
 /// server that kiro itself started (`kiro_servers_wake`), and falls back
 /// to the installed mcp.json only when no such server is running.
 pub const ENV_KIRO_WAKE: &str = "AGENTMAIL_KIRO_WAKE";
+/// `0` turns waking off for every agent and every harness: the global
+/// switch. Set in the environment a harness runs in (its hooks, MCP server
+/// and shell commands inherit it): agents register with `wake` off, an
+/// explicit `--wake` / `wake: true` included, and the hooks never wait for
+/// mail, whatever an agent registered with ([`wake_disabled`]).
+pub const ENV_WAKE: &str = "AGENTMAIL_WAKE";
+
+/// Whether `env` turns waking off globally: [`ENV_WAKE`]`=0`.
+pub fn wake_disabled(env: impl Fn(&str) -> Option<OsString>) -> bool {
+    env(ENV_WAKE).is_some_and(|v| v == "0")
+}
 
 /// The session variables, in the order [`session_from_env`] reads them.
 const SESSION_VARS: [(&str, Harness); 2] = [
@@ -400,15 +411,29 @@ fn binding_with(
 /// variable, that is [`default_wake_here`]'s check: the variable in the
 /// environment of the agentmail MCP server kiro itself started
 /// (`kiro_servers_wake`), or, only when no such server is running, the
-/// installed mcp.json.
+/// installed mcp.json. Never with [`ENV_WAKE`]`=0` ([`wake_disabled`]).
 pub fn default_wake(
     harness: Harness,
     env: impl Fn(&str) -> Option<OsString>,
     kiro_wake_installed: impl FnOnce() -> bool,
 ) -> bool {
+    if wake_disabled(&env) {
+        return false;
+    }
     harness != Harness::Kiro
         || env(ENV_KIRO_WAKE).is_some_and(|v| v == "1")
         || kiro_wake_installed()
+}
+
+/// The `wake` a registration records: `asked` (`--wake` / `--no-wake`,
+/// MCP `wake`) when given, else `default`; always off with
+/// [`ENV_WAKE`]`=0`.
+pub fn register_wake(
+    asked: Option<bool>,
+    env: impl Fn(&str) -> Option<OsString>,
+    default: impl FnOnce() -> bool,
+) -> bool {
+    !wake_disabled(env) && asked.unwrap_or_else(default)
 }
 
 /// [`default_wake`] for agentmail's MCP server: its own environment only.
@@ -573,6 +598,37 @@ mod tests {
         assert!(!default_wake(Harness::Kiro, unset, || false));
         assert!(!default_wake(Harness::Kiro, zero, || false));
         assert!(default_wake(Harness::Kiro, unset, || true));
+    }
+
+    #[test]
+    fn global_wake_switch_turns_waking_off() {
+        let off = |k: &str| (k == ENV_WAKE).then(|| OsString::from("0"));
+        let on = |k: &str| (k == ENV_WAKE).then(|| OsString::from("1"));
+        let unset = |_: &str| None;
+        let never = || -> bool { panic!("the default was asked") };
+        assert!(wake_disabled(off));
+        assert!(!wake_disabled(on));
+        assert!(!wake_disabled(unset));
+        for h in [
+            Harness::ClaudeCode,
+            Harness::Opencode,
+            Harness::Kiro,
+            Harness::Other,
+        ] {
+            assert!(!default_wake(h, off, never));
+        }
+        let kiro_off = |k: &str| match k {
+            ENV_WAKE => Some(OsString::from("0")),
+            ENV_KIRO_WAKE => Some(OsString::from("1")),
+            _ => None,
+        };
+        assert!(!default_wake(Harness::Kiro, kiro_off, never));
+        // The switch wins over an explicit ask.
+        assert!(!register_wake(Some(true), off, never));
+        assert!(register_wake(Some(true), unset, never));
+        assert!(!register_wake(Some(false), unset, never));
+        assert!(register_wake(None, on, || true));
+        assert!(!register_wake(None, unset, || false));
     }
 
     #[test]

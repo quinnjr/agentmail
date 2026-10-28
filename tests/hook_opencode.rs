@@ -520,6 +520,23 @@ async fn rewait_after_timeout_wakes_for_a_question_that_came_between() {
 }
 
 #[tokio::test]
+async fn global_wake_switch_turns_waking_off() {
+    // `AGENTMAIL_WAKE=0` in opencode's environment (the plugin passes it
+    // on): status reports `wake` off, so the plugin starts no waiter, and
+    // a wait skips even with mail there.
+    let d = TestDaemon::start().await;
+    let a = register(&d, "backend", "ses_a", true).await;
+    send(&d, &a, "schema", false).await;
+    let env = Env::of(&d.paths).with("AGENTMAIL_WAKE", "0");
+    let v = status(&env, "ses_a", false).await;
+    assert_eq!(v["wake"], false, "{v}");
+    let v = joined(spawn_wait(&env, "ses_a", false, None)).await;
+    assert_eq!(v, json!({ "skip": true }));
+    let v = status(&Env::of(&d.paths), "ses_a", false).await;
+    assert_eq!(v["wake"], true, "{v}");
+}
+
+#[tokio::test]
 async fn wait_respects_no_wake() {
     let d = TestDaemon::start().await;
     register(&d, "backend", "ses_a", false).await;
@@ -641,6 +658,7 @@ fn cli(paths: &Paths, args: &[&str], stdin: &str) -> std::process::Output {
         .env("AGENTMAIL_SOCKET", &paths.socket)
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("OPENCODE_SESSION_ID")
         .env_remove("KIRO_SESSION_ID")
         .env_remove("CLAUDE_PID")
@@ -759,6 +777,7 @@ fn cli_daemon_down_prints_empty_status_and_gone() {
                 cmd.env("AGENTMAIL_HUMAN", "1");
             } else {
                 cmd.env_remove("AGENTMAIL_HUMAN");
+                cmd.env_remove("AGENTMAIL_WAKE");
             }
             assert_eq!(
                 stdout_json(&cmd.output().unwrap()),
@@ -808,6 +827,7 @@ async fn cli_wait_ends_on_sigterm_with_nothing_recorded() {
         .env("AGENTMAIL_SOCKET", &d.paths.socket)
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .env_remove("OPENCODE_SESSION_ID")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::Client;
-use crate::identity::ENV_HUMAN;
+use crate::identity::{self, ENV_HUMAN};
 use crate::model::{Harness, Message, Presence, ProcId, SessionKey};
 use crate::paths::Paths;
 use crate::procinfo;
@@ -342,6 +342,9 @@ pub struct Daemon {
     /// When the hook started ([`now_nanos`]), before it connected: a busy
     /// mark newer than this came after the hook was started.
     started: u128,
+    /// Waking is off globally ([`identity::wake_disabled`]): every status
+    /// reports `wake` off, so no hook waits or keeps wait state.
+    wake_off: bool,
 }
 
 impl Daemon {
@@ -367,18 +370,23 @@ impl Daemon {
             paths,
             procs,
             started,
+            wake_off: identity::wake_disabled(env),
         })
     }
 
     /// The agent's [`HookStatus`], marking its urgent mail surfaced when
     /// `surface_urgent`. `None` for no agent (or a signed-off one), or any
-    /// failure.
+    /// failure. `wake` is off, whatever the agent registered with, when
+    /// waking is off globally (`AGENTMAIL_WAKE=0` in the hook's
+    /// environment).
     pub async fn status(&mut self, surface_urgent: bool) -> Option<HookStatus> {
         let call = self
             .client
             .call(&self.caller, Request::HookStatus { surface_urgent });
         let data = tokio::time::timeout(CALL_LIMIT, call).await.ok()?.ok()?;
-        serde_json::from_value(data).ok()
+        let mut status: HookStatus = serde_json::from_value(data).ok()?;
+        status.wake &= !self.wake_off;
+        Some(status)
     }
 
     /// Sign the agent off. `None` for no agent (the session has none), or

@@ -104,6 +104,8 @@ pub enum Command {
         #[arg(long, conflicts_with = "wake")]
         no_wake: bool,
         /// Wake this agent for new mail (the default, except under kiro-cli).
+        /// AGENTMAIL_WAKE=0 in the environment turns waking off for every
+        /// agent, this flag included.
         #[arg(long)]
         wake: bool,
         /// Bind to this process instead of the detected harness process. A
@@ -1629,11 +1631,16 @@ async fn command(s: &mut Session, cmd: Command) -> Result<ExitCode> {
                 (None, Some(k)) => k.harness,
                 (None, None) => detected,
             };
-            let wake = match (wake, no_wake) {
-                (true, _) => true,
-                (_, true) => false,
-                _ => identity::default_wake_here(harness),
+            let asked = match (wake, no_wake) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
             };
+            let wake = identity::register_wake(
+                asked,
+                |k| std::env::var_os(k),
+                || identity::default_wake_here(harness),
+            );
             let req = Request::Register {
                 name,
                 role,

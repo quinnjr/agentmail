@@ -59,6 +59,7 @@ impl Env {
             .env("AGENTMAIL_SOCKET", self.socket())
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_WAKE")
             .env_remove("AGENTMAIL_BIN")
             .env_remove("OPENCODE_SESSION_ID")
             .env_remove("KIRO_SESSION_ID")
@@ -102,6 +103,7 @@ impl Env {
             .env("AGENTMAIL_SOCKET", self.socket())
             .env_remove("AGENTMAIL_ADDRESS")
             .env_remove("AGENTMAIL_HUMAN")
+            .env_remove("AGENTMAIL_WAKE")
             .env_remove("AGENTMAIL_BIN")
             .env_remove("OPENCODE_SESSION_ID")
             .env_remove("KIRO_SESSION_ID")
@@ -964,6 +966,7 @@ fn closed_stdout(env: &Env, args: &[&str]) -> std::process::ExitStatus {
         .env("AGENTMAIL_SOCKET", env.socket())
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_WAKE")
         .current_dir(&env.work)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1449,6 +1452,24 @@ fn register_wake_defaults_off_for_kiro() {
     assert_eq!(v, false);
     // Other harnesses keep waking on by default.
     assert_eq!(wake(&mut reg(env.under("claude"), "c1")), true);
+    // `AGENTMAIL_WAKE=0` turns waking off for every harness, `--wake` and
+    // `AGENTMAIL_KIRO_WAKE=1` included.
+    let off = |c: Command, name: &str| {
+        let mut c = reg(c, name);
+        c.env("AGENTMAIL_WAKE", "0");
+        c
+    };
+    assert_eq!(wake(&mut off(env.under("claude"), "c2")), false);
+    assert_eq!(wake(off(env.under("claude"), "c3").arg("--wake")), false);
+    assert_eq!(wake(&mut off(env.in_session_of("s1"), "o1")), false);
+    assert_eq!(
+        wake(
+            off(env.under("kiro-cli"), "k7")
+                .env("AGENTMAIL_KIRO_WAKE", "1")
+                .arg("--wake")
+        ),
+        false
+    );
     // Both flags at once is a usage error.
     let out = reg(env.under("kiro-cli"), "k6")
         .args(["--wake", "--no-wake"])

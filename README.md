@@ -117,6 +117,30 @@ directory instead of your user config. Run the harness from the same
 `agentmail` binary you installed with: the config records its absolute
 path.
 
+A file `install` creates (rather than edits) gets a marker next to it,
+`<file>.agentmail.created`, listing the directories `install` created for
+it. Later installs and uninstalls trust the marker: a file with one is
+agentmail's, so `uninstall` deletes it (and those directories once empty)
+and `install` never backs it up. Leave the markers alone while agentmail
+is installed. If you delete such a file by hand, delete its marker too:
+otherwise a file you later write at that path is taken for agentmail's,
+and a later `uninstall` may delete it. `uninstall` removes a marker
+together with the file it marks.
+
+`--project` puts these markers and backups in your working tree beside the
+config files, for example `.mcp.json.agentmail.created`,
+`.claude/settings.json.agentmail.created`,
+`opencode.json.agentmail.created`,
+`.opencode/plugins/agentmail.js.agentmail.created`, the ones under
+`.kiro/`, and `<file>.agentmail.bak` for each file you already had. They
+show up as untracked files. Do not commit them. Add them to `.gitignore`
+(or `.git/info/exclude` to keep it to your clone):
+
+```gitignore
+*.agentmail.created
+*.agentmail.bak
+```
+
 | harness | user config (default) | `--project` |
 |---|---|---|
 | Claude Code | hooks in `settings.json`, MCP server in `.claude.json`, both under `$CLAUDE_CONFIG_DIR` when set, else `~/.claude/settings.json` and `~/.claude.json` | `.claude/settings.json`, `.mcp.json` (Claude Code asks you to approve the server the first time) |
@@ -179,6 +203,11 @@ What it does:
 - Never loses a unit of yours: one already there (say, written by hand from
   this README) is saved as `agentmail.service.agentmail.bak` first, and a
   unit agentmail wrote that you have since edited is not replaced at all.
+- Marks a unit it created with `agentmail.service.agentmail.created` next
+  to it (see
+  [Installing into a harness](#installing-into-a-harness)). Later installs
+  and uninstalls trust it: with the marker there, the unit is agentmail's
+  to replace or remove.
 - Notes when your shell sets `AGENTMAIL_DATA_DIR` or `AGENTMAIL_SOCKET`
   differently from the service, with the lines to give the service the same
   (see the drop-in below).
@@ -188,9 +217,19 @@ Put your own settings for the service in a drop-in
 uninstall never touch drop-ins.
 
 `agentmail uninstall --service` disables and stops the service and removes
-the unit (cleaning up after one you already removed by hand). It leaves
-drop-ins and a saved `.agentmail.bak` unit in place, and says how to restore
-the latter.
+the unit and its marker. If you already removed the unit by hand, it still
+cleans up what systemd has left (the running service and the `enable`
+link). It leaves drop-ins and a saved `.agentmail.bak` unit in place, and
+says how to restore the latter.
+
+If you remove the unit by hand, also remove its marker:
+
+```sh
+rm -f ~/.config/systemd/user/agentmail.service.agentmail.created
+```
+
+Otherwise a unit you later write there is taken for agentmail's: a later
+install may replace it, and uninstall may remove it.
 
 Both refuse, changing nothing and printing the steps to do by hand, when the
 systemd user manager is not available, or when it would not see the unit
@@ -572,8 +611,14 @@ Waking is on by default for Claude Code and opencode agents (and for kiro
 agents after `install --kiro-wake`): an agent that has finished just stops,
 and new mail starts its next turn. Turn it off for one agent by registering
 with `agentmail register --no-wake` (MCP: `register` with `wake: false`);
-`--wake` / `wake: true` turns it back on. There is no global switch: per
-agent `--no-wake` and kiro's install-time `--kiro-wake` cover it. A wait
+`--wake` / `wake: true` turns it back on. To turn it off for every agent,
+set `AGENTMAIL_WAKE=0` in the environment you start the harness in (for
+example, export it in your shell profile). The harness's hooks, MCP
+server, plugin and shell commands all inherit it. Agents then register
+with `wake` off, even with `--wake` / `wake: true` or kiro's `--kiro-wake`,
+and no hook waits for mail, even for an agent registered earlier with
+`wake` on. Unset it (or set it to anything else) and restart the harness
+to turn waking back on. A wait
 ends when the agent signs off (`signoff`) or the human takes the session
 back: typing to a Claude Code or opencode agent goes straight through, since
 their waits run outside the turn, and in kiro Esc ends the turn

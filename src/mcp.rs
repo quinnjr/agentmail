@@ -110,7 +110,8 @@ pub struct RegisterParams {
     pub fresh: bool,
     /// Wake this agent for new mail (default true, except under kiro-cli,
     /// where waking is opt-in: false unless agentmail was installed with
-    /// `--kiro-wake`).
+    /// `--kiro-wake`). Always false when AGENTMAIL_WAKE=0 is set for the
+    /// harness.
     #[serde(default)]
     pub wake: Option<bool>,
 }
@@ -533,9 +534,11 @@ impl AgentMailServer {
             cwd,
             proc_id,
             fresh: p.fresh,
-            wake: p
-                .wake
-                .unwrap_or_else(|| crate::identity::default_wake_for_server(harness)),
+            wake: crate::identity::register_wake(
+                p.wake,
+                |k| std::env::var_os(k),
+                || crate::identity::default_wake_for_server(harness),
+            ),
             session: s.0.clone(),
         };
         Ok(match self.request(&s, req).await {
