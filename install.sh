@@ -90,12 +90,13 @@ latest_tag() {
 }
 
 # has_linux <cmd>: <cmd> is on PATH and, under WSL, not on a Windows drive
-# (/mnt/c/...): a Windows tool seen through WSL's appended Windows PATH.
+# (a Windows tool seen through WSL's appended Windows PATH). WSL mounts
+# Windows drives over 9p, wherever wsl.conf's automount root puts them.
 has_linux() {
     p="$(command -v "$1" 2>/dev/null)" || return 1
-    if [ -n "${WSL_DISTRO_NAME:-}" ]; then
-        case "$p" in
-            /mnt/[a-z]/*) return 1 ;;
+    if [ -n "${WSL_DISTRO_NAME:-}" ] && has stat; then
+        case "$(stat -f -c %T "$(dirname "$p")" 2>/dev/null)" in
+            v9fs | 9p | drvfs) return 1 ;;
         esac
     fi
 }
@@ -179,13 +180,13 @@ Run this again with --from-source to build the development branch."
 on_path() {
     case ":$user_path:" in *":$1:"*) return 0 ;; esac
     if [ -n "${WSL_DISTRO_NAME:-}" ] && has setsid && has timeout; then
-        # Through a file, not a pipe: a profile that starts a background
+        # `env` prints PATH colon-separated whatever the shell (fish too),
+        # and into a file, not a pipe: a profile that starts a background
         # job would hold a pipe open past the timeout.
-        PATH="$user_path" timeout 5 setsid "${SHELL:-/bin/sh}" -lc 'echo "$PATH" >"$1"' sh "$tmp/login_path" \
-            </dev/null >/dev/null 2>&1 || true
-        login_path="$(cat "$tmp/login_path" 2>/dev/null || true)"
-        # fish prints its PATH list space-separated.
-        case ":$login_path: " in *":$1:"* | *" $1 "*) return 0 ;; esac
+        PATH="$user_path" timeout 5 setsid "${SHELL:-/bin/sh}" -lc env \
+            </dev/null >"$tmp/login_env" 2>/dev/null || true
+        login_path="$(sed -n 's/^PATH=//p' "$tmp/login_env" 2>/dev/null || true)"
+        case ":$login_path:" in *":$1:"*) return 0 ;; esac
     fi
     return 1
 }

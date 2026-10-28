@@ -31,7 +31,7 @@ example with busybox wget), `--from-source` asks for `--version <tag>`.
 |---|---|---|
 | `--version <tag>` | `AGENTMAIL_VERSION` | Release to install, e.g. `v0.1.0` (default: latest). |
 | `--bin-dir <dir>` | `AGENTMAIL_INSTALL_DIR` | Where to put the binary (default: `~/.local/bin`). |
-| `--harness <name>` | | Afterwards run `agentmail install --harness <name>`. Takes `claude-code`, `opencode` or `kiro`, and can be repeated. `auto` picks every harness whose CLI (`claude`, `opencode`, `kiro-cli`) is on `PATH`, `~/.local/bin` or `~/.cargo/bin` (not Windows tools seen from WSL under `/mnt`). |
+| `--harness <name>` | | Afterwards run `agentmail install --harness <name>`. Takes `claude-code`, `opencode` or `kiro`, and can be repeated. `auto` picks every harness whose CLI (`claude`, `opencode`, `kiro-cli`) is on `PATH`, `~/.local/bin` or `~/.cargo/bin` (not Windows tools seen from WSL). |
 | `--service` | | Afterwards run `agentmail install --service`. |
 | `--from-source` | | Build with cargo instead of downloading. |
 | | `AGENTMAIL_DOWNLOAD_URL` | Download from a mirror instead of `https://github.com/quinnjr/agentmail/releases`. |

@@ -56,6 +56,8 @@ const TOOLS: &[&str] = &[
     "timeout",
     "setsid",
     "sleep",
+    "env",
+    "stat",
 ];
 
 fn triple() -> &'static str {
