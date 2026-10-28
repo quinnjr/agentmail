@@ -442,7 +442,8 @@ How `agentmail hook wait` behaves under it:
   `--`) is `hook`.
 - Its files under `<data dir>/hook-wait/` (`<address>.turn`,
   `<address>.lock`, `<address>.woken`, `<address>.busy`,
-  `<address>.stop`) exist only for agents registered with `wake` (busy
+  `<address>.stop`, and `<address>.shown`, written by kiro's waiting Stop
+  hook; see "kiro-cli V3 hooks") exist only for agents registered with `wake` (busy
   marks and stop records are written only for those). The daemon removes them, with any temporary
   `<address>.<kind>.<pid>-<nanos>` file a crashed write left, when the
   agent becomes gone: on sign-off, on a registration that unbinds it, and

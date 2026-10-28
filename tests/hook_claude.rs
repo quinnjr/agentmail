@@ -213,7 +213,10 @@ async fn human_is_silent() {
 async fn daemon_down_is_silent_and_spawns_nothing() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
-    let env = Env::of(&paths).with("AGENTMAIL_BIN", "/nonexistent/agentmail");
+    // In process, a spawn would not show here (it would start this test
+    // binary, which makes no socket): `cli_hook_daemon_down_is_silent`
+    // runs the real binary and is the test that catches one.
+    let env = Env::of(&paths);
     for (event, payload) in ALL_EVENTS {
         let started = Instant::now();
         let out = run(&env, event, payload).await;
@@ -1010,6 +1013,7 @@ fn cli(paths: &Paths, args: &[&str], payload: &str) -> std::process::Output {
         .env_remove("OPENCODE_SESSION_ID")
         .env_remove("KIRO_SESSION_ID")
         .env_remove("CLAUDE_PID")
+        .env_remove("AGENTMAIL_BIN")
         .env("CLAUDE_CODE_ENTRYPOINT", "cli")
         .write_stdin(fixture(payload))
         .timeout(Duration::from_secs(20))

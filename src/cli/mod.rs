@@ -55,7 +55,7 @@ pub struct Cli {
     /// (or set AGENTMAIL_HUMAN=1).
     #[arg(long = "as", global = true, value_name = "WHO", value_parser = [HUMAN])]
     pub as_who: Option<String>,
-    /// Print the daemon's JSON instead of human-readable output.
+    /// Print machine-readable JSON instead of human-readable output.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]

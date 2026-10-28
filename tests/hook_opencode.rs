@@ -299,7 +299,10 @@ async fn status_empty_when_unregistered() {
 async fn status_empty_when_daemon_down_and_spawns_nothing() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
-    let env = Env::of(&paths).with("AGENTMAIL_BIN", "/nonexistent/agentmail");
+    // In process, a spawn would not show here (it would start this test
+    // binary, which makes no socket): `cli_daemon_down_prints_empty_status_and_gone`
+    // runs the real binary and is the test that catches one.
+    let env = Env::of(&paths);
     assert_eq!(status(&env, "ses_a", true).await, json!({}));
     let wait = joined(spawn_wait(&env, "ses_a", false, None)).await;
     assert_eq!(wait, json!({ "gone": true }));
@@ -750,6 +753,7 @@ fn cli_daemon_down_prints_empty_status_and_gone() {
                 .env("AGENTMAIL_SOCKET", &paths.socket)
                 .env_remove("AGENTMAIL_ADDRESS")
                 .env_remove("OPENCODE_SESSION_ID")
+                .env_remove("AGENTMAIL_BIN")
                 .timeout(Duration::from_secs(20));
             if env_human {
                 cmd.env("AGENTMAIL_HUMAN", "1");

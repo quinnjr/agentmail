@@ -45,11 +45,6 @@ impl Env {
         Env(m)
     }
 
-    fn with(mut self, k: &str, v: &str) -> Env {
-        self.0.insert(k.into(), v.into());
-        self
-    }
-
     fn get(&self, k: &str) -> Option<OsString> {
         self.0.get(k).cloned()
     }
@@ -176,7 +171,10 @@ async fn unregistered_silent() {
 async fn daemon_down_is_silent_and_spawns_nothing() {
     let dir = TempDir::new().unwrap();
     let paths = Paths::in_dir(dir.path());
-    let env = Env::of(&paths).with("AGENTMAIL_BIN", "/nonexistent/agentmail");
+    // In process, a spawn would not show here (it would start this test
+    // binary, which makes no socket): `cli_hook_daemon_down_is_silent`
+    // runs the real binary and is the test that catches one.
+    let env = Env::of(&paths);
     for (event, payload) in ALL_EVENTS {
         let started = Instant::now();
         let out = run_wake(&env, event, payload, true).await;
@@ -592,6 +590,7 @@ fn hook_cmd(paths: &Paths, args: &[&str], stdin: &[u8]) -> std::process::Output 
         .env("AGENTMAIL_SOCKET", &paths.socket)
         .env_remove("AGENTMAIL_ADDRESS")
         .env_remove("AGENTMAIL_HUMAN")
+        .env_remove("AGENTMAIL_BIN")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -635,6 +634,32 @@ async fn cli_exit_codes_and_streams() {
     .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains(&q));
+}
+
+#[test]
+fn cli_hook_daemon_down_is_silent() {
+    // Through the binary: a hook that spawned a daemon would run this
+    // `agentmail`, whose daemon would make the socket and lock.
+    let dir = TempDir::new().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    for args in [
+        &["session-start", "--harness", "kiro"][..],
+        &["prompt", "--harness", "kiro"][..],
+        &["pre-tool", "--harness", "kiro"][..],
+        &["post-tool", "--harness", "kiro"][..],
+        &["stop", "--harness", "kiro"][..],
+        &["stop", "--harness", "kiro", "--wake"][..],
+    ] {
+        let started = Instant::now();
+        let out = hook_cmd(&paths, args, &fixture(args[0]));
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{args:?}");
+    }
+    assert!(!paths.socket.exists(), "a daemon socket appeared");
+    assert!(!paths.lock.exists(), "a daemon lock appeared");
+    assert!(!paths.db.exists(), "a database appeared");
 }
 
 #[test]
