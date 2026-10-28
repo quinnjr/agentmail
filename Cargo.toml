@@ -29,3 +29,6 @@ ulid = { version = "3", features = ["serde"] }
 assert_cmd = "2"
 tempfile = "3"
 rmcp = { version = "3.7", features = ["client", "transport-child-process"] }
+
+[profile.release]
+strip = true

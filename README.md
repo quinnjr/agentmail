@@ -46,14 +46,43 @@ backend-k3v9x2qa → frontend-x7p2m4qa   [answer]
 
 ## Quick start
 
-```sh
-# 1. Install the binary
-cargo install --git https://github.com/quinnjr/agentmail
+1. Install the binary.
 
-# 2. Wire it into your harness (MCP server and hooks, or the opencode plugin)
-agentmail install --harness claude-code --dry-run   # see what it would change
-agentmail install --harness claude-code             # or: opencode, kiro
-```
+   **Linux or WSL:**
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/quinnjr/agentmail/main/install.sh | sh
+   ```
+
+   **Windows** (PowerShell) installs into WSL, where your agents run:
+
+   ```powershell
+   irm https://raw.githubusercontent.com/quinnjr/agentmail/main/install.ps1 | iex
+   ```
+
+   or from `cmd.exe`:
+
+   ```bat
+   curl -fsSLo "%TEMP%\agentmail-install.cmd" https://raw.githubusercontent.com/quinnjr/agentmail/main/install.cmd && "%TEMP%\agentmail-install.cmd"
+   ```
+
+   The script downloads the static binary for your CPU (x86_64 or
+   aarch64), checks its SHA-256 and puts it in `~/.local/bin`. With Rust
+   installed you can build a release instead:
+   `cargo install --locked --git https://github.com/quinnjr/agentmail --tag <version>`
+   (without `--tag`, cargo builds the development branch).
+
+2. Wire it into your harness (the MCP server and hooks, or the opencode
+   plugin):
+
+   ```sh
+   agentmail install --harness claude-code --dry-run   # see what it would change
+   agentmail install --harness claude-code             # or: opencode, kiro
+   ```
+
+   To do steps 1 and 2 in one go, for every harness on your `PATH`, run
+   `curl -fsSL .../install.sh | sh -s -- --harness auto`. The installer
+   options are in [docs/install.md](docs/install.md#installing-the-binary).
 
 3. Start two sessions and tell each one who it is and who its partner is:
 
@@ -190,7 +219,7 @@ take a waiting session back, just type to it. In kiro, press Esc.
 
 ## Documentation
 
-- [Installing into a harness](docs/install.md): what `install` changes,
+- [Installing](docs/install.md): the install scripts, what `agentmail install` changes,
   `--project`, `--dry-run`, `uninstall`, and manual MCP setup.
 - [Identity](docs/identity.md): addresses, name resolution, how sessions
   are bound, and reclaiming an address.

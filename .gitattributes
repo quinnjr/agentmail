@@ -1,0 +1,2 @@
+install.cmd -text
+install.sh text eol=lf
