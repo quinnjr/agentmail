@@ -826,18 +826,13 @@ mod tests {
     /// records; there is nothing to wait for, so it is not read again.
     #[tokio::test]
     async fn an_empty_lock_file_is_no_record_at_once() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let paths = Paths::in_dir(dir.path());
-        std::fs::write(&paths.lock, b"").unwrap();
-        let lock = std::fs::File::open(&paths.lock).unwrap();
-        lock.try_lock().unwrap();
-        let began = Instant::now();
-        assert_eq!(settled_lock_record(&paths).await, None);
-        assert!(
-            began.elapsed() < RECORD_REREAD_INTERVAL,
-            "read again for {:?}",
-            began.elapsed()
-        );
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Some(Vec::new())
+        };
+        assert_eq!(settled_record(read, || true, true).await, None);
+        assert_eq!(reads.get(), 1, "read again");
     }
 
     /// A daemon that has removed its socket (it is draining) still counts

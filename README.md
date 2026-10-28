@@ -92,15 +92,14 @@ explicitly answers it.
 
 ```sh
 agentmail install --harness claude-code|opencode|kiro [--project] [--dry-run] [--json]
-                  [--kiro-wake] [--set-default]
+                  [--kiro-wake]
 agentmail uninstall --harness claude-code|opencode|kiro [--project] [--dry-run] [--json]
 agentmail install|uninstall --service [--dry-run] [--json]
 ```
 
-`--kiro-wake` and `--set-default` are for kiro only (see the notes below);
-`--service` installs (or removes) the daemon's systemd user unit instead of
-a harness and takes none of `--harness`, `--project`, `--kiro-wake` or
-`--set-default` (see
+`--kiro-wake` is for kiro only (see the notes below); `--service`
+installs (or removes) the daemon's systemd user unit instead of a harness
+and takes none of `--harness`, `--project` or `--kiro-wake` (see
 [Running the daemon under systemd](#running-the-daemon-under-systemd)).
 `--json` prints the result as JSON.
 
@@ -131,8 +130,8 @@ Notes:
   kiro agent is off unless you install with `--kiro-wake` (see
   [Harness support](#harness-support)). Install at one scope only: kiro
   loads the user's and a trusted workspace's hooks together, so both would
-  run every hook twice. `--set-default` is accepted and changes nothing:
-  kiro V3 loads agentmail's hooks for every agent.
+  run every hook twice. There is no agentmail agent to make kiro's
+  default: kiro V3 loads agentmail's hooks for every agent.
 - **opencode `codemode`.** agentmail's server is installed with
   `codemode: false`, so the agent calls its tools directly rather than
   from code passed to opencode's `execute` tool. opencode adds a server's
@@ -141,7 +140,7 @@ Notes:
   all of the server's tools are denied. opencode connects MCP servers
   only when a directory's first session starts, so that session's first
   turn runs without the instructions; they are added at its next turn.
-  A `opencode.jsonc` with comments is never rewritten: install prints the
+  An `opencode.jsonc` with comments is never rewritten: install prints the
   entry to add by hand instead. opencode picks up the change without a
   restart.
 
@@ -561,7 +560,7 @@ by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses).
 | MCP server and tools | yes | yes (installed with `codemode: false`) | yes |
 | Agent guidance via MCP `instructions` | yes | yes, in code mode too (a directory's first session gets it from its second turn) | yes (kiro keeps the first 2048 characters) |
 | Agent identity | by process (one address per `claude` process) | by session (one address per session) | by process (the nearest `kiro-cli`) |
-| Who-you-are and unread reminder at session start and on each prompt | yes (`SessionStart`, `UserPromptSubmit`) | no prompt hook in opencode 2.0.27: the agent learns its address from `register`, reminders start after its first tool call | yes (`SessionStart`, `UserPromptSubmit`) |
+| Who-you-are and unread reminder at session start and on each prompt | yes (`SessionStart`, `UserPromptSubmit`) | no (opencode 2.0.27 has no context hook, and its `prompt` hook would rewrite the human's own message): the agent learns its address from `register`, and reminders start after its first tool call | yes (`SessionStart`, `UserPromptSubmit`) |
 | Unread-mail reminder between steps | yes (`PostToolUse`, also for failed calls) | yes (appended to each tool result) | no (kiro ignores `PostToolUse` output); at the next prompt instead |
 | Urgent mail surfaced mid-run, once | yes, at the next tool call | yes, steered into the running turn | yes: the next tool call is held once with the mail, then can run again |
 | Open questions kept in front of the agent at stop | yes (Stop hook blocks, not twice in a row) | yes (queued as one more turn) | yes (Stop hook continues the turn once per prompt) |

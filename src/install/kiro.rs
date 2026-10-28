@@ -367,8 +367,7 @@ pub(super) fn plan(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<Chan
 /// What `install` tells the user about kiro: the V3-only warning, that
 /// agentmail's hooks are installed at the other scope too (kiro loads a
 /// workspace's hooks alongside the user's, so each would run twice), what
-/// waking costs (`--kiro-wake`), and that `--set-default` has nothing to
-/// do.
+/// waking costs (`--kiro-wake`).
 pub(super) fn notes(o: &InstallOpts, env: &Env, install: bool) -> Vec<String> {
     if !install {
         return Vec::new();
@@ -392,13 +391,6 @@ pub(super) fn notes(o: &InstallOpts, env: &Env, install: bool) -> Vec<String> {
         notes.push(
             "note: kiro-cli waking is on: after each turn the Stop hook waits for mail, \
              and kiro holds what you type until mail comes or you press Esc"
-                .to_string(),
-        );
-    }
-    if o.set_default {
-        notes.push(
-            "note: --set-default changes nothing: kiro-cli V3 loads hooks/agentmail.json \
-             for every agent, so there is no agentmail agent to make the default"
                 .to_string(),
         );
     }

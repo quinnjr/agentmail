@@ -328,7 +328,7 @@ pub enum Command {
         /// write `~/.config/systemd/user/agentmail.service` (honouring
         /// XDG_CONFIG_HOME), enable and start the unit, and stop the daemon
         /// started on demand, if one runs.
-        #[arg(long, conflicts_with_all = ["project", "set_default", "kiro_wake"])]
+        #[arg(long, conflicts_with_all = ["project", "kiro_wake"])]
         service: bool,
         /// Install into the current project instead of your user config.
         #[arg(long)]
@@ -336,11 +336,6 @@ pub enum Command {
         /// Show the changes as a diff without making them.
         #[arg(long)]
         dry_run: bool,
-        /// Make agentmail's agent the harness's default (kiro only; kiro-cli
-        /// V3 loads agentmail's hooks for every agent, so this changes
-        /// nothing).
-        #[arg(long)]
-        set_default: bool,
         /// kiro only: wake idle agents for new mail. The Stop hook then waits
         /// after each turn, and kiro holds what you type until it ends or
         /// you press Esc, so it is off by default.
@@ -831,7 +826,6 @@ fn restart_hint(
 struct InstallFlags {
     project: bool,
     dry_run: bool,
-    set_default: bool,
     kiro_wake: bool,
 }
 
@@ -842,7 +836,6 @@ fn install(harness: &str, flags: InstallFlags, uninstall: bool, json: bool) -> R
     let InstallFlags {
         project,
         dry_run,
-        set_default,
         kiro_wake,
     } = flags;
     let harness = harness_from(harness)?;
@@ -851,7 +844,6 @@ fn install(harness: &str, flags: InstallFlags, uninstall: bool, json: bool) -> R
         harness,
         project,
         dry_run,
-        set_default,
         kiro_wake,
         bin,
     };
@@ -1443,7 +1435,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             service,
             project,
             dry_run,
-            set_default,
             kiro_wake,
         } => {
             let Some(harness) = harness.filter(|_| !service) else {
@@ -1460,21 +1451,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 );
                 return Ok(clap_exit(&e));
             }
-            if set_default && harness != "kiro" {
-                use clap::CommandFactory;
-                let e = Cli::command().error(
-                    clap::error::ErrorKind::ArgumentConflict,
-                    format!(
-                        "--set-default applies only to --harness kiro; {harness} has no \
-                         default agent to set, drop --set-default"
-                    ),
-                );
-                return Ok(clap_exit(&e));
-            }
             let flags = InstallFlags {
                 project,
                 dry_run,
-                set_default,
                 kiro_wake,
             };
             return install(&harness, flags, false, cli.json);

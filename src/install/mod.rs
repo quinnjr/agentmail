@@ -39,10 +39,6 @@ pub struct InstallOpts {
     pub project: bool,
     /// Show the changes without making them.
     pub dry_run: bool,
-    /// Make agentmail's agent the harness's default (kiro only). kiro-cli
-    /// V3 loads agentmail's hooks file for every agent, so this changes
-    /// nothing; install says so.
-    pub set_default: bool,
     /// kiro only: install the Stop hook that waits for mail to wake an
     /// idle agent, and have kiro agents register with `wake` on.
     pub kiro_wake: bool,
@@ -138,7 +134,7 @@ pub fn plan_uninstall(o: &InstallOpts, env: &Env) -> Result<Vec<Change>> {
 /// uninstalling agentmail for `o.harness`, from the files as they are
 /// before the change: for opencode, when the agentmail plugin that runs is
 /// not the one this command installs or removes; for kiro, that only its V3
-/// engine is supported, and what `--kiro-wake` and `--set-default` do.
+/// engine is supported, and what `--kiro-wake` does.
 pub fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
     match o.harness {
         Harness::Opencode => opencode::notes(o, env, install),

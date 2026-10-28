@@ -420,14 +420,14 @@ How `agentmail hook wait` behaves under it:
   time the wait looks (just after its delivery) does not count.
 - It exits 0 when the agent turns `wake` off (registers again with
   `--no-wake`; the registration publishes a presence event, and every
-  status re-read checks it), when the agent signs off, when the daemon stops, when a
-  process it runs under (Claude Code) exits, or when the agent is gone
-  because its Claude Code process was registered as another agent
-  (`agentmail register --pid`): the daemon then publishes the unbound
-  agent as gone, and a status re-read that names another agent also ends
-  the wait, so it never wakes the session with the other agent's mail; it checks the processes and
-  the turn file every 0.5 s and otherwise sleeps on the daemon's event
-  stream (no polling of mail).
+  status re-read checks it), when the agent signs off, when the daemon
+  stops, when a process it runs under (Claude Code) exits, or when the
+  agent is gone because its Claude Code process was registered as another
+  agent (`agentmail register --pid`): the daemon then publishes the
+  unbound agent as gone, and a status re-read that names another agent
+  also ends the wait, so it never wakes the session with the other
+  agent's mail; it checks the processes and the turn file every 0.5 s and
+  otherwise sleeps on the daemon's event stream (no polling of mail).
 - A `hook` command line this binary cannot parse (a newer config, an older
   binary) exits 0 and prints nothing (the usage error only when stderr is
   a terminal, for a person running it by hand), so it never blocks a stop
@@ -443,8 +443,9 @@ How `agentmail hook wait` behaves under it:
 - Its files under `<data dir>/hook-wait/` (`<address>.turn`,
   `<address>.lock`, `<address>.woken`, `<address>.busy`,
   `<address>.stop`, and `<address>.shown`, written by kiro's waiting Stop
-  hook; see "kiro-cli V3 hooks") exist only for agents registered with `wake` (busy
-  marks and stop records are written only for those). The daemon removes them, with any temporary
+  hook; see "kiro-cli V3 hooks") exist only for agents registered with
+  `wake` (busy marks and stop records are written only for those). The
+  daemon removes them, with any temporary
   `<address>.<kind>.<pid>-<nanos>` file a crashed write left, when the
   agent becomes gone: on sign-off, on a registration that unbinds it, and
   the first time a listing or lookup finds its process dead. It remembers
@@ -533,8 +534,9 @@ Checked live against Claude Code 2.1.311 in a throwaway
 - A backup is written to a temporary file and hard-linked into place, so
   a failed write never leaves a partial `<file>.agentmail.bak` (which
   would stop the real original from ever being saved).
-- `--set-default` is kiro-only; with another harness it is a usage error
-  (exit 2).
+- There is no `--set-default`: the plan gave it a job only in the kiro
+  agent-file fallback, and spike (a) showed a standalone hooks file works
+  for every agent (see "kiro-cli V3 hooks"), so it was dropped.
 
 ### Hook identity
 
@@ -999,8 +1001,8 @@ config schema and exit-code rules come from the engine bundle
   is in seconds, default 60; `0` means none. A workspace's
   `.kiro/hooks/*.json` is loaded too (seen live in a git repo, with `-a`;
   the engine runs hook commands only in a trusted workspace). The engine
-  watches `.kiro/hooks` and reloads. `--set-default` therefore has nothing
-  to do: install says so and changes no default agent.
+  watches `.kiro/hooks` and reloads. agentmail therefore needs no agent of
+  its own and no default agent, and `install` has no `--set-default`.
 - **MCP.** `$KIRO_HOME/settings/mcp.json` (and a workspace's
   `.kiro/settings/mcp.json`) `mcpServers.agentmail = {"command", "args"}`
   is started by the V3 engine with the server's `env` added to kiro's own

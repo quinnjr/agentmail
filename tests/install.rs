@@ -63,7 +63,6 @@ fn opts(project: bool, bin: &str) -> InstallOpts {
         harness: Harness::ClaudeCode,
         project,
         dry_run: false,
-        set_default: false,
         kiro_wake: false,
         bin: PathBuf::from(bin),
     }
@@ -959,22 +958,6 @@ fn cli_install_and_uninstall() {
     assert!(!h.user_mcp().exists());
     assert!(!bak(&h.settings()).exists());
     assert!(!bak(&h.user_mcp()).exists());
-}
-
-#[test]
-fn cli_set_default_is_kiro_only() {
-    let h = Home::new();
-    let out = cli(&h)
-        .args(["install", "--harness", "claude-code", "--set-default"])
-        .assert()
-        .code(2)
-        .get_output()
-        .stderr
-        .clone();
-    let err = String::from_utf8(out).unwrap();
-    assert!(err.contains("--set-default"), "{err}");
-    assert!(!h.settings().exists());
-    assert!(!h.user_mcp().exists());
 }
 
 #[test]
@@ -2875,25 +2858,6 @@ fn cli_kiro_wake_is_kiro_only() {
     // Waking holds what the human types until Esc: the install says so.
     assert!(out.contains("Esc"), "{out}");
     assert!(read(&h.kiro_hooks()).contains("--wake"));
-}
-
-#[test]
-fn cli_kiro_set_default_changes_nothing() {
-    // kiro V3 loads hooks/agentmail.json for every agent (spike), so there
-    // is no agent of agentmail's to make the default.
-    let h = Home::new();
-    let out = cli(&h)
-        .env_remove("KIRO_HOME")
-        .args(["install", "--harness", "kiro", "--set-default"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let out = String::from_utf8(out).unwrap();
-    assert!(out.contains("--set-default"), "{out}");
-    assert!(!h.kiro_dir().join("agents").exists());
-    assert!(!h.kiro_dir().join("settings/cli.json").exists());
 }
 
 // ---- Task 9: `install --service` -------------------------------------------
