@@ -1220,7 +1220,7 @@ Deviations from the plan, and why:
   `systemctl --user show -p Environment agentmail`) and
   `EnvironmentFile=`s over it, read again once the second look runs
   (systemd has then loaded the unit and its drop-ins). Otherwise a
-  service given a data directory by a drop-in, the README's way, would
+  service given a data directory by a drop-in, docs/daemon.md's way, would
   wait behind an on-demand daemon there that install never stopped. A
   daemon records itself in the lock file a moment after taking the lock,
   so a record whose process is gone, a lock file still empty, or a record
@@ -1257,7 +1257,7 @@ Deviations from the plan, and why:
   `ExecStart`, or the one it wrote over a unit of the user's kept as the
   backup, recognised by an `ExecStart` path in the form agentmail writes
   (absolute, `%` doubled, quoted only when needed). Every other unit is
-  the user's, including the README's unit written by hand (`%h/...`): it
+  the user's, including docs/daemon.md's unit written by hand (`%h/...`): it
   is saved as the backup before install replaces it or uninstall removes
   it, and both refuse when the backup already keeps a different unit. A
   hand-written unit identical to what agentmail would write for some
@@ -1314,7 +1314,7 @@ Deviations from the plan, and why:
 
 ## Real-harness e2e (Task 10)
 
-`scripts/e2e.sh <claude-code|opencode|kiro|mixed>` (see the README). Run on
+`scripts/e2e.sh <claude-code|opencode|kiro|mixed>` (see docs/testing.md). Run on
 2026-10-27 against Claude Code 2.1.312 (`--model haiku`), opencode 2.0.27
 (`opencode/big-pickle`, a free model) and kiro-cli 2.32.0 (`chat --v3`,
 default model), each in a throwaway home, with the release build. All
@@ -1378,7 +1378,7 @@ process was left behind.
   daemon, the login copies); a cargo test would only shell out to the
   script and add a second way to run it, with `cargo test -- --ignored`
   then also starting paid model runs. `cargo test` stays hermetic, and
-  the e2e is run by hand per harness as described in the README.
+  the e2e is run by hand per harness as described in docs/testing.md.
 
 - **Logins.** Claude Code's `.credentials.json` and kiro-cli's
   `data.sqlite3` were copied into the throwaway home with their refresh

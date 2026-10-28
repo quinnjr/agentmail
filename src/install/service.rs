@@ -1,7 +1,7 @@
 //! `agentmail install --service` / `uninstall --service`: run the daemon
 //! as a systemd user service.
 //!
-//! Install writes the unit from the README (its "Running the daemon under
+//! Install writes the unit from docs/daemon.md (its "Running the daemon under
 //! systemd" section, verbatim but for `ExecStart`, which runs this binary),
 //! has systemd load the unit, enable it and start it, then stops the daemon
 //! started on demand, if one runs, so that the service's takes over. Uninstall disables
@@ -23,7 +23,7 @@ use super::{Change, Env, backup_path, created_marker_path, read_opt, shell_quote
 /// The unit's name, as `systemctl` takes it.
 pub const NAME: &str = "agentmail";
 
-/// The README's unit, `ExecStart` aside (`{exec}`).
+/// docs/daemon.md's unit, `ExecStart` aside (`{exec}`).
 const UNIT: &str = "\
 [Unit]
 Description=agentmail local agent mail daemon
@@ -580,7 +580,7 @@ fn generated_exec(text: &str) -> Option<&str> {
 
 /// Whether `exec` is an `ExecStart` binary agentmail writes (see
 /// [`exec_arg`]): an absolute path with every `%` doubled, quoted only
-/// when it must be. Not, say, the README's `%h/.cargo/bin/agentmail`.
+/// when it must be. Not, say, docs/daemon.md's `%h/.cargo/bin/agentmail`.
 fn written_exec(exec: &str) -> bool {
     let unquoted = match exec.strip_prefix('"').and_then(|e| e.strip_suffix('"')) {
         Some(inner) => {
@@ -702,10 +702,10 @@ pub fn environment_line(k: &str, v: &str) -> String {
 /// created (its marker says so; whatever its `ExecStart`), or the one it
 /// wrote over a unit of the user's, which is kept as the backup (its
 /// `ExecStart` one agentmail writes, see `written_exec`). Any other
-/// unit is the user's, also one written by hand from the README: install
+/// unit is the user's, also one written by hand from docs/daemon.md: install
 /// saves it as the backup, replacing any older backup of agentmail's, and
 /// uninstall saves it as the backup before removing it when it matches
-/// the README's unit (see [`is_generated`]) or agentmail created it (it
+/// docs/daemon.md's unit (see [`is_generated`]) or agentmail created it (it
 /// was then edited). Both refuse when a different earlier unit is kept as
 /// the backup, and uninstall refuses to remove any other unit.
 pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
@@ -776,7 +776,7 @@ pub fn plan(bin: &Path, env: &Env, install: bool) -> Result<Vec<Change>> {
         // install recorded.
         c.record_anew = true;
     } else if backup.is_none() && (generated.is_some() || created) {
-        // The README's unit, written by hand, or agentmail's with the
+        // docs/daemon.md's unit, written by hand, or agentmail's with the
         // user's edits: removed, but kept.
         c.save = Some(bak);
     } else if !saved {
@@ -924,7 +924,7 @@ fn fragment(env: &Env) -> Result<Option<PathBuf>> {
 /// Install, with the service running and its unit file already as
 /// agentmail would write it for `bin`: whether the running service is
 /// still on something else, so that it must be restarted all the same
-/// (say, a previous install wrote the unit over the README's, then its
+/// (say, a previous install wrote the unit over docs/daemon.md's, then its
 /// `daemon-reload`, `enable` or `try-restart` failed). It is when systemd
 /// has no unit file for it loaded (`LoadState=not-found`), has not
 /// reloaded the file since it changed (`NeedDaemonReload=yes`), loads it

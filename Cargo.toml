@@ -2,6 +2,13 @@
 name = "agentmail"
 version = "0.1.0"
 edition = "2024"
+description = "Local mail for coding agents: lets Claude Code, opencode and kiro-cli sessions message each other, ask blocking questions and wake each other up"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quinnjr/agentmail"
+homepage = "https://github.com/quinnjr/agentmail"
+readme = "README.md"
+keywords = ["ai-agents", "mcp", "claude-code", "multi-agent", "messaging"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"

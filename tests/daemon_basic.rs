@@ -2420,7 +2420,7 @@ async fn second_signal_during_a_requested_shutdown_exits_without_waiting() {
     let _ = slow.await;
 }
 
-/// The README's recovery step: with a unit daemon (`--wait-for-lock`)
+/// docs/daemon.md's recovery step: with a unit daemon (`--wait-for-lock`)
 /// waiting behind an on-demand one, `daemon stop` stops the on-demand
 /// daemon and reports success, although the unit's daemon takes the lock
 /// at once. Stopping while the unit's daemon still retries the lock every

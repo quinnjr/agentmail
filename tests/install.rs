@@ -2862,14 +2862,14 @@ fn cli_kiro_wake_is_kiro_only() {
 
 // ---- Task 9: `install --service` -------------------------------------------
 
-/// The systemd unit in the README's "Running the daemon under systemd"
+/// The systemd unit in docs/daemon.md's "Running the daemon under systemd"
 /// section.
 fn readme_unit() -> String {
-    let readme = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"));
-    let section = readme
-        .split("### Running the daemon under systemd")
+    let doc = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/daemon.md"));
+    let section = doc
+        .split("## Running the daemon under systemd")
         .nth(1)
-        .expect("README has the systemd section");
+        .expect("docs/daemon.md has the systemd section");
     let block = section
         .split("```ini\n")
         .nth(1)
@@ -2878,7 +2878,7 @@ fn readme_unit() -> String {
 }
 
 #[test]
-fn service_unit_content_matches_readme() {
+fn service_unit_content_matches_docs() {
     let bin = Path::new("/opt/agentmail/bin/agentmail");
     let want: String = readme_unit()
         .lines()
@@ -4197,7 +4197,7 @@ fn service_restarts_a_replaced_unit() {
 
 #[test]
 fn service_rerun_after_a_failed_install_restarts_the_service() {
-    // Install replaces the README's unit while the service runs on it, and
+    // Install replaces docs/daemon.md's unit while the service runs on it, and
     // fails before the service is restarted onto agentmail's unit: running
     // it again, as the error says, finishes it with the restart, though
     // the unit file is already as it should be.
@@ -4379,7 +4379,7 @@ fn service_uninstall_leaves_a_unit_agentmail_did_not_write() {
 
 #[test]
 fn service_uninstall_removes_the_readme_unit() {
-    // The README's unit, written by hand (whatever binary it runs), is
+    // docs/daemon.md's unit, written by hand (whatever binary it runs), is
     // removed, but kept as the backup first, with how to put it back.
     for text in [
         readme_unit(),
@@ -4414,7 +4414,7 @@ fn service_uninstall_removes_the_readme_unit() {
 
 #[test]
 fn service_install_keeps_a_readme_unit_written_by_hand() {
-    // The README's unit, written by hand (its ExecStart `%h/...`, no
+    // docs/daemon.md's unit, written by hand (its ExecStart `%h/...`, no
     // marker): install keeps it as the backup, and uninstall says how to
     // put it back.
     let s = ServiceHome::new();
@@ -4462,7 +4462,7 @@ fn service_install_keeps_a_readme_unit_written_by_hand() {
 
 #[test]
 fn service_never_drops_a_readme_unit_over_an_earlier_kept_unit() {
-    // An earlier unit X is kept as the backup, and the README's unit was
+    // An earlier unit X is kept as the backup, and docs/daemon.md's unit was
     // written by hand in place of agentmail's: neither install nor
     // uninstall discards either.
     let s = ServiceHome::new();
@@ -4655,7 +4655,7 @@ fn service_install_keeps_a_unit_already_kept() {
 
 #[test]
 fn service_environment_in_a_drop_in_survives_install_and_uninstall() {
-    // The README's way to give the service a data directory: a drop-in,
+    // docs/daemon.md's way to give the service a data directory: a drop-in,
     // which install and uninstall never touch, so a second install (here,
     // run by another path, which changes `ExecStart`) keeps it applying.
     let s = ServiceHome::new();
@@ -4697,7 +4697,7 @@ fn service_environment_in_a_drop_in_survives_install_and_uninstall() {
 
 #[test]
 fn service_notes_settings_of_a_replaced_unit() {
-    // A unit of the user's (the README's, written by hand) with an
+    // A unit of the user's (docs/daemon.md's, written by hand) with an
     // `Environment=` line: install keeps it as the backup and says the
     // service no longer gets that line, and where to put it.
     let s = ServiceHome::new();
@@ -4725,7 +4725,7 @@ fn service_notes_settings_of_a_replaced_unit() {
         "{out}"
     );
     assert!(out.contains("systemctl --user edit agentmail"), "{out}");
-    // The README's unit as is sets nothing more: no note.
+    // docs/daemon.md's unit as is sets nothing more: no note.
     let s = ServiceHome::new();
     write(&s.unit(), &readme_unit());
     let out = s
