@@ -76,7 +76,7 @@ pub fn session_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<Sessio
 /// as it was started) does not count either: it was inherited from an
 /// outer session (opencode started from another opencode's bash tool), and
 /// the harness passes it on to everything it starts, not only its shell
-/// commands. This is the rule [`launched_from_harness_shell`] applies.
+/// commands. This is the rule `launched_from_harness_shell` applies.
 pub fn session_for(
     var: impl Fn(&str) -> Option<OsString>,
     nearest: Option<(ProcId, Harness)>,
@@ -261,7 +261,7 @@ fn register_proc_for(me: u32, explicit_pid: Option<u32>) -> Option<(ProcId, Harn
 /// kiro or opencode process above it) applies only when that harness
 /// started the server itself, not when the server belongs to some other
 /// MCP client run from the harness's shell
-/// ([`launched_from_harness_shell`]). Such a client (another agent tool, an
+/// (`launched_from_harness_shell`). Such a client (another agent tool, an
 /// MCP inspector) binds its own process, as under Claude Code: redirected,
 /// it would bind kiro-cli and take over the agent kiro's own server
 /// registered, or bind opencode and be refused as a sessionless call on
@@ -399,7 +399,7 @@ fn binding_with(
 /// so; it is asked only then. For the CLI, which kiro does not give the
 /// variable, that is [`default_wake_here`]'s check: the variable in the
 /// environment of the agentmail MCP server kiro itself started
-/// ([`kiro_servers_wake`]), or, only when no such server is running, the
+/// (`kiro_servers_wake`), or, only when no such server is running, the
 /// installed mcp.json.
 pub fn default_wake(
     harness: Harness,
@@ -425,7 +425,7 @@ pub fn default_wake_for_server(harness: Harness) -> bool {
 /// [`default_wake`] for this process: its environment, then what kiro
 /// itself runs. kiro does not give its shell tool's commands the MCP
 /// server's `env`, so the CLI asks the source of truth: agentmail's MCP
-/// server running under the same `kiro-cli` ([`kiro_servers_wake`]),
+/// server running under the same `kiro-cli` (`kiro_servers_wake`),
 /// which kiro started with the `env` it settled on (workspace trust and
 /// the order it merges the workspace's and the user's servers included).
 /// Only when there is no such process (no `kiro-cli` above, with

@@ -11,7 +11,7 @@
 //! - `stop`: `decision: block` while questions to the agent are open,
 //!   unless this stop already follows a hook continuation
 //!   (`stop_hook_active`), so a model that cannot answer is not held. It
-//!   records its decision under the stop's key ([`stop_key`]: its
+//!   records its decision under the stop's key (`stop_key`: its
 //!   `prompt_id` and `stop_hook_active`) before printing, and the `wait`
 //!   hook of the same stop goes by that record.
 //! - `wait` (an `asyncRewake` Stop hook): block until mail comes while the

@@ -451,7 +451,7 @@ impl Daemon {
     /// key can repeat: Claude Code keeps one `prompt_id` until the next
     /// human prompt, so a wake's continuation stops with the key of the
     /// stop whose wait woke it. A record with this key dated more than
-    /// [`STOP_SLACK`] before this hook started is that earlier stop's, and
+    /// `STOP_SLACK` before this hook started is that earlier stop's, and
     /// the wait goes on looking for its own.
     ///
     /// With `wake_for_unread` (a plain stop), the wait ends at once with

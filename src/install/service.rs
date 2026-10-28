@@ -58,7 +58,7 @@ const PATH_VARS: [&str; 5] = [
 ];
 
 /// The service's environment, as far as the daemon's location goes: the
-/// values of [`PATH_VARS`] its daemon gets (see [`service_env`]).
+/// values of `PATH_VARS` its daemon gets (see [`service_env`]).
 pub type ServiceEnv = HashMap<String, String>;
 
 /// Of [`LOCATION_VARS`], those set in `env`.
@@ -246,8 +246,8 @@ fn unit_env(env: &Env) -> Option<Vec<(String, String)>> {
 }
 
 /// The environment the service's daemon gets, as far as its location goes
-/// ([`PATH_VARS`]): the systemd user manager's (see [`manager_env`]), with
-/// what the unit and its drop-ins set over it (see [`unit_env`]). Nothing
+/// (`PATH_VARS`): the systemd user manager's (see `manager_env`), with
+/// what the unit and its drop-ins set over it (see `unit_env`). Nothing
 /// when either cannot be told.
 pub fn service_env(env: &Env) -> Option<ServiceEnv> {
     let mut vars = manager_env(env)?;
@@ -497,7 +497,7 @@ fn on_search_path(search: &str, dir: &Path) -> bool {
 /// When the systemd user manager does not load user units from the
 /// directory the unit goes in here (its own `XDG_CONFIG_HOME`, or `HOME`,
 /// differs from this shell's), as its unit search path says (see
-/// [`manager_unit_path`]): why agentmail refuses, since the manager would
+/// `manager_unit_path`): why agentmail refuses, since the manager would
 /// never see the unit (and `enable` it, which the manager does). Nothing
 /// when the directory is on that path, or the manager cannot be asked.
 pub fn config_mismatch(env: &Env) -> Option<String> {
@@ -701,7 +701,7 @@ pub fn environment_line(k: &str, v: &str) -> String {
 /// Only agentmail's own unit is replaced or removed as is: the unit it
 /// created (its marker says so; whatever its `ExecStart`), or the one it
 /// wrote over a unit of the user's, which is kept as the backup (its
-/// `ExecStart` one agentmail writes, see [`written_exec`]). Any other
+/// `ExecStart` one agentmail writes, see `written_exec`). Any other
 /// unit is the user's, also one written by hand from the README: install
 /// saves it as the backup, replacing any older backup of agentmail's, and
 /// uninstall saves it as the backup before removing it when it matches
@@ -992,7 +992,7 @@ fn started_before_written(env: &Env, unit: &Path) -> bool {
 /// user's. Likewise the `default.target.wants` link is agentmail's only
 /// when it points to [`unit_path`] (it may dangle there). Both compare
 /// with symlinks resolved, in the unit's directory too (see
-/// [`same_file`]), as the unit search path check does.
+/// `same_file`), as the unit search path check does.
 pub fn orphan(env: &Env) -> (Option<Orphan>, Option<String>) {
     let unit = unit_path(env);
     let mut left = Vec::new();

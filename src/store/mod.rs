@@ -143,7 +143,7 @@ impl Store {
     ///
     /// A schema-1 database is migrated in place to schema 2 inside the same
     /// write transaction (the bool `mailbox` table becomes `mailbox_flags`;
-    /// see [`MAILBOX`]), so either the whole migration and the version bump
+    /// see `MAILBOX`), so either the whole migration and the version bump
     /// commit or nothing does. The migration is one-way: a schema-1 build
     /// refuses the migrated database, and there is no downgrade.
     pub fn open(path: &Path) -> anyhow::Result<Store> {

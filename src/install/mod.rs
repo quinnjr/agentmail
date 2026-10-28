@@ -144,7 +144,7 @@ pub fn notes(o: &InstallOpts, env: &Env, install: bool) -> Result<Vec<String>> {
 }
 
 /// Whether `install --kiro-wake` is in effect for kiro agents where `env`
-/// runs (see [`kiro::wake_installed`]).
+/// runs (see `kiro::wake_installed`).
 pub fn kiro_wake_installed(env: &Env) -> bool {
     kiro::wake_installed(env)
 }

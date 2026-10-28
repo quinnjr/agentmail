@@ -436,7 +436,7 @@ impl Client {
     ///
     /// Before starting a daemon, whether because none is listening, it
     /// stopped an old-protocol one, or it found one shutting down, the
-    /// client waits for a successor: see [`Client::await_successor`].
+    /// client waits for a successor: see `Client::await_successor`.
     pub async fn connect_or_spawn_with(paths: &Paths, bin: &Path) -> Result<Client> {
         match Client::open_and_hello(paths, ANSWER_WAIT).await {
             Ok(c) => return Ok(c),

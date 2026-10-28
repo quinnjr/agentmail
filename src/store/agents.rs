@@ -229,8 +229,8 @@ impl Store {
     /// reclaim rule applies. Returns the agent and whether it was reclaimed.
     ///
     /// Reclaim: unless `fresh`, an agent with the same `name` and `cwd` that
-    /// [`reclaimable`] allows is rebound: one not bound to a live process,
-    /// or the requesting process's own ([`is_own`]), and never one still
+    /// `reclaimable` allows is rebound: one not bound to a live process,
+    /// or the requesting process's own (`is_own`), and never one still
     /// bound to another opencode session. With several, the requesting process's own
     /// wins (a re-registration keeps the caller's current address);
     /// otherwise the most recently seen wins. The address, `registered_at`

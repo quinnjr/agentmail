@@ -324,13 +324,13 @@ impl Commands {
 /// The commands running under [`output_within`].
 static COMMANDS: Commands = Commands::new();
 
-/// Kill every command running under [`output_within`], with its whole
+/// Kill every command running under `output_within`, with its whole
 /// process group, and start no more. For a daemon about to exit without
 /// waiting for the requests that run them, which would otherwise orphan
 /// them.
 ///
 /// Never gives the lock back: holding it keeps every listed leader
-/// unreaped (see [`Commands`]) until the process exits. A command being
+/// unreaped (see `Commands`) until the process exits. A command being
 /// spawned when this is called is waited for, and killed by its request.
 pub fn kill_running_commands() {
     std::mem::forget(COMMANDS.stop(kill_group));
