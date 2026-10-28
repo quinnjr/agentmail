@@ -1610,3 +1610,23 @@ done
     );
     assert_eq!(wake("k7", &both), false);
 }
+
+/// `install` and `uninstall` without a target name both alternatives, so a
+/// user after the systemd service is not told a harness is required.
+#[test]
+fn install_without_a_target_names_harness_and_service() {
+    let env = Env::new();
+    for sub in ["install", "uninstall"] {
+        let out = env.cmd().arg(sub).output().unwrap();
+        assert!(!out.status.success(), "{sub} without a target succeeded");
+        let err = text(&out.stderr);
+        assert!(err.contains("--harness"), "{sub}: {err}");
+        assert!(err.contains("--service"), "{sub}: {err}");
+    }
+    let out = env
+        .cmd()
+        .args(["install", "--harness", "kiro", "--service"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "--harness with --service succeeded");
+}

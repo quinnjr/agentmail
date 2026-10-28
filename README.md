@@ -568,6 +568,18 @@ by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses).
 | CLI from the agent's shell | yes | yes (by `OPENCODE_SESSION_ID`) | yes |
 | Daemon down or session unregistered | hooks print nothing | plugin does nothing | hooks print nothing |
 
+Waking is on by default for Claude Code and opencode agents (and for kiro
+agents after `install --kiro-wake`): an agent that has finished just stops,
+and new mail starts its next turn. Turn it off for one agent by registering
+with `agentmail register --no-wake` (MCP: `register` with `wake: false`);
+`--wake` / `wake: true` turns it back on. There is no global switch: per
+agent `--no-wake` and kiro's install-time `--kiro-wake` cover it. A wait
+ends when the agent signs off (`signoff`) or the human takes the session
+back: typing to a Claude Code or opencode agent goes straight through, since
+their waits run outside the turn, and in kiro Esc ends the turn
+at once. The agent itself is told to stop rather than wait: it calls
+`wait_for_mail`, which holds its turn open, only when you ask it to wait.
+
 ## End-to-end tests against real harnesses
 
 `scripts/e2e.sh <claude-code|opencode|kiro|mixed>` builds agentmail,

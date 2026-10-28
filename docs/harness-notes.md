@@ -1531,3 +1531,41 @@ guessed, so a codeword in the answer was in the model's context.
   so agentmail's tools are called directly, as on the other harnesses; the
   README now gives that reason and says that a directory's first session
   gets the instructions from its second turn.
+
+### `wait_for_mail` no longer the end-of-work step (branch review)
+
+The ninth line of `INSTRUCTIONS` used to tell every agent to call
+`wait_for_mail` when about to stop. With the hook-based wake (Claude
+Code's `asyncRewake` wait hook, the opencode plugin's waiter, kiro's
+opt-in waiting Stop hook) that is both redundant (the agent never goes
+idle, so the hooks never fire) and harmful: a blocking tool call holds the
+turn for up to 240 s at every stop, and anything the human types meanwhile
+is queued, against the spec's rule that the human typing into the session
+wins over the wait. That is the same input hold that made kiro's wake
+opt-in under the Task 8 decision rule. **Decision:** the line now says to
+just stop, that the agent is woken for new mail where the harness supports
+it, and to call `wait_for_mail` only when the human asks it to wait for
+its partner; the tool's own description says the same.
+`mcp_instructions_carry_the_guidance` checks the new ending, that the old
+advice is gone and that the text stays within 2048 characters. Where no
+wake exists (`claude -p`, kiro without `--kiro-wake`, `opencode run
+--standalone`) a human who wants the agent reachable asks it to wait, as
+`scripts/e2e.sh` does: its `PROMPT_A` asks backend to call `wait_for_mail`
+(a headless `-p`/`--no-interactive` run cannot be woken), which is the
+human-asks case the instruction allows.
+
+### Turning waking off: no global config setting (branch review)
+
+The spec's "Waking idle agents" asks for `register --no-wake` and a config
+setting to turn waking off. Only the per-agent switch was built:
+`agentmail register --no-wake` (MCP `register` with `wake: false`; `--wake`
+/ `wake: true` turns it on), plus kiro's install-time `--kiro-wake`, which
+sets `AGENTMAIL_KIRO_WAKE=1` for kiro's MCP server and makes waking the
+default for kiro agents. A global setting was not built because agentmail
+has no config file to put it in (everything else is per harness install or
+per agent), waking only happens when it is wanted per session, and the
+harness install already decides it wholesale: kiro wakes only with
+`--kiro-wake`, and `uninstall` removes Claude Code's wait hook and
+opencode's plugin. The README's Harness support section says how
+waking works and how to turn it off.
+

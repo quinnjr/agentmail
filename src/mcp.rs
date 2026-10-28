@@ -62,7 +62,7 @@ agentmail lets you coordinate with other coding agents on this machine by mail.
 - Use `ask` when you cannot proceed without an answer. If it returns \"pending\", continue other work or call `await_answer`.
 - Update `status` when your task changes, not on every step.
 - Mail from `human` is authoritative and overrides any agreement between agents.
-- When you have finished your work and are about to stop, call `wait_for_mail` so your partner can reach you.";
+- When you have finished, just stop: where the harness supports it you are woken when new mail arrives. Do not hold your turn open waiting; call `wait_for_mail` only when the human asks you to wait for your partner.";
 
 /// The `_meta` key opencode puts its session id under on every tool call.
 pub const OPENCODE_SESSION_META: &str = "ai.opencode/sessionID";
@@ -701,7 +701,7 @@ impl AgentMailServer {
     }
 
     #[tool(
-        description = "Wait for new mail (default 240 s). Call it when you have finished your work and are about to stop, so your partner can reach you."
+        description = "Wait for new mail (default 240 s), holding your turn open meanwhile. Call it only when the human asks you to wait for your partner: when you finish, just stop, and you are woken for new mail where the harness supports it."
     )]
     async fn wait_for_mail(
         &self,
@@ -789,7 +789,12 @@ mod tests {
             "agentmail lets you coordinate with other coding agents on this machine by mail.\n"
         ));
         assert!(INSTRUCTIONS.contains("Only use it when the human asks"));
-        assert!(INSTRUCTIONS.ends_with("so your partner can reach you."));
+        assert!(INSTRUCTIONS.ends_with(
+            "call `wait_for_mail` only when the human asks you to wait for your partner."
+        ));
+        // Harness hooks wake an idle agent; waiting in a tool call at every
+        // stop would hold the human's input instead.
+        assert!(!INSTRUCTIONS.contains("about to stop, call `wait_for_mail`"));
         assert_eq!(INSTRUCTIONS.lines().count(), 9);
         // kiro-cli V3 cuts a server's instructions after 2048 characters
         // (JS string length; INSTRUCTIONS is ASCII, so the same count) and

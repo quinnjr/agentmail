@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -315,13 +315,12 @@ pub enum Command {
     /// Wire agentmail into a harness: its hooks (opencode: its plugin) and
     /// MCP server. Edits the harness's config files, keeping everything else
     /// in them; each file's original is saved once as `<file>.agentmail.bak`.
+    #[command(group(ArgGroup::new("target").required(true).args(["harness", "service"])))]
     Install {
         /// The harness to install into (kiro: the V3 engine only).
         #[arg(
             long,
-            value_parser = ["claude-code", "opencode", "kiro"],
-            required_unless_present = "service",
-            conflicts_with = "service"
+            value_parser = ["claude-code", "opencode", "kiro"]
         )]
         harness: Option<String>,
         /// Instead of a harness, run the daemon as a systemd user service:
@@ -343,13 +342,12 @@ pub enum Command {
         kiro_wake: bool,
     },
     /// Remove what `install` added to a harness's config files.
+    #[command(group(ArgGroup::new("target").required(true).args(["harness", "service"])))]
     Uninstall {
         /// The harness to remove agentmail from.
         #[arg(
             long,
-            value_parser = ["claude-code", "opencode", "kiro"],
-            required_unless_present = "service",
-            conflicts_with = "service"
+            value_parser = ["claude-code", "opencode", "kiro"]
         )]
         harness: Option<String>,
         /// Instead of a harness, stop and disable agentmail's systemd user
