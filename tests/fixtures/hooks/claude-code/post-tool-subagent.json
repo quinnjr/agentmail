@@ -1,0 +1,27 @@
+{
+  "session_id": "02a74402-679b-4f52-84f0-5914e8a54482",
+  "transcript_path": "/home/user/.claude/projects/-home-user-project/02a74402-679b-4f52-84f0-5914e8a54482.jsonl",
+  "cwd": "/home/user/project",
+  "prompt_id": "ec919db9-0d6a-4adb-9f5f-616d58448bd9",
+  "permission_mode": "bypassPermissions",
+  "agent_id": "aeb4c58b205863493",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo sub",
+    "description": "Print the word sub"
+  },
+  "tool_response": {
+    "stdout": "sub",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_01FihryG76Ks2LbRKh5pn2H5",
+  "duration_ms": 9
+}
