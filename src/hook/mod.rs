@@ -17,8 +17,8 @@
 //! shell would otherwise act as the outer agent. A hook run as the human
 //! (`AGENTMAIL_HUMAN=1`, or the CLI's `--as human`) has nothing to say.
 //!
-//! Entry points for the per-harness modules (Tasks 6 and 8 build on these,
-//! not on the plan's sketch):
+//! Entry points for the per-harness modules (`claude.rs`, `opencode.rs`,
+//! `kiro.rs`):
 //!
 //! - [`run`]`(harness, event, stdin, env)`, [`run_as`]`(.., session, ..)`
 //!   and [`run_with`]`(.., &HookArgs, ..)` (the whole command line), with

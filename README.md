@@ -592,8 +592,8 @@ It needs real model access, so `cargo test` does not run it:
   (`AGENTMAIL_E2E_KIRO_DATA` for a non-default data directory). Only the
   runtimes kiro-cli never writes are linked from that directory; the login
   and feed files are copied, the rest left out.
-- `jq`, `git`, `cargo`, and `python3` for kiro and opencode (and `curl`
-  for opencode).
+- `jq`, `git`, `cargo` and `setsid` (util-linux) in every mode, plus
+  `python3` for kiro and `opencode` mode, and `curl` for `opencode` mode.
 
 Logins are copied into the throwaway home without their refresh token, so
 a run can never rotate your real login, and deleted afterwards. A copy

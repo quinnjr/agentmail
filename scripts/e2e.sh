@@ -72,7 +72,8 @@
 # timeout and on exit, before the temporary directory is removed, so none
 # of its descendants (MCP servers, hooks, kiro's engine) outlives the run.
 # Nothing outside the temporary directory is written, apart from cargo's
-# target directory.
+# target directory and a short-lived /tmp/am-e2e.* socket directory
+# (removed on exit).
 
 set -uo pipefail
 

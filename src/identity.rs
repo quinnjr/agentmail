@@ -225,8 +225,9 @@ fn caller_from(
 ///    (say the terminal that launched it) is bound exactly. The MCP server
 ///    ([`mcp_bind`]) narrows this further: see there.
 ///
-///    This narrows the plan's rule (prefer the harness ancestor for every
-///    explicit pid) on purpose, for Claude Code: an unknown MCP client run
+///    This deliberately does not prefer the harness ancestor for every
+///    explicit pid (see "Claude Code: no harness redirect" in
+///    docs/harness-notes.md). For Claude Code, an unknown MCP client run
 ///    from a Claude Code shell must bind itself, not the Claude Code it
 ///    happens to run under, or it would take over the binding of the agent
 ///    Claude Code itself registered. The cost: a Claude Code MCP server
