@@ -219,8 +219,8 @@ come from the binary's bundled settings schema.
   for up to a day, so the wait hook stays silent under every entry point
   but `cli`. Under the IDE and desktop integrations the other hooks work
   (reminders, urgent mail, the Stop block for open questions), but an
-  idle session is not woken for new mail. The README's support table
-  (Task 10) must say so.
+  idle session is not woken for new mail. The README's support table and
+  Known limitations say so.
 - **Timeouts.** `timeout` is in seconds, any positive number; the schema
   sets no maximum. It applies to `asyncRewake` hooks too: with `timeout: 5`
   a rewake hook sleeping 15 s was killed and never woke the session.
@@ -250,9 +250,9 @@ come from the binary's bundled settings schema.
   not `claude`; through the usual `~/.local/bin/claude` symlink it is
   `claude`. The hooks cut their ancestry at `CLAUDE_PID` (else at the
   nearest process with a harness name), so a Claude Code started from a
-  registered agent's shell never acts as that outer agent. The e2e script
-  should run Claude Code through a symlink named `claude`, so that the
-  CLI's own harness detection (by command name) sees it.
+  registered agent's shell never acts as that outer agent.
+  `scripts/e2e.sh` runs Claude Code through a symlink named `claude`, so
+  that the CLI's own harness detection (by command name) sees it.
 - **Payloads** (stdin) are recorded in `tests/fixtures/hooks/claude-code/`
   (paths anonymised): `session-start.json` (`source`, `model`),
   `prompt.json` (`prompt`), `post-tool.json` (`tool_name`, `tool_input`,
