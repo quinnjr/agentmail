@@ -72,14 +72,29 @@ sha256_of() {
     fi
 }
 
-# latest_tag <base>: the tag GitHub's releases/latest redirects to, or
-# nothing (no release yet, a mirror without the redirect, or no curl).
+# latest_tag <base>: where GitHub's releases/latest redirects. Prints the
+# tag of the latest release, `none` when there is no release yet (GitHub
+# then redirects to the release list), or nothing when it cannot tell (a
+# network error, or a mirror without the redirect).
 latest_tag() {
-    has curl || return 0
-    url="$(curl --proto '=https,file' -sSLo /dev/null -w '%{url_effective}' "$1/latest" 2>/dev/null)" || return 0
+    if has curl; then
+        url="$(curl --proto '=https,file' -sSLo /dev/null -w '%{url_effective}' "$1/latest" 2>/dev/null)" || return 0
+    else
+        url="$(wget --max-redirect=0 -S -O /dev/null "$1/latest" 2>&1 | sed -n 's/^ *Location: *//p' | tail -n1 | tr -d '\r')"
+    fi
     case "$url" in
         */releases/tag/*) printf '%s\n' "${url##*/}" ;;
+        */releases | */releases/) echo none ;;
         *) ;;
+    esac
+}
+
+# has_linux <cmd>: <cmd> is on PATH outside the Windows drives WSL mounts,
+# so it is not a Windows tool seen through WSL's appended Windows PATH.
+has_linux() {
+    p="$(command -v "$1" 2>/dev/null)" || return 1
+    case "$p" in
+        /mnt/*) return 1 ;;
     esac
 }
 
@@ -132,14 +147,18 @@ fetch_prebuilt() {
     [ -f "$1/unpacked/agentmail" ] || die "$archive has no agentmail binary"
 }
 
-# build_from_source <tmpdir>: cargo install of the release (or, with no
-# release to name, the default branch) into <tmpdir>/root.
+# build_from_source <tmpdir>: cargo install of the release into
+# <tmpdir>/root. With --from-source and no release published yet, of the
+# default branch.
 build_from_source() {
     has cargo || die "cargo is not installed, so agentmail cannot be built from source.
 Install Rust from https://rustup.rs and run this again, or use a release from
 https://github.com/$REPO/releases"
     if [ "$tag" = latest ]; then
-        say "no release to build; building the development branch instead"
+        [ "$release" = none ] || die "could not find the latest release to build; pass --version <tag>"
+        [ "$from_source" = 1 ] || die "no agentmail release has been published yet.
+Run this again with --from-source to build the development branch."
+        say "no release published yet; building the development branch"
         set -- "$1" --git "https://github.com/$REPO"
     else
         set -- "$1" --git "https://github.com/$REPO" --tag "$tag"
@@ -152,12 +171,16 @@ https://github.com/$REPO/releases"
     cp "$root/root/bin/agentmail" "$root/unpacked/agentmail" || die "cargo installed no agentmail binary"
 }
 
-# on_path <dir>: whether <dir> is on the user's PATH, as given to us or as
-# their login shell sets it (wsl.exe and some pipes start without it).
+# on_path <dir>: whether <dir> is on the user's PATH. Under WSL, also as
+# their login shell sets it, since `wsl.exe -e` starts without the profile:
+# detached from the terminal (no passphrase prompts) and time-limited.
 on_path() {
     case ":$user_path:" in *":$1:"*) return 0 ;; esac
-    login_path="$(PATH="$user_path" "${SHELL:-/bin/sh}" -lc 'printf "%s" "$PATH"' 2>/dev/null </dev/null || true)"
-    case ":$login_path:" in *":$1:"*) return 0 ;; esac
+    if [ -n "${WSL_DISTRO_NAME:-}" ] && has setsid && has timeout; then
+        login_path="$(PATH="$user_path" timeout 5 setsid "${SHELL:-/bin/sh}" -lc 'echo "$PATH"' </dev/null 2>/dev/null || true)"
+        # fish prints its PATH list space-separated.
+        case ":$login_path: " in *":$1:"* | *" $1 "*) return 0 ;; esac
+    fi
     return 1
 }
 
@@ -204,6 +227,12 @@ main() {
         /*) ;;
         *) bin_dir="$(pwd)/$bin_dir" ;;
     esac
+    while :; do
+        case "$bin_dir" in
+            / | *[!/]) break ;;
+            */) bin_dir="${bin_dir%/}" ;;
+        esac
+    done
 
     check_platform
     has sha256sum || has shasum || die "need sha256sum or shasum to verify the download"
@@ -222,11 +251,18 @@ main() {
 
     base="${AGENTMAIL_DOWNLOAD_URL:-https://github.com/$REPO/releases}"
     tag="$version"
+    release=""
     if [ "$tag" = latest ]; then
         # One tag for every download (and a source build), so a release
         # published meanwhile cannot mix archives and checksums.
-        resolved="$(latest_tag "$base")"
-        [ -n "$resolved" ] && tag="$resolved"
+        release="$(latest_tag "$base")"
+        case "$release" in
+            none)
+                [ "$from_source" = 1 ] || die "no agentmail release has been published yet.
+Run this again with --from-source to build the development branch." ;;
+            "") ;;
+            *) tag="$release" ;;
+        esac
     fi
 
     triple="$(target_triple)"
@@ -239,8 +275,7 @@ main() {
         rc=0
         fetch_prebuilt "$tmp" "$triple" || rc=$?
         if [ "$rc" = 2 ]; then
-            [ "$tag" = latest ] && die "no agentmail release has been published yet.
-Run this again with --from-source to build the development branch."
+            [ "$tag" = latest ] && die "found no agentmail release at $base"
             die "release $tag has no agentmail-$triple.tar.gz (see https://github.com/$REPO/releases)"
         fi
     fi
@@ -268,7 +303,7 @@ Run this again with --from-source to build the development branch."
     fi
 
     other="$(PATH="$user_path" command -v agentmail 2>/dev/null || true)"
-    if [ -n "$other" ] && [ "$other" != "$bin" ]; then
+    if [ -n "$other" ] && ! [ "$other" -ef "$bin" ]; then
         say "warning: your PATH finds another agentmail first, at $other"
         say "remove it (e.g. \`cargo uninstall agentmail\`) or put $bin_dir earlier on PATH"
     fi
@@ -277,9 +312,9 @@ Run this again with --from-source to build the development branch."
     for h in $harnesses; do
         if [ "$h" = auto ]; then
             found=0
-            if has claude; then "$bin" install --harness claude-code; found=1; fi
-            if has opencode; then "$bin" install --harness opencode; found=1; fi
-            if has kiro-cli; then "$bin" install --harness kiro; found=1; fi
+            if has_linux claude; then "$bin" install --harness claude-code; found=1; fi
+            if has_linux opencode; then "$bin" install --harness opencode; found=1; fi
+            if has_linux kiro-cli; then "$bin" install --harness kiro; found=1; fi
             [ "$found" = 1 ] || say "--harness auto: no claude, opencode or kiro-cli on PATH"
         else
             "$bin" install --harness "$h"

@@ -149,9 +149,29 @@ impl Release {
         self.path("cargo.log")
     }
 
+    /// Makes `curl` answer the releases/latest lookup with a redirect to
+    /// `url`, as GitHub does (a file:// release cannot redirect).
+    fn latest_redirects_to(&self, url: &str) {
+        let curl = self.path("path/curl");
+        std::fs::remove_file(&curl).unwrap();
+        let real = which("curl");
+        write_exec(
+            &curl,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = '%{{url_effective}}' ] && {{ echo '{url}'; exit 0; }}; done\nexec {} \"$@\"\n",
+                real.display()
+            ),
+        );
+    }
+
     /// Runs install.sh with `args`, the release as its download source and
     /// a private HOME and PATH.
     fn install(&self, args: &[&str]) -> Output {
+        self.install_env(args, &[])
+    }
+
+    /// `install` with extra (or overriding) environment variables.
+    fn install_env(&self, args: &[&str], env: &[(&str, String)]) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
         std::process::Command::new(self.path("path/sh"))
             .arg(script)
@@ -168,6 +188,7 @@ impl Release {
             .env("AGENTMAIL_INSTALL_DIR", self.bin_dir())
             .env("FAKE_CARGO_LOG", self.path("cargo.log"))
             .env("FAKE_CARGO_STUB", self.path("cargo-stub"))
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .output()
             .unwrap()
     }
@@ -296,11 +317,58 @@ fn a_binary_that_does_not_run_keeps_the_old_one() {
 #[test]
 fn no_release_yet_says_so_and_does_not_build() {
     let r = Release::new();
-    std::fs::remove_dir_all(r.path("rel/latest")).unwrap();
+    r.latest_redirects_to(NO_RELEASE);
     let cargo_log = r.add_cargo();
     let out = r.install(&[]);
     assert_fails_with(&r, &out, "no agentmail release has been published yet");
     assert!(!cargo_log.exists(), "cargo ran without --from-source");
+}
+
+/// Where GitHub's releases/latest redirects with no release published.
+const NO_RELEASE: &str = "https://github.com/quinnjr/agentmail/releases";
+/// Where it redirects when v0.1.0 is the latest release.
+const LATEST_V010: &str = "https://github.com/quinnjr/agentmail/releases/tag/v0.1.0";
+
+#[test]
+fn the_latest_tag_is_resolved_once_and_downloaded() {
+    let r = Release::new();
+    r.latest_redirects_to(LATEST_V010);
+    let out = r.install(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("/download/v0.1.0/"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn from_source_builds_the_latest_tag() {
+    let r = Release::new();
+    r.latest_redirects_to(LATEST_V010);
+    let cargo_log = r.add_cargo();
+    let out = r.install(&["--from-source"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = std::fs::read_to_string(cargo_log).unwrap();
+    assert!(log.contains(" --tag v0.1.0 "), "{log}");
+}
+
+#[test]
+fn from_source_refuses_when_the_latest_release_is_unknown() {
+    // The file:// release has no redirect, so the lookup cannot tell.
+    let r = Release::new();
+    let cargo_log = r.add_cargo();
+    let out = r.install(&["--from-source"]);
+    assert_fails_with(&r, &out, "could not find the latest release");
+    assert!(!cargo_log.exists(), "cargo ran without a tag");
+}
+
+#[test]
+fn an_unknown_latest_release_missing_from_a_mirror_is_an_error() {
+    let r = Release::new();
+    std::fs::remove_dir_all(r.path("rel/latest")).unwrap();
+    let out = r.install(&[]);
+    assert_fails_with(&r, &out, "found no agentmail release at");
 }
 
 #[test]
@@ -330,6 +398,7 @@ fn from_source_builds_the_requested_tag() {
 #[test]
 fn from_source_with_no_release_builds_the_development_branch() {
     let r = Release::new();
+    r.latest_redirects_to(NO_RELEASE);
     let cargo_log = r.add_cargo();
     let out = r.install(&["--from-source"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -345,6 +414,7 @@ fn from_source_with_no_release_builds_the_development_branch() {
 #[test]
 fn from_source_without_cargo_says_how_to_get_rust() {
     let r = Release::new();
+    r.latest_redirects_to(LATEST_V010);
     let out = r.install(&["--from-source"]);
     assert_fails_with(&r, &out, "cargo is not installed");
     assert!(stderr(&out).contains("https://rustup.rs"));
@@ -408,6 +478,19 @@ fn a_relative_bin_dir_is_made_absolute() {
         r.dir.path().display()
     );
     assert!(stderr(&out).contains(&want), "{}", stderr(&out));
+}
+
+#[test]
+fn a_trailing_slash_bin_dir_on_path_is_recognised() {
+    let r = Release::new();
+    let bin = format!("{}/", r.bin_dir().display());
+    let path = format!("{}:{}", r.bin_dir().display(), r.path("path").display());
+    let out = r.install_env(&["--bin-dir", &bin], &[("PATH", path)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(!err.contains("another agentmail"), "{err}");
+    assert!(!err.contains("not on your PATH"), "{err}");
+    assert!(!err.contains("//agentmail"), "{err}");
 }
 
 #[test]
