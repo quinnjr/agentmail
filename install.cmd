@@ -1,7 +1,7 @@
 @echo off
 rem agentmail installer for Windows (cmd.exe).
 rem
-rem   curl -fsSLo %TEMP%\agentmail-install.cmd https://raw.githubusercontent.com/quinnjr/agentmail/main/install.cmd && %TEMP%\agentmail-install.cmd
+rem   curl -fsSLo "%TEMP%\agentmail-install.cmd" https://raw.githubusercontent.com/quinnjr/agentmail/main/install.cmd && "%TEMP%\agentmail-install.cmd"
 rem
 rem Options are passed on to install.sh, e.g. "--harness auto" or
 rem "--version v0.1.0" (run with --help for all of them).
@@ -24,16 +24,19 @@ if defined AGENTMAIL_INSTALL_URL set "AGENTMAIL_URL=%AGENTMAIL_INSTALL_URL%"
 set "AGENTMAIL_WSL="
 if defined AGENTMAIL_WSL_DISTRO set "AGENTMAIL_WSL=-d %AGENTMAIL_WSL_DISTRO%"
 
+rem wsl.exe exits -1 when it cannot start a distribution, which
+rem "if errorlevel 1" (exit code >= 1) would miss.
 wsl.exe %AGENTMAIL_WSL% -e true >nul 2>nul
-if errorlevel 1 (
+if %errorlevel% neq 0 (
     echo agentmail: error: could not start a WSL distribution.
     echo Install one with "wsl --install -d Ubuntu", or set AGENTMAIL_WSL_DISTRO ^(see "wsl -l"^).
     exit /b 1
 )
 
-rem Download install.sh inside WSL and run it there with the options.
-wsl.exe %AGENTMAIL_WSL% -e sh -c "t=$(mktemp) && { curl -fsSL $0 -o $t || wget -qO $t $0; } && sh $t $@; r=$?; rm -f $t; exit $r" %AGENTMAIL_URL% %*
-if errorlevel 1 (
+rem Download install.sh inside WSL and run it there with the options. An
+rem empty IFS keeps each option whole in the unquoted $@.
+wsl.exe %AGENTMAIL_WSL% -e sh -c "t=$(mktemp) && { curl -fsSL $0 -o $t || wget -qO $t $0; } && { IFS=; set -f; sh $t $@; }; r=$?; rm -f $t; exit $r" "%AGENTMAIL_URL%" %*
+if %errorlevel% neq 0 (
     echo agentmail: installation failed.
     exit /b 1
 )

@@ -63,13 +63,14 @@ backend-k3v9x2qa → frontend-x7p2m4qa   [answer]
    or from `cmd.exe`:
 
    ```bat
-   curl -fsSLo %TEMP%\agentmail-install.cmd https://raw.githubusercontent.com/quinnjr/agentmail/main/install.cmd && %TEMP%\agentmail-install.cmd
+   curl -fsSLo "%TEMP%\agentmail-install.cmd" https://raw.githubusercontent.com/quinnjr/agentmail/main/install.cmd && "%TEMP%\agentmail-install.cmd"
    ```
 
    The script downloads the static binary for your CPU (x86_64 or
    aarch64), checks its SHA-256 and puts it in `~/.local/bin`. With Rust
-   installed you can build it instead:
-   `cargo install --locked --git https://github.com/quinnjr/agentmail`.
+   installed you can build a release instead:
+   `cargo install --locked --git https://github.com/quinnjr/agentmail --tag <version>`
+   (without `--tag`, cargo builds the development branch).
 
 2. Wire it into your harness (the MCP server and hooks, or the opencode
    plugin):

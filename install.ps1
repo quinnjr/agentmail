@@ -34,18 +34,18 @@ function Install-AgentMail {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
         Write-Host "agentmail: error: WSL is not installed. agentmail runs inside WSL." -ForegroundColor Red
         Write-Host "Install it with 'wsl --install' (then restart), and run this again."
-        return $false
+        return 1
     }
 
     $wsl = @()
     if ($Distro) { $wsl += @('-d', $Distro) }
 
-    & wsl.exe @wsl -e true 2>$null
+    & wsl.exe @wsl -e true 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         $which = if ($Distro) { "the WSL distribution '$Distro'" } else { 'a default WSL distribution' }
         Write-Host "agentmail: error: could not start $which." -ForegroundColor Red
         Write-Host "Install one with 'wsl --install -d Ubuntu', or pick one with -Distro (see 'wsl -l')."
-        return $false
+        return 1
     }
 
     $opts = @()
@@ -55,21 +55,29 @@ function Install-AgentMail {
     if ($Service) { $opts += '--service' }
     if ($FromSource) { $opts += '--from-source' }
 
-    # Download install.sh inside WSL and run it there with the options.
-    # No double quotes in it: Windows PowerShell 5.1 does not escape them
-    # when it passes arguments to wsl.exe.
-    $fetch = 't=$(mktemp) && { curl -fsSL $0 -o $t || wget -qO $t $0; } && sh $t $@; r=$?; rm -f $t; exit $r'
-    & wsl.exe @wsl -e sh -c $fetch $url @opts
+    # Download install.sh inside WSL and run it there with the options. No
+    # double quotes in it, since Windows PowerShell 5.1 does not escape them
+    # for wsl.exe; an empty IFS keeps each option whole in the unquoted $@.
+    $fetch = 't=$(mktemp) && { curl -fsSL $0 -o $t || wget -qO $t $0; } && { IFS=; set -f; sh $t $@; }; r=$?; rm -f $t; exit $r'
+    & wsl.exe @wsl -e sh -c $fetch $url @opts | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host "agentmail: installation failed (exit $LASTEXITCODE)." -ForegroundColor Red
-        return $false
+        return 1
     }
 
     Write-Host ""
     Write-Host "agentmail is installed in WSL. Run your agents inside WSL (e.g. 'wsl' then 'claude')."
-    return $true
+    return 0
 }
 
-# A function and no `exit`, so running this through iex never closes the
-# caller's PowerShell window.
-$null = Install-AgentMail
+$agentmailStatus = Install-AgentMail
+# Leave nothing behind in the caller's session (iex runs in its scope).
+Remove-Item Function:\Install-AgentMail
+Remove-Variable Version, BinDir, Harness, Service, FromSource, Distro -ErrorAction SilentlyContinue
+if ($PSCommandPath) {
+    # Run as a file (powershell -File install.ps1): report through the exit code.
+    exit $agentmailStatus
+}
+# Through iex or a script block, `exit` would close the caller's window.
+$global:LASTEXITCODE = $agentmailStatus
+Remove-Variable agentmailStatus
