@@ -591,7 +591,12 @@ Supported: Claude Code, opencode 2.x (V2 plugin API) and kiro-cli with the
 V3 engine. Each row was checked live against Claude Code 2.1.311–2.1.312,
 opencode 2.0.27 and kiro-cli 2.32.0 (details in
 [`docs/harness-notes.md`](docs/harness-notes.md)), and the headless parts
-by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses).
+by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses). The
+latest e2e results, and the commit each was run on, are in
+`docs/harness-notes.md` ("Real-harness e2e"). The `claude-code` and
+`kiro` modes passed on the current code. The `opencode` and `mixed` modes
+last passed on an earlier commit and could not be re-run since (opencode's
+free models hit their usage limit).
 
 | | Claude Code | opencode | kiro-cli (V3) |
 |---|---|---|---|

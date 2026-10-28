@@ -1332,6 +1332,38 @@ with `AGENTMAIL_E2E_MIN_LOGIN_SECS=600`):
 | `kiro` | passed | 1–5 |
 | `mixed` (Claude Code A, opencode B) | passed | 1–4 |
 
+Those passes were recorded at 5c508f7. Behaviour changed after that:
+1be2eb8 (hook wait/status logic in `src/hook/mod.rs` and
+`src/hook/opencode.rs`), 185cb12 (`src/install/kiro.rs`, the CLI), 09d2876
+(the MCP `instructions`: agents stop rather than call `wait_for_mail`), and
+1cea955 (`AGENTMAIL_WAKE=0`). So the table above does not cover the
+current code. Re-run on 2026-10-27 at 1cea955 (release build,
+`AGENTMAIL_E2E_TIMEOUT=300`, `AGENTMAIL_E2E_MIN_LOGIN_SECS=600`, Claude
+Code 2.1.312, opencode 2.0.27, kiro-cli 2.32.0):
+
+| mode | commit | result | steps checked |
+|---|---|---|---|
+| `claude-code` | 1cea955 | passed | 1–4 |
+| `kiro` | 1cea955 | passed | 1–5 |
+| `opencode` | 5c508f7 (last pass) | **not run on 1cea955** | step 1 could not start |
+| `mixed` (Claude Code A, opencode B) | 5c508f7 (last pass) | **not run on 1cea955** | step 2 could not start |
+
+**Open gap: `opencode` and `mixed` are unverified on 1cea955.** Both runs
+stopped before any agentmail step because the opencode agent got no
+model answer. Its first model call returned
+`provider.quota` / `FreeUsageLimitError` ("Free usage limit reached",
+HTTP 429) for `opencode/big-pickle`. Every other free model listed by
+`opencode models --standalone` gave the same quota error
+(`mimo-v2.6-flash-free`, `nemotron-3.5-lightning-free`) or "Model
+unavailable" (the rest). The throwaway home has no other opencode
+provider login, and the script does not copy one. Their last passes, at
+5c508f7, are the only opencode e2e results. Re-run
+`scripts/e2e.sh opencode` and `scripts/e2e.sh mixed` once the free
+quota resets, or with `AGENTMAIL_E2E_OPENCODE_MODEL` set to a model
+that works, and record the commit here. The opencode hook and plugin
+changes since 5c508f7 are covered only by `cargo test`
+(`tests/hook_opencode.rs`) and `bun test plugin/`.
+
 - **Deviation from the plan: Claude Code's config.** The plan drives Claude
   Code as `claude -p --settings … --mcp-config …`. The script instead runs
   `agentmail install --harness claude-code` into the throwaway
