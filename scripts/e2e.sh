@@ -47,6 +47,11 @@
 #   AGENTMAIL_E2E_OPENCODE_MODEL   default: opencode/big-pickle
 #                           (free at the time of writing, no login; `opencode
 #                           models --standalone` lists the current ones)
+#   AGENTMAIL_E2E_OPENCODE_DATA
+#                           opencode's data dir; its login (an OpenCode
+#                           account) is copied in when there is one
+#                           (default: ${XDG_DATA_HOME:-~/.local/share}/opencode).
+#                           Free models hit a usage limit; others need it.
 #   AGENTMAIL_E2E_KIRO      kiro-cli binary (default: `kiro-cli` on PATH)
 #   AGENTMAIL_E2E_KIRO_DATA kiro-cli's data dir holding its login
 #                           (default: ${XDG_DATA_HOME:-~/.local/share}/kiro-cli)
@@ -127,10 +132,9 @@ if needs opencode; then
     [ -n "$OPENCODE_BIN" ] && [ -x "$OPENCODE_BIN" ] ||
         fail "opencode not found; set AGENTMAIL_E2E_OPENCODE"
     OPENCODE_MODEL=${AGENTMAIL_E2E_OPENCODE_MODEL:-opencode/big-pickle}
+    command -v python3 >/dev/null || fail "python3 is required"
     if [ "$HA" = opencode ]; then
-        for tool in curl python3; do
-            command -v "$tool" >/dev/null || fail "$tool is required"
-        done
+        command -v curl >/dev/null || fail "curl is required"
     fi
 fi
 if needs kiro; then
@@ -271,6 +275,66 @@ setup_claude() {
 setup_opencode() {
     (henv "$BIN" install --harness opencode) >"$TMP/logs/install-opencode.log" 2>&1 ||
         fail "install --harness opencode: $(cat "$TMP/logs/install-opencode.log")"
+    # opencode keeps its login (an OpenCode account, the `opencode`
+    # provider) in the `credential` table of its database. Without one only
+    # the free models work, so the login is copied in when there is one.
+    local src=${AGENTMAIL_E2E_OPENCODE_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}/opencode.db
+    [ -r "$src" ] || return 0
+    local db=$H/.local/share/opencode/opencode.db
+    # Let opencode create its own database (schema and migrations) first,
+    # then add the one credential row to it.
+    (henv setsid "$OPENCODE_BIN" models --standalone) >"$TMP/logs/opencode-init.log" 2>&1 &
+    local pid=$! i
+    PIDS+=("$pid")
+    for i in $(seq 120); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill_groups "$pid"
+    [ -f "$db" ] || fail "opencode did not create its database (see $TMP/logs/opencode-init.log)"
+    SECRETS+=("$db" "$db-wal" "$db-shm" "$db-journal")
+    local copied
+    copied=$(umask 077 && python3 -I - "$src" "$db" "$MIN_LOGIN_MS" "$MIN_LOGIN_TEXT" <<'EOF'
+import json, sqlite3, sys, time
+
+src, dst, min_ms, min_text = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+try:
+    rows = s.execute(
+        "select * from credential where integration_id = 'opencode' and active = 1"
+    ).fetchall()
+except sqlite3.OperationalError:
+    rows = []
+cols = [r[1] for r in s.execute("pragma table_info(credential)")]
+s.close()
+if not rows:
+    print(0)
+    sys.exit(0)
+d = sqlite3.connect(dst)
+# Only the columns this opencode's database has, should the two differ.
+keep = {r[1] for r in d.execute("pragma table_info(credential)")}
+idx = [i for i, c in enumerate(cols) if c in keep]
+vi = cols.index("value")
+for row in rows:
+    row = list(row)
+    v = json.loads(row[vi])
+    if v.get("type") == "oauth":
+        if v.get("expires", 0) - time.time() * 1000 < min_ms:
+            sys.exit(f"the opencode login expires within {min_text}; refresh it (run opencode once) and retry")
+        v["refresh"] = ""
+    row[vi] = json.dumps(v)
+    d.execute(
+        f"insert into credential ({', '.join(cols[i] for i in idx)}) "
+        f"values ({', '.join('?' * len(idx))})",
+        [row[i] for i in idx],
+    )
+d.commit()
+d.close()
+print(len(rows))
+EOF
+    ) || fail "cannot copy the opencode login"
+    [ "$copied" -gt 0 ] && note "copied the opencode login from $src"
+    return 0
 }
 
 setup_kiro() {

@@ -593,10 +593,8 @@ opencode 2.0.27 and kiro-cli 2.32.0 (details in
 [`docs/harness-notes.md`](docs/harness-notes.md)), and the headless parts
 by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses). The
 latest e2e results, and the commit each was run on, are in
-`docs/harness-notes.md` ("Real-harness e2e"). The `claude-code` and
-`kiro` modes passed on the current code. The `opencode` and `mixed` modes
-last passed on an earlier commit and could not be re-run since (opencode's
-free models hit their usage limit).
+`docs/harness-notes.md` ("Real-harness e2e"); all four modes passed on
+the current code.
 
 | | Claude Code | opencode | kiro-cli (V3) |
 |---|---|---|---|
@@ -655,13 +653,16 @@ It needs real model access, so `cargo test` does not run it:
   `$CLAUDE_CONFIG_DIR`'s, or `AGENTMAIL_E2E_CLAUDE_CREDENTIALS`) or
   `ANTHROPIC_API_KEY`.
 - opencode: on `PATH` or `AGENTMAIL_E2E_OPENCODE`; uses a free opencode
-  model by default (`AGENTMAIL_E2E_OPENCODE_MODEL`).
+  model by default (`AGENTMAIL_E2E_OPENCODE_MODEL`). Free models have a
+  usage limit, so its OpenCode account login, when there is one, is copied
+  in from opencode's data directory (`AGENTMAIL_E2E_OPENCODE_DATA`) for
+  any other model.
 - kiro-cli: on `PATH` or `AGENTMAIL_E2E_KIRO`, logged in
   (`AGENTMAIL_E2E_KIRO_DATA` for a non-default data directory). Only the
   runtimes kiro-cli never writes are linked from that directory; the login
   and feed files are copied, the rest left out.
 - `jq`, `git`, `cargo` and `setsid` (util-linux) in every mode, plus
-  `python3` for kiro and `opencode` mode, and `curl` for `opencode` mode.
+  `python3` whenever kiro or opencode runs, and `curl` for `opencode` mode.
 
 Logins are copied into the throwaway home without their refresh token, so
 a run can never rotate your real login, and deleted afterwards. A copy

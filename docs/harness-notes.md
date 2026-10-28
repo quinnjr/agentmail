@@ -1345,24 +1345,23 @@ Code 2.1.312, opencode 2.0.27, kiro-cli 2.32.0):
 |---|---|---|---|
 | `claude-code` | 1cea955 | passed | 1–4 |
 | `kiro` | 1cea955 | passed | 1–5 |
-| `opencode` | 5c508f7 (last pass) | **not run on 1cea955** | step 1 could not start |
-| `mixed` (Claude Code A, opencode B) | 5c508f7 (last pass) | **not run on 1cea955** | step 2 could not start |
+| `opencode` | 8c4a21e | passed | 1–4, 6 |
+| `mixed` (Claude Code A, opencode B) | 8c4a21e | passed | 1–4 |
 
-**Open gap: `opencode` and `mixed` are unverified on 1cea955.** Both runs
-stopped before any agentmail step because the opencode agent got no
-model answer. Its first model call returned
-`provider.quota` / `FreeUsageLimitError` ("Free usage limit reached",
-HTTP 429) for `opencode/big-pickle`. Every other free model listed by
-`opencode models --standalone` gave the same quota error
-(`mimo-v2.6-flash-free`, `nemotron-3.5-lightning-free`) or "Model
-unavailable" (the rest). The throwaway home has no other opencode
-provider login, and the script does not copy one. Their last passes, at
-5c508f7, are the only opencode e2e results. Re-run
-`scripts/e2e.sh opencode` and `scripts/e2e.sh mixed` once the free
-quota resets, or with `AGENTMAIL_E2E_OPENCODE_MODEL` set to a model
-that works, and record the commit here. The opencode hook and plugin
-changes since 5c508f7 are covered only by `cargo test`
-(`tests/hook_opencode.rs`) and `bun test plugin/`.
+`opencode` and `mixed` could not run at 1cea955: opencode's free models
+(`opencode/big-pickle` and the other `-free` ones) answered every call with
+`provider.quota` / `FreeUsageLimitError` ("Free usage limit reached", HTTP
+429), and the throwaway home had no opencode login. The script now copies
+opencode's login in (see "Logins" below). Both modes were then re-run on
+2026-10-27 on the code of 8c4a21e (HEAD at the time; the commit after it
+changes only the script and docs), with the script as committed in that
+next commit, the release build,
+`AGENTMAIL_E2E_OPENCODE_MODEL=opencode/claude-haiku-4-5` (a paid model on
+the copied OpenCode account login), `AGENTMAIL_E2E_TIMEOUT=300`,
+`AGENTMAIL_E2E_MIN_LOGIN_SECS=600`, Claude Code 2.1.312 and opencode
+2.0.27. In `opencode` mode step 6 passed on opencode's own record (the
+plugin's wake ran a turn that saw the mail; the model did not reply). No
+process was left behind.
 
 - **Deviation from the plan: Claude Code's config.** The plan drives Claude
   Code as `claude -p --settings … --mcp-config …`. The script instead runs
@@ -1392,7 +1391,14 @@ changes since 5c508f7 are covered only by `cargo test`
   setup), or `AGENTMAIL_E2E_MIN_LOGIN_SECS`. A login close to expiry can
   be used by lowering `AGENTMAIL_E2E_MIN_LOGIN_SECS`. The expiry is
   parsed with any number of fraction digits (none, 3, 6, 9). opencode's
-  free models need no login.
+  login (an OpenCode account, the `opencode` row of the `credential`
+  table in `opencode.db`) is copied the same way when there is one: the
+  script lets opencode create its own database in the throwaway home
+  (`opencode models --standalone`), then inserts that row with its
+  `refresh` token emptied, checking `expires` against the same minimum.
+  Only that row is copied (no sessions or projects), and the database is
+  deleted on exit. Free models need no login but have a usage limit;
+  without a login a run on them fails once it is reached.
 - **kiro's data dir.** Only what kiro-cli never writes is linked from
   the real `~/.local/share/kiro-cli`: `bun`, `node`, `tui.js`, their
   `.sha256` files and each versioned engine directory under `kas/` (the
