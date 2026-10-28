@@ -60,7 +60,10 @@
         $opts = @()
         if ($Version -and $Version -ne 'latest') { $opts += @('--version', $Version) }
         if ($BinDir) { $opts += @('--bin-dir', $BinDir) }
-        foreach ($h in $Harness) { $opts += @('--harness', $h) }
+        # -File passes `-Harness a,b` as one string, not a list.
+        foreach ($h in ($Harness -split ',')) {
+            if ($h.Trim()) { $opts += @('--harness', $h.Trim()) }
+        }
         if ($Service) { $opts += '--service' }
         if ($FromSource) { $opts += '--from-source' }
 

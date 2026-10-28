@@ -50,6 +50,12 @@ const TOOLS: &[&str] = &[
     "curl",
     "cat",
     "dirname",
+    "sed",
+    "tail",
+    "tr",
+    "timeout",
+    "setsid",
+    "sleep",
 ];
 
 fn triple() -> &'static str {
@@ -160,6 +166,36 @@ impl Release {
             &format!(
                 "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = '%{{url_effective}}' ] && {{ echo '{url}'; exit 0; }}; done\nexec {} \"$@\"\n",
                 real.display()
+            ),
+        );
+    }
+
+    /// Replaces `curl` with a fake GNU `wget` that serves file:// URLs and
+    /// answers the releases/latest lookup the way wget prints a redirect.
+    fn use_wget(&self, latest: &str) {
+        std::fs::remove_file(self.path("path/curl")).unwrap();
+        write_exec(
+            &self.path("path/wget"),
+            &format!(
+                r#"#!/bin/sh
+out=""; url=""; probe=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -O) out="$2"; shift 2 ;;
+        --max-redirect=0) probe=1; shift ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+if [ -n "$probe" ]; then
+    echo "  HTTP/1.1 302 Found" >&2
+    echo "  Location: {latest} [following]" >&2
+    exit 8
+fi
+path="${{url#file://}}"
+[ -f "$path" ] || exit 8
+cp "$path" "$out"
+"#
             ),
         );
     }
@@ -372,6 +408,27 @@ fn an_unknown_latest_release_missing_from_a_mirror_is_an_error() {
 }
 
 #[test]
+fn wget_resolves_the_latest_tag() {
+    let r = Release::new();
+    r.use_wget(LATEST_V010);
+    let out = r.install(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("/download/v0.1.0/agentmail-"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn wget_sees_that_no_release_exists() {
+    let r = Release::new();
+    r.use_wget(NO_RELEASE);
+    let out = r.install(&[]);
+    assert_fails_with(&r, &out, "no agentmail release has been published yet");
+}
+
+#[test]
 fn a_missing_tag_is_an_error() {
     let r = Release::new();
     let out = r.install(&["--version", "v9.9.9"]);
@@ -491,6 +548,37 @@ fn a_trailing_slash_bin_dir_on_path_is_recognised() {
     assert!(!err.contains("another agentmail"), "{err}");
     assert!(!err.contains("not on your PATH"), "{err}");
     assert!(!err.contains("//agentmail"), "{err}");
+}
+
+#[test]
+fn under_wsl_the_login_shell_path_counts_and_cannot_hang_the_install() {
+    let r = Release::new();
+    // A login shell whose profile adds the bin dir to PATH and leaves a
+    // background job holding its output open.
+    let shell = r.path("login-shell");
+    write_exec(
+        &shell,
+        &format!(
+            "#!/bin/sh\nsleep 30 &\nPATH=\"$PATH:{}\"; export PATH\nexec {} \"$@\"\n",
+            r.bin_dir().display(),
+            which("sh").display()
+        ),
+    );
+    let began = std::time::Instant::now();
+    let out = r.install_env(
+        &[],
+        &[
+            ("WSL_DISTRO_NAME", "Test".to_string()),
+            ("SHELL", shell.display().to_string()),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(began.elapsed() < std::time::Duration::from_secs(20));
+    assert!(
+        !stderr(&out).contains("not on your PATH"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

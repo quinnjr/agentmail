@@ -23,7 +23,9 @@ unit restarts it). It also warns if another `agentmail`, such as one from
 On a CPU with no prebuilt binary, or with `--from-source`, it builds that
 release with `cargo install --tag`. If no release has been published yet,
 `--from-source` builds the development branch instead. A failed download
-stops the install. It never falls back to building from source.
+stops the install. It never falls back to building from source. Finding
+the latest release needs curl or GNU wget. Where it cannot be found (for
+example with busybox wget), `--from-source` asks for `--version <tag>`.
 
 | option | env | effect |
 |---|---|---|

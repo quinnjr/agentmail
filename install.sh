@@ -80,7 +80,7 @@ latest_tag() {
     if has curl; then
         url="$(curl --proto '=https,file' -sSLo /dev/null -w '%{url_effective}' "$1/latest" 2>/dev/null)" || return 0
     else
-        url="$(wget --max-redirect=0 -S -O /dev/null "$1/latest" 2>&1 | sed -n 's/^ *Location: *//p' | tail -n1 | tr -d '\r')"
+        url="$(wget --max-redirect=0 -S -O /dev/null "$1/latest" 2>&1 | sed -n 's/^ *Location: *\([^ ]*\).*/\1/p' | tail -n1 | tr -d '\r')"
     fi
     case "$url" in
         */releases/tag/*) printf '%s\n' "${url##*/}" ;;
@@ -89,13 +89,15 @@ latest_tag() {
     esac
 }
 
-# has_linux <cmd>: <cmd> is on PATH outside the Windows drives WSL mounts,
-# so it is not a Windows tool seen through WSL's appended Windows PATH.
+# has_linux <cmd>: <cmd> is on PATH and, under WSL, not on a Windows drive
+# (/mnt/c/...): a Windows tool seen through WSL's appended Windows PATH.
 has_linux() {
     p="$(command -v "$1" 2>/dev/null)" || return 1
-    case "$p" in
-        /mnt/*) return 1 ;;
-    esac
+    if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+        case "$p" in
+            /mnt/[a-z]/*) return 1 ;;
+        esac
+    fi
 }
 
 # The Rust target triple of the prebuilt binary for this machine, or nothing
@@ -177,7 +179,11 @@ Run this again with --from-source to build the development branch."
 on_path() {
     case ":$user_path:" in *":$1:"*) return 0 ;; esac
     if [ -n "${WSL_DISTRO_NAME:-}" ] && has setsid && has timeout; then
-        login_path="$(PATH="$user_path" timeout 5 setsid "${SHELL:-/bin/sh}" -lc 'echo "$PATH"' </dev/null 2>/dev/null || true)"
+        # Through a file, not a pipe: a profile that starts a background
+        # job would hold a pipe open past the timeout.
+        PATH="$user_path" timeout 5 setsid "${SHELL:-/bin/sh}" -lc 'echo "$PATH" >"$1"' sh "$tmp/login_path" \
+            </dev/null >/dev/null 2>&1 || true
+        login_path="$(cat "$tmp/login_path" 2>/dev/null || true)"
         # fish prints its PATH list space-separated.
         case ":$login_path: " in *":$1:"* | *" $1 "*) return 0 ;; esac
     fi
