@@ -42,6 +42,7 @@ Files:
 | daemon lock | `agentmail.lock` in the data directory: held by the running daemon, and records whether the last daemon was supervised (`--wait-for-lock`), its pid and its socket |
 | waiter lock | `agentmail.waiter` in the data directory: held by a `--wait-for-lock` daemon while it waits for the daemon lock, with the same record |
 | start-up error | `daemon.err` in the data directory: why the last spawned daemon failed to start, for the CLI to report; removed once a daemon starts |
+| hook state | `hook-wait/` in the data directory: per-agent files of the wake and Stop hooks, named `<address>.<kind>`: `lock` (the waiter lock), `turn` (the newest wait's claim on the agent's turn), `woken` (the unread mail ids of the last wake), `busy` (when the session was last marked busy), `stop` (the Stop hook's last decision) and `shown` (the open questions kiro's Stop hook has shown). An agent's files are removed when it signs off or is gone |
 
 `AGENTMAIL_DATA_DIR` (the data directory) and `AGENTMAIL_SOCKET` override
 these, e.g. to run an isolated instance for tests.
@@ -133,10 +134,14 @@ Notes:
   run every hook twice. `--set-default` is accepted and changes nothing:
   kiro V3 loads agentmail's hooks for every agent.
 - **opencode `codemode`.** agentmail's server is installed with
-  `codemode: false`. opencode only shows a server's `instructions` (how
-  agents should use agentmail) while one of its tools is directly
-  reachable, which code mode hides behind its `execute` tool. A
-  `opencode.jsonc` with comments is never rewritten: install prints the
+  `codemode: false`, so the agent calls its tools directly rather than
+  from code passed to opencode's `execute` tool. opencode adds a server's
+  `instructions` (how agents should use agentmail) to the agent's context
+  either way: in code mode unless `execute` is denied, otherwise unless
+  all of the server's tools are denied. opencode connects MCP servers
+  only when a directory's first session starts, so that session's first
+  turn runs without the instructions; they are added at its next turn.
+  A `opencode.jsonc` with comments is never rewritten: install prints the
   entry to add by hand instead. opencode picks up the change without a
   restart.
 
@@ -527,7 +532,9 @@ never taken. `register --fresh` (MCP: `fresh: true`) always gets a new address.
   came. kiro-cli wakes only when installed with `--kiro-wake`, and never in
   a `--no-interactive` run. opencode wakes an idle session for as long as
   its server runs (the TUI, `opencode serve`); `opencode run --standalone`
-  stops its server when the turn ends.
+  stops its server when the turn ends. After opencode restarts, a session
+  that was idle when it stopped is woken for new mail only after its next
+  turn ends.
 - **kiro-cli subagents act as their root agent.** kiro gives a subagent's
   hooks and shell the root conversation's session and process, so urgent
   mail that arrives while a subagent runs is pushed to the subagent, which
@@ -552,7 +559,7 @@ by [`scripts/e2e.sh`](#end-to-end-tests-against-real-harnesses).
 |---|---|---|---|
 | `agentmail install` / `uninstall` | yes (`settings.json`, `.claude.json`) | yes (`opencode.json`, plugin) | yes (`settings/mcp.json`, `hooks/agentmail.json`) |
 | MCP server and tools | yes | yes (installed with `codemode: false`) | yes |
-| Agent guidance via MCP `instructions` | yes | yes, while not in code mode | yes |
+| Agent guidance via MCP `instructions` | yes | yes, in code mode too (a directory's first session gets it from its second turn) | yes (kiro keeps the first 2048 characters) |
 | Agent identity | by process (one address per `claude` process) | by session (one address per session) | by process (the nearest `kiro-cli`) |
 | Who-you-are and unread reminder at session start and on each prompt | yes (`SessionStart`, `UserPromptSubmit`) | no prompt hook in opencode 2.0.27: the agent learns its address from `register`, reminders start after its first tool call | yes (`SessionStart`, `UserPromptSubmit`) |
 | Unread-mail reminder between steps | yes (`PostToolUse`, also for failed calls) | yes (appended to each tool result) | no (kiro ignores `PostToolUse` output); at the next prompt instead |

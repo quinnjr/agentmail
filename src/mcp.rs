@@ -791,6 +791,11 @@ mod tests {
         assert!(INSTRUCTIONS.contains("Only use it when the human asks"));
         assert!(INSTRUCTIONS.ends_with("so your partner can reach you."));
         assert_eq!(INSTRUCTIONS.lines().count(), 9);
+        // kiro-cli V3 cuts a server's instructions after 2048 characters
+        // (JS string length; INSTRUCTIONS is ASCII, so the same count) and
+        // appends "…[truncated]": past that, the guidance's end is lost.
+        assert!(INSTRUCTIONS.is_ascii());
+        assert!(INSTRUCTIONS.chars().count() <= 2048);
     }
 
     #[test]

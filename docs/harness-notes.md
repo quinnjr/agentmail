@@ -1462,3 +1462,69 @@ explicitly); the unit test
 `agentmail_commands_never_inherit_opencodes_stdin` runs the plugin in a
 child process whose stdin holds data and checks that `hook status` and
 `hook signoff` read nothing.
+
+## Guidance via MCP `instructions` (branch review)
+
+Checked on 2026-10-27 against Claude Code 2.1.312 (`-p --model haiku`),
+opencode 2.0.27 and kiro-cli 2.32.0 (`chat --v3 --no-interactive`), each
+in a throwaway home (private `HOME`, `XDG_*`, `CLAUDE_CONFIG_DIR`,
+`KIRO_HOME`, logins copied without their refresh token), with
+`agentmail install --harness <h>` and the release build.
+
+Method: beside agentmail, a fake stdio MCP server `canary` (one tool,
+`ping`) whose `instructions` are 2,150–2,170 characters of filler holding
+three random codewords: one at the start, one ending at character ~1,970
+(inside 2048) and one starting at character ~2,145 (past 2048). The agent
+was told not to call any tool and to list the three codewords and quote
+the first and last line of agentmail's instructions from its context,
+writing MISSING for anything it could not see. Random codewords cannot be
+guessed, so a codeword in the answer was in the model's context.
+
+| harness | how | codewords one / two / three | agentmail's first and last line |
+|---|---|---|---|
+| Claude Code | live, model's answer | all three | both, verbatim |
+| opencode, `codemode: false` | live, the context opencode built (no model answer, see below) | all three | whole text |
+| opencode, `codemode: true` | same | all three | whole text |
+| kiro-cli V3 | live, model's answer | one, two; three MISSING | both, verbatim |
+
+- **Claude Code** shows a server's instructions whole: no cut at 2048
+  (the third codeword, past 2048, was quoted).
+- **kiro-cli V3 keeps the first 2048 characters.** Live: the codeword
+  past 2048 was MISSING, the two before it quoted. In the bundle
+  (`@kiro/agent/dist/server/acp-server.js`): `JIo=2048`, and each
+  server's text becomes `${e.slice(0,2048)} …[truncated]` (JS string
+  length, so UTF-16 units), under "# MCP Server Instructions" fenced as
+  "untrusted hints about how to use their tools", in the description of
+  kiro's tool-loading tool. agentmail's `INSTRUCTIONS` is ASCII and about
+  1,100 characters; `mcp_instructions_carry_the_guidance` fails if it
+  grows past 2048.
+- **opencode, model answer unavailable.** The first run (`run
+  --standalone`, `opencode/big-pickle`, `codemode: false`) answered
+  MISSING for everything, then every free model returned "Free usage
+  limit reached" (HTTP 429), so no later run got a model reply. The
+  MISSING answer was a startup race, not code mode: opencode connects a
+  directory's MCP servers only when its first session starts, and that
+  turn's assistant message was created (00:07:48.110) before agentmail
+  and canary connected (48.145 and 48.259 in opencode's log); the
+  session's context entries (`instruction_state`) had no
+  `core/mcp-guidance`. The later runs therefore checked what opencode
+  puts in front of the model rather than what the model said: an
+  `opencode serve` with two `run --server` sessions and then a second turn
+  in the first session (each turn failing at the provider after its
+  context was built), reading opencode's database. With `codemode: false`
+  and with `codemode: true` alike, the second session's
+  `core/mcp-guidance` entry held both servers' instructions whole (all
+  three codewords, agentmail's full text), and the first session's second
+  turn got them as a system message ("… `<mcp_instructions>` …"). In code
+  mode each server's block starts "Use tools from this server through
+  `execute` under `tools["agentmail"]`." The bundle's
+  `McpInstructions.load` matches: a server's instructions are included
+  when, in code mode, `execute` is not denied, and otherwise when at
+  least one of its tools is not denied; nothing is truncated.
+- **Correction (README and spec).** The spec's harness table and the
+  README said opencode shows a server's instructions only while one of
+  its tools is directly reachable, hence `codemode: false`. 2.0.27 shows
+  them in code mode too (above). `install` still writes `codemode: false`
+  so agentmail's tools are called directly, as on the other harnesses; the
+  README now gives that reason and says that a directory's first session
+  gets the instructions from its second turn.
