@@ -1,6 +1,57 @@
-# Installing into a harness
+# Installing
 
 [← README](../README.md)
+
+## Installing the binary
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/quinnjr/agentmail/main/install.sh | sh -s -- [options]
+```
+
+`install.sh` runs on Linux and WSL. It downloads the release archive for
+the machine (`x86_64` or `aarch64`, statically linked with musl) from
+GitHub, checks it against the release's `.sha256` file, and installs
+`agentmail` into `~/.local/bin`. It replaces an existing binary by
+renaming the new one over it, so a running daemon is never left with a
+half-written file. When it upgrades, it stops the running daemon so that
+the next command starts the new version. Under systemd, the unit restarts
+it. If no prebuilt binary is available for the CPU or the version, it
+builds one with `cargo install` when cargo is installed. It never
+installs an archive whose checksum is missing or wrong.
+
+| option | env | effect |
+|---|---|---|
+| `--version <tag>` | `AGENTMAIL_VERSION` | Release to install, e.g. `v0.1.0` (default: latest). |
+| `--bin-dir <dir>` | `AGENTMAIL_INSTALL_DIR` | Where to put the binary (default: `~/.local/bin`). |
+| `--harness <name>` | | Afterwards run `agentmail install --harness <name>`. Takes `claude-code`, `opencode` or `kiro`, and can be repeated. `auto` picks every harness whose CLI (`claude`, `opencode`, `kiro-cli`) is on `PATH`. |
+| `--service` | | Afterwards run `agentmail install --service`. |
+| `--from-source` | | Build with cargo instead of downloading. |
+| | `AGENTMAIL_DOWNLOAD_URL` | Download from a mirror instead of `https://github.com/quinnjr/agentmail/releases`. |
+
+### Windows
+
+agentmail needs Linux, so on Windows it runs inside WSL, together with the
+agents that use it. Run Claude Code, opencode or kiro-cli inside WSL too.
+The Windows scripts check that WSL and a distribution are available, then
+run `install.sh` in your default distribution:
+
+```powershell
+irm https://raw.githubusercontent.com/quinnjr/agentmail/main/install.ps1 | iex
+
+# with options
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/quinnjr/agentmail/main/install.ps1))) -Harness auto -Distro Ubuntu
+```
+
+`install.ps1` takes `-Version`, `-BinDir`, `-Harness`, `-Service`,
+`-FromSource` and `-Distro`. `install.cmd` passes its arguments straight
+on to `install.sh`, and uses `AGENTMAIL_WSL_DISTRO` to pick the
+distribution:
+
+```bat
+curl -fsSLo %TEMP%\agentmail-install.cmd https://raw.githubusercontent.com/quinnjr/agentmail/main/install.cmd && %TEMP%\agentmail-install.cmd --harness auto
+```
+
+## Wiring agentmail into a harness
 
 ```sh
 agentmail install --harness claude-code|opencode|kiro [--project] [--dry-run] [--json]
