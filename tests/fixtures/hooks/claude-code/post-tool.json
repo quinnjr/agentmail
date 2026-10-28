@@ -1,0 +1,26 @@
+{
+  "session_id": "c54e86ef-1315-44f0-a0cf-a52506e6d0bb",
+  "transcript_path": "/home/user/.claude/projects/-home-user-project/c54e86ef-1315-44f0-a0cf-a52506e6d0bb.jsonl",
+  "cwd": "/home/user/project",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-project/c54e86ef-1315-44f0-a0cf-a52506e6d0bb/scratchpad",
+  "prompt_id": "8745ca22-c22c-4a80-a407-21c3cb1c5e41",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo hi",
+    "description": "Run echo hi"
+  },
+  "tool_response": {
+    "stdout": "hi",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_01RdLqrGDg5X6aB3G1ucWbjx",
+  "duration_ms": 29
+}

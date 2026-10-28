@@ -1,0 +1,423 @@
+//! The wire protocol between clients and the daemon.
+//!
+//! Newline-delimited JSON over a Unix socket: each line a client writes is
+//! one [`Envelope`]; each line the daemon writes is one [`Response`]. A
+//! connection carries one request at a time. The first request on a
+//! connection must be [`Request::Hello`]; the daemon answers `Ok` when the
+//! versions match and `Err` with [`ErrorCode::VersionMismatch`] otherwise
+//! (and to any other request sent before a successful `Hello`, or after a
+//! failed one: a mismatching `Hello` revokes an earlier handshake). The `Ok`
+//! data is `{"version", "pid", "data_dir"}`: clients refuse a daemon whose
+//! `data_dir` is not theirs, since it would serve another database.
+//!
+//! Compatibility invariant: the encodings of `Hello`, `Shutdown` and of the
+//! `VersionMismatch` error never change, and `Shutdown` is honoured even
+//! without a successful `Hello`, so a newer client can always stop an older
+//! daemon and start its own.
+//!
+//! [`Request::Ask`], [`Request::AwaitAnswer`] and [`Request::WaitForMail`]
+//! block: their one response comes when the wait ends, at most their
+//! timeout later. A client that hangs up meanwhile cancels the wait.
+//!
+//! [`Request::Watch`] is the one streaming request: the daemon answers `Ok`
+//! once it is subscribed, then writes a [`Response::Event`] line per event
+//! until the client disconnects.
+
+use std::fmt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::{AgentView, Harness, Message, ProcId, SessionKey};
+use crate::store::ThreadFilter;
+
+/// Bumped on every incompatible change to [`Envelope`] or [`Response`].
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Longest request line the daemon accepts, in bytes. Comfortably above a
+/// maximal body (256 KiB) even when every byte is JSON-escaped.
+pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
+/// Who is making a request.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Caller {
+    /// The human operator (`--as human` or `AGENTMAIL_HUMAN=1`).
+    Human,
+    /// An explicit agent address (`AGENTMAIL_ADDRESS`, or a registered MCP
+    /// session).
+    Address { address: String },
+    /// The calling process's ancestry, nearest first; the daemon picks the
+    /// agent bound to one of them.
+    Procs { procs: Vec<ProcId> },
+    /// A harness session (e.g. opencode's per-request session id). Resolves
+    /// only to the agent bound to that session; never falls back to
+    /// process ancestry, which the daemon cannot see for this caller.
+    Session { session: SessionKey },
+}
+
+/// A request. See the module docs for framing.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Request {
+    Hello {
+        version: u32,
+    },
+    Register {
+        name: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        working_on: Option<String>,
+        harness: Harness,
+        /// Must be absolute.
+        cwd: PathBuf,
+        #[serde(default)]
+        proc_id: Option<ProcId>,
+        /// Always take a new address; never reclaim. Rejected from a
+        /// session that is already bound (see `session`).
+        #[serde(default)]
+        fresh: bool,
+        #[serde(default)]
+        wake: bool,
+        /// Bind the address to this harness session too. Registering again
+        /// from a session that is already bound returns its agent, updated;
+        /// a different name, or `fresh` set, is `InvalidInput` (sign off
+        /// first to take a new address for a bound session).
+        ///
+        /// The response's `existing` is true for any repeat registration of
+        /// a live (not signed-off) identity, from its bound session or its
+        /// bound process (a plain re-registration without any session
+        /// included). It is false for a new or reclaimed address.
+        #[serde(default)]
+        session: Option<SessionKey>,
+    },
+    Whoami,
+    Status {
+        working_on: String,
+    },
+    Signoff,
+    Agents {
+        #[serde(default)]
+        name_prefix: Option<String>,
+        #[serde(default)]
+        repo: Option<PathBuf>,
+        /// Include gone agents.
+        #[serde(default)]
+        all: bool,
+    },
+    ContactAdd {
+        address: String,
+    },
+    ContactRemove {
+        address: String,
+    },
+    Contacts,
+    Send {
+        to: Vec<String>,
+        subject: String,
+        body: String,
+        #[serde(default)]
+        urgent: bool,
+        #[serde(default)]
+        refs: Vec<String>,
+    },
+    /// Reply in `message_id`'s thread, to its sender and recipients other
+    /// than the caller. With `answer`, the reply must close an open
+    /// question on its reply chain. Data: the stored message.
+    Reply {
+        message_id: String,
+        body: String,
+        #[serde(default)]
+        urgent: bool,
+        #[serde(default)]
+        refs: Vec<String>,
+        #[serde(default)]
+        answer: bool,
+    },
+    /// Send a question and block until it is answered, someone else
+    /// replies to the asker in its thread, or `timeout_secs` pass. Data:
+    /// `{"status":"answered","question_id","answer":Message}`,
+    /// `{"status":"clarification","question_id","message":Message}`,
+    /// `{"status":"pending","question_id"}` on timeout, or
+    /// `{"status":"no_one_listening","question_id"}` at once when no
+    /// recipient is active (the question is stored all the same).
+    Ask {
+        to: Vec<String>,
+        subject: String,
+        body: String,
+        #[serde(default)]
+        refs: Vec<String>,
+        #[serde(default)]
+        urgent: bool,
+        timeout_secs: u64,
+    },
+    /// Keep waiting on one's own question, as after [`Request::Ask`]
+    /// (`answered` at once if it already is). Replies the asker has already
+    /// read when the call starts do not count as clarifications; an unread
+    /// reply from someone else already in the thread is returned at once as
+    /// a clarification. A returned clarification is marked read.
+    AwaitAnswer {
+        question_id: String,
+        timeout_secs: u64,
+    },
+    /// Block until the caller has unread mail: at once if it already has
+    /// some (surfaced but unread mail counts), otherwise when mail is
+    /// delivered to it. Data: `{"status":"mail","messages":[unread
+    /// Message]}`, or `{"status":"timeout"}`.
+    WaitForMail {
+        timeout_secs: u64,
+    },
+    /// What a harness hook needs about the caller, in one round trip.
+    /// Data: `{"address", "name", "wake", "unread": count,
+    /// "unread_ids": [id], "open_questions": [{"id","from","subject"}],
+    /// "urgent": [Message]}`. `unread_ids` are the unread messages' ids,
+    /// in id order.
+    /// `open_questions` are those addressed to the caller, oldest first;
+    /// `urgent` is its urgent mail that is neither read nor surfaced yet,
+    /// oldest first. With `surface_urgent`, those messages are marked
+    /// surfaced, so the next call leaves them out; their read state is
+    /// unchanged. Agents only (`InvalidInput` for the human).
+    HookStatus {
+        #[serde(default)]
+        surface_urgent: bool,
+    },
+    Inbox {
+        /// Include read messages.
+        #[serde(default)]
+        all: bool,
+    },
+    Counts,
+    /// A message by id; marks it read for the caller. When `id` is a thread
+    /// id, the whole thread is returned too and marked read.
+    Read {
+        id: String,
+    },
+    Threads {
+        #[serde(default)]
+        filter: ThreadFilter,
+    },
+    /// The full ids of every message (or thread) whose id ends with `id`,
+    /// compared without regard to case; resolves the short ids the CLI
+    /// prints. Data: `[id]`.
+    ResolveId {
+        id: String,
+    },
+    Search {
+        query: String,
+    },
+    Prune {
+        older_than_secs: u64,
+    },
+    /// Stream hub events, optionally only those involving `agent`.
+    Watch {
+        #[serde(default)]
+        agent: Option<String>,
+    },
+    Shutdown,
+}
+
+/// One request line.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Envelope {
+    pub caller: Caller,
+    pub req: Request,
+}
+
+/// One response line.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Response {
+    Ok {
+        data: serde_json::Value,
+    },
+    Err {
+        code: ErrorCode,
+        message: String,
+        #[serde(default)]
+        candidates: Vec<AgentView>,
+    },
+    Event {
+        event: Event,
+    },
+}
+
+/// Why a request failed.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorCode {
+    VersionMismatch,
+    NoIdentity,
+    InvalidName,
+    InvalidInput,
+    InvalidRecipient,
+    UnknownRecipient,
+    AmbiguousRecipient,
+    Deadlock,
+    TooLarge,
+    NotFound,
+    /// Client side only: the daemon closed the connection mid-call.
+    ConnectionLost,
+    Internal,
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+/// Something that happened, pushed to waiting and watching clients.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// `message` was put in `to`'s mailbox.
+    Delivered { to: String, message: Message },
+    /// An agent registered, changed status or signed off.
+    Presence { agent: AgentView },
+}
+
+/// A failed request, as the client sees it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ClientError {
+    pub code: ErrorCode,
+    pub message: String,
+    /// For [`ErrorCode::AmbiguousRecipient`]: the agents to choose from.
+    pub candidates: Vec<AgentView>,
+}
+
+impl ClientError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> ClientError {
+        ClientError {
+            code,
+            message: message.into(),
+            candidates: Vec::new(),
+        }
+    }
+
+    /// The daemon went away during a call.
+    pub fn connection_lost() -> ClientError {
+        ClientError::new(ErrorCode::ConnectionLost, "daemon connection lost")
+    }
+
+    /// The error as a response line.
+    pub fn into_response(self) -> Response {
+        Response::Err {
+            code: self.code,
+            message: self.message,
+            candidates: self.candidates,
+        }
+    }
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn protocol_wire_shapes() {
+        let env = Envelope {
+            caller: Caller::Address {
+                address: "a-12345678".into(),
+            },
+            req: Request::Inbox { all: true },
+        };
+        assert_eq!(
+            serde_json::to_value(&env).unwrap(),
+            json!({"caller":{"kind":"address","address":"a-12345678"},"req":{"op":"inbox","all":true}})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::Whoami).unwrap(),
+            json!({"op":"whoami"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::Hello { version: 1 }).unwrap(),
+            json!({"op":"hello","version":1})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::Shutdown).unwrap(),
+            json!({"op":"shutdown"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::HookStatus {
+                surface_urgent: true
+            })
+            .unwrap(),
+            json!({"op":"hook_status","surface_urgent":true})
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({"op":"hook_status"})).unwrap(),
+            Request::HookStatus {
+                surface_urgent: false
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(Request::ResolveId { id: "x".into() }).unwrap(),
+            json!({"op":"resolve_id","id":"x"})
+        );
+        let err = ClientError::new(ErrorCode::VersionMismatch, "x").into_response();
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            json!({"status":"err","code":"VersionMismatch","message":"x","candidates":[]})
+        );
+        assert_eq!(
+            serde_json::to_value(Response::Ok { data: json!(1) }).unwrap(),
+            json!({"status":"ok","data":1})
+        );
+    }
+
+    #[test]
+    fn protocol_session_shapes() {
+        let caller = Caller::Session {
+            session: SessionKey {
+                harness: Harness::Opencode,
+                id: "ses_1".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&caller).unwrap(),
+            json!({"kind":"session","session":{"harness":"opencode","id":"ses_1"}})
+        );
+        let req: Request = serde_json::from_value(
+            json!({"op":"register","name":"a","harness":"other","cwd":"/w"}),
+        )
+        .unwrap();
+        assert!(matches!(req, Request::Register { session: None, .. }));
+    }
+
+    #[test]
+    fn protocol_optional_fields_default() {
+        let req: Request = serde_json::from_value(json!({"op":"agents"})).unwrap();
+        assert_eq!(
+            req,
+            Request::Agents {
+                name_prefix: None,
+                repo: None,
+                all: false
+            }
+        );
+        let req: Request = serde_json::from_value(json!({"op":"threads"})).unwrap();
+        assert_eq!(
+            req,
+            Request::Threads {
+                filter: ThreadFilter::default()
+            }
+        );
+    }
+
+    #[test]
+    fn protocol_error_code_displays_as_name() {
+        assert_eq!(
+            ErrorCode::AmbiguousRecipient.to_string(),
+            "AmbiguousRecipient"
+        );
+    }
+}

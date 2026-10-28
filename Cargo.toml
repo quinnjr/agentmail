@@ -1,0 +1,34 @@
+[package]
+name = "agentmail"
+version = "0.1.0"
+edition = "2024"
+description = "Local mail for coding agents: lets Claude Code, opencode and kiro-cli sessions message each other, ask blocking questions and wake each other up"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quinnjr/agentmail"
+homepage = "https://github.com/quinnjr/agentmail"
+readme = "README.md"
+keywords = ["ai-agents", "mcp", "claude-code", "multi-agent", "messaging"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+cuid2 = "0.1"
+futures-util = "0.3"
+libc = "0.2"
+redb = "4.4"
+rmcp = { version = "3.7", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1.54", features = ["full"] }
+ulid = { version = "3", features = ["serde"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+rmcp = { version = "3.7", features = ["client", "transport-child-process"] }
+
+[profile.release]
+strip = true
